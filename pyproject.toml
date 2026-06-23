@@ -1,0 +1,20 @@
+[project]
+name = "artificial-forecaster"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=2.43.0",
+    "pydantic-settings>=2.14.2",
+    "python-dotenv>=1.2.2",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.18",
+]
+[tool.hatch.build.targets.wheel]
+packages = ["src/forecaster"]
+[tool.uv]
+package = true

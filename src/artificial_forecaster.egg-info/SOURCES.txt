@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+src/artificial_forecaster.egg-info/PKG-INFO
+src/artificial_forecaster.egg-info/SOURCES.txt
+src/artificial_forecaster.egg-info/dependency_links.txt
+src/artificial_forecaster.egg-info/requires.txt
+src/artificial_forecaster.egg-info/top_level.txt
+src/forecaster/__init__.py
+src/forecaster/config.py
+src/forecaster/llm.py
