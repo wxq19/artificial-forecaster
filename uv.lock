@@ -29,6 +29,7 @@ name = "artificial-forecaster"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "metar-taf-parser-mivek" },
     { name = "openai" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
@@ -41,6 +42,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "metar-taf-parser-mivek", specifier = ">=1.13.1" },
     { name = "openai", specifier = ">=2.43.0" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
@@ -210,6 +212,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/e7/95/a06692b29e77473f286e1ec1f426d3ca44d7b5843be8ad21d7a5f3fcdcc0/jiter-0.15.0-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:b6c0ffae686c39bf3737be60793783267628783ea42545632c10b291105aee45", size = 305128, upload-time = "2026-05-19T10:09:43.657Z" },
     { url = "https://files.pythonhosted.org/packages/23/85/7270d7ad41d6061a25b950c6bf91d638bd9aacb113200a8c8d57a055fd67/jiter-0.15.0-graalpy312-graalpy250_312_native-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:1d54fb5b31dea401a41af3f8a7d2512e9b6a6a005491e6166c7e4ffab9639a9c", size = 340459, upload-time = "2026-05-19T10:09:45.452Z" },
     { url = "https://files.pythonhosted.org/packages/c8/8d/302cb2057b7513327b4d575cff6b1d066ee6431a5357fc3f8867cd684406/jiter-0.15.0-graalpy312-graalpy250_312_native-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:54d5d6090cdc1b7c9e780dfb04949a990adb1e301a2fc0bbcee7de4638d33f9a", size = 344469, upload-time = "2026-05-19T10:09:46.864Z" },
+]
+
+[[package]]
+name = "metar-taf-parser-mivek"
+version = "1.13.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/02/20/47495a4065e911d91fa2643d47453465fc5875fed3ed8559f761fca35ca2/metar_taf_parser_mivek-1.13.1.tar.gz", hash = "sha256:82b28b93d2f0ff9d980eb3dbacecf479f30338983f9e7e284f8f23007e9e3e9c", size = 447115, upload-time = "2026-05-31T13:51:58.576Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/c4/017b3d1dc42377084b6172c7051c57fb52c01a79a2d34ab6ff3eb7651118/metar_taf_parser_mivek-1.13.1-py3-none-any.whl", hash = "sha256:019b837954d8d69681e7101fbaa479b2e1f125c15ce0ae65381c8cb1a71d80d0", size = 503431, upload-time = "2026-05-31T13:51:57.275Z" },
 ]
 
 [[package]]

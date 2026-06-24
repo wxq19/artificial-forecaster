@@ -10,7 +10,7 @@ r = client.chat.completions.create(
 print(r.choices[0].message.content)
 
 print("\n=== VISION CALL (starting, may be slow) ===")
-with open("test.png", "rb") as f:
+with open("data/charts/nws/test.png", "rb") as f:
     b64 = base64.b64encode(f.read()).decode()
 print(f"Image loaded: {len(b64)} base64 chars")
 
