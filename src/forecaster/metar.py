@@ -6,13 +6,24 @@ from pydantic import BaseModel
 from metar_taf_parser.parser.parser import MetarParser
 
 _PARSER = MetarParser()
-_PREFIX = re.compile(r"^\s*(?:METAR|SPECI)\s+")   # library chokes on these keywords
+_PREFIX = re.compile(r"^\s*(METAR|SPECI)\s+")     # library chokes on these; we capture which
 _ALT_INHG = re.compile(r"\bA(\d{4})\b")           # US altimeter group, e.g. A2990
 _ALT_HPA = re.compile(r"\bQ(\d{4})\b")            # international, e.g. Q1013
 # US visibility token, incl. M/P (less/greater-than) and fractions: M1/4SM, 1 1/2SM, P6SM
 _VIS_SM = re.compile(r"\b([MP]?(?:\d{1,2} \d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{1,3})SM)\b")
 _HPA_PER_INHG = 33.8638866667
 _SKY_CLEAR = {"CLR", "SKC", "NSC", "NCD"}         # not real cloud layers
+# Table 8.1 — reportable visibility, SM <-> meters. A LOOKUP, not physics
+# (1/2SM == 800m, not 804m): the values forecasters actually report. M1/8 folds
+# into the 0.125 row. 9999m ("10 km or more") is the OCONUS max -> treated as >6SM.
+_VIS_TABLE: list[tuple[float, int]] = [
+    (0.0, 0), (0.0625, 100), (0.125, 200), (0.1875, 300), (0.25, 400),
+    (0.3125, 500), (0.375, 600), (0.5, 800), (0.625, 1000), (0.75, 1200),
+    (0.875, 1400), (1.0, 1600), (1.125, 1800), (1.25, 2000), (1.375, 2200),
+    (1.5, 2400), (1.625, 2600), (1.75, 2800), (1.875, 3000), (2.0, 3200),
+    (2.25, 3600), (2.5, 4000), (2.75, 4400), (3.0, 4800), (4.0, 6000),
+    (5.0, 8000), (6.0, 9000),
+]
 
 
 class CloudLayer(BaseModel):
@@ -29,25 +40,84 @@ class MetarObs(BaseModel):
     station: str
     day: int                   # day-of-month (a METAR alone has no month/year)
     time: time                 # UTC
+    report_type: str | None    # 'METAR' (routine) or 'SPECI' (weather forced an off-cycle ob)
+    auto: bool                 # AUTO — automated station, no human augmentation
+    cavok: bool                # CAVOK — vis ≥10 km, no sig cloud/weather
     wind_dir_deg: int | None
     wind_dir_card: str | None
     wind_speed: int | None
     wind_gust: int | None
     wind_unit: str | None
     visibility: str | None     # reported string; AF works in statute miles
+    vis_sm: float | None       # numeric statute miles (Table 8.1 lookup)
+    vis_m: int | None          # numeric meters (Table 8.1 lookup)
+    vis_flag: str | None       # 'M' (less-than), 'P' (greater-than), or None (exact)
     weather: list[str]         # present-weather groups, e.g. ["+RA", "BR"], "VCTS"
     temp_c: int | None
     dewpoint_c: int | None
     altimeter_inhg: float | None   # reported value, taken exact from the raw token
     altimeter_hpa: float | None    # derived from inHg (US METARs only report inHg)
     clouds: list[CloudLayer]
+    vertical_visibility_ft: int | None   # VV — indefinite ceiling (fog); None if absent
+    ceiling_ft: int | None               # derived: lowest BKN/OVC or VV; None = unlimited
     remarks: str | None        # the RMK section, verbatim
     raw: str                   # original line, untouched
+
+
+def _sm_to_float(core: str) -> float | None:
+    """'10' -> 10.0 | '1/4' -> 0.25 | '1 3/4' -> 1.75"""
+    try:
+        if " " in core:
+            whole, frac = core.split()
+            n, d = frac.split("/")
+            return int(whole) + int(n) / int(d)
+        if "/" in core:
+            n, d = core.split("/")
+            return int(n) / int(d)
+        return float(core)
+    except ValueError:
+        return None
+
+
+def _nearest(value: float, key: int, out: int) -> float:
+    """Closest Table 8.1 row; ties resolve to the lower visibility (pessimistic)."""
+    return min(_VIS_TABLE, key=lambda r: (abs(r[key] - value), r[out]))[out]
+
+
+def _parse_vis(s: str | None) -> tuple[float | None, int | None, str | None]:
+    """(vis_sm, vis_m, vis_flag) — flag is 'M' (<), 'P' (>), or None (exact)."""
+    if not s:
+        return None, None, None
+    t = s.strip()
+    if t.upper().endswith("SM"):                          # CONUS — statute miles
+        flag = "M" if t[0] == "M" else "P" if t[0] == "P" else None
+        sm = _sm_to_float(t[:-2].lstrip("MP"))
+        if sm is None:
+            return None, None, flag
+        m = 9999 if sm > 6 or (flag == "P" and sm >= 6) else int(_nearest(sm, 0, 1))
+        return sm, m, flag
+    flag = None                                           # OCONUS — meters
+    if t[0] in ">P":
+        flag, t = "P", t[1:]
+    elif t[0] == "M":
+        flag, t = "M", t[1:]
+    try:
+        m = int(t)
+    except ValueError:
+        return None, None, flag
+    if m >= 9999:                       # 9999m = "10 km or more": OCONUS max, i.e. >6 SM
+        return 6.0, 9999, "P"
+    return _nearest(m, 1, 0), m, flag
 
 
 def parse(line: str) -> MetarObs:
     raw = line.strip().rstrip("=").strip()
     m = _PARSER.parse(_PREFIX.sub("", raw))        # parse a cleaned copy, keep raw verbatim
+
+    # Report type from the leading keyword, when the source kept it (AWC/Skyvector
+    # pastes do; IEM strips it -> None here, and the loader supplies the real tag).
+    pm = _PREFIX.match(raw)
+    report_type = pm.group(1) if pm else None
 
     # Pressure: read inHg straight from the raw token rather than trusting the
     # library's lossy integer-hPa conversion. US METARs report inHg only.
@@ -77,32 +147,56 @@ def parse(line: str) -> MetarObs:
         for wc in m.weather_conditions
     ]
 
+    auto = bool(re.search(r"\bAUTO\b", raw))
+    cavok = bool(re.search(r"\bCAVOK\b", raw))
+    vv = m.vertical_visibility            # ft AGL, or None
+
+    vis_sm, vis_m, vis_flag = _parse_vis(visibility)
+    if cavok and visibility is None:      # CAVOK implies vis >=10 km -> treat as >6 SM
+        vis_sm, vis_m, vis_flag = 6.0, 9999, "P"
+
+    clouds = [
+        CloudLayer(
+            cover=c.quantity.name,
+            height_ft=c.height,
+            type=c.type.name if c.type else None,
+        )
+        for c in m.clouds
+        if c.quantity.name not in _SKY_CLEAR
+    ]
+    # Ceiling = lowest broken/overcast layer, or an indefinite (VV) ceiling
+    # — VV counts as a ceiling per AFMAN 15-111, 11.4.4.6.
+    bases = [c.height_ft for c in clouds if c.cover in ("BKN", "OVC") and c.height_ft is not None]
+    if vv is not None:
+        bases.append(vv)
+    ceiling_ft = min(bases) if bases else None
+
     remarks = raw.split(" RMK ", 1)[1] if " RMK " in raw else None
     w = m.wind
     return MetarObs(
         station=m.station,
         day=m.day,
         time=m.time,
+        report_type=report_type,
+        auto=auto,
+        cavok=cavok,
         wind_dir_deg=w.degrees if w else None,
         wind_dir_card=w.direction if w else None,
         wind_speed=w.speed if w else None,
         wind_gust=w.gust if w else None,
         wind_unit=w.unit if w else None,
         visibility=visibility,
+        vis_sm=vis_sm,
+        vis_m=vis_m,
+        vis_flag=vis_flag,
         weather=weather,
         temp_c=m.temperature,
         dewpoint_c=m.dew_point,
         altimeter_inhg=inhg,
         altimeter_hpa=hpa,
-        clouds=[
-            CloudLayer(
-                cover=c.quantity.name,
-                height_ft=c.height,
-                type=c.type.name if c.type else None,
-            )
-            for c in m.clouds
-            if c.quantity.name not in _SKY_CLEAR
-        ],
+        clouds=clouds,
+        vertical_visibility_ft=vv,
+        ceiling_ft=ceiling_ft,
         remarks=remarks,
         raw=raw,
     )

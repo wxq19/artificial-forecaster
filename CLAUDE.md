@@ -32,7 +32,7 @@ must remain a `.env` edit with ZERO code change. Preserve this seam in any sugge
 - **Local (dev):** Ollama serving a small Qwen3-VL at `http://localhost:11434/v1`.
   CPU-only laptop, no GPU — fine for testing logic, too slow for real vision inference.
 - **Cloud (real inference):** Together AI, OpenAI-compatible at
-  `https://api.together.xyz/v1`. Current dev model: `Qwen/Qwen3.5-9B` (vision, supports
+  `https://api.together.ai/v1`. Current dev model: `Qwen/Qwen3.5-9B` (vision, supports
   function calling). Used because the laptop has no GPU.
 - **HPC (final target):** MIT SuperCloud. Slurm scheduler, Volta V100 GPUs
   (`--gres=gpu:volta:1`), Podman containers (GPU via `--device nvidia.com/gpu=all`),
@@ -104,22 +104,57 @@ artificial-forecaster/
 - Dev/run scripts now live in `scripts/`; reference imagery under `data/charts/` (untracked).
 - Known v1 METAR deferrals (all survive in the retained raw line): trend groups
   (NOSIG/BECMG/TEMPO), RVR, variable-wind range, and the full month/year datetime.
+- METAR fields extended: `auto`, `cavok`, `vertical_visibility_ft`, and derived
+  `ceiling_ft` (lowest BKN/OVC, or a VV indefinite ceiling — VV counts per AFMAN
+  15-111 11.4.4.6). Numeric visibility added as `vis_sm`/`vis_m`/`vis_flag`, converted
+  via a Table 8.1 LOOKUP (not physics): both units stored, OCONUS capped at 9999m
+  ("≥10 km" → >6SM), off-table meters snap to nearest row (ties → lower/pessimistic),
+  CAVOK with no vis group → P6SM. `vis_flag` is 'M' (<), 'P' (>), or None (exact).
+- DuckDB store built: `src/forecaster/store.py` — the ONLY file that imports `duckdb`
+  or writes SQL (seam like `llm.py`). `connect(read_only=)`, `init_schema`, `insert_obs`
+  (attaches year/month + a `source` lineage col + `report_type` METAR/SPECI; idempotent
+  via PK `(station, obs_time)` + ON CONFLICT DO NOTHING), `count`, `latest`, `window`
+  (time-range read, deserializes JSON). `weather`/`clouds` stored as JSON (derived scalars
+  + JSON fidelity); JSON reads back as a STRING — `json.loads` at the boundary. Read-only
+  conn rejects writes at the engine level (verified). `db_path` = `data/forecaster.duckdb`
+  (gitignored); created on first `connect`+`init_schema`+insert.
+- METAR/SPECI tagged: `MetarObs.report_type` ('METAR'|'SPECI'|None). `parse()` reads it
+  from the leading keyword when a source keeps it (AWC/Skyvector); IEM strips it, so the
+  loader supplies it. A SPECI = weather forced an off-cycle ob (a significance signal).
+- IEM loader: `src/forecaster/iem.py` — ingestion orchestrator (uses metar+store seams,
+  no SQL/duckdb of its own). Pulls historical METARs WITH authoritative UTC timestamps
+  (no year/month inference), groups by month, `insert_obs(source='iem')`. Fetches
+  report_type 3 (routine) and 4 (SPECI) SEPARATELY so each ob's type is certain — and
+  EXCLUDES the 5-minute MADIS stream (report_type=1), which the AF workflow never uses
+  (AWC/Skyvector show routine+SPECI only). Module-level min-interval throttle spaces every
+  request (IEM rate-limits bursts hard). Validated: KORD Jan 2024 snowstorm → 97 obs
+  (48 METAR + 49 SPECI), 0 MADISHF.
+- First agent TOOL + loop built: `src/forecaster/tools.py` exposes `query_obs` (the ONLY
+  registered tool) → `store.window` on a `read_only=True` conn. Returns a decoded summary
+  + the RAW METAR/SPECI beneath each ob (so RMK/RVR/SLP/peak-wind aren't lost) + the type
+  tag. The model CANNOT reach IEM — only this DB read is on its menu. `scripts/test_iem_tool.py`
+  drives the end-to-end loop (NL question → tool call → answer) with a markdown log;
+  skips ingest if the station is already loaded.
 
 ## Likely next steps
-1. **v2 — METAR store + first tool (NEXT UP).** Build `src/forecaster/store.py` as the
-   ONLY file that touches DuckDB (same seam idea as `llm.py` for the client). Chosen over
-   Postgres deliberately: single-tenant, reproducible (a `.duckdb` file you can ship/hash),
-   embedded (works on the air-gapped SuperCloud node, zero ops), analytics-first, and it
-   queries Parquet/Arrow in place — fits the "arrays-as-files, records-in-DB" rule.
-   - `MetarObs` rows → an `obs` table; attach the real month/year HERE (a METAR alone
-     only carries day + time — that's why `MetarObs` stores `day`/`time`, not a datetime).
-   - Add numeric visibility parsing (statute miles, per DAF Table 8.1) so tools can do math.
-   - Then the first agent TOOL: a trend query (ceiling/vis/wind over the last N hours) the
-     model calls in the loop. Keep all SQL inside `store.py`; tools never see markdown.
-   - Tables to plan for: `obs`, `climo`, `runs`, `scores`, `assets` (file refs).
-2. Build the agent loop + first GRIB tool (skew-T or 200mb winds) — Weeks 1-5.
-3. Build the AF metric harness (TAFVER / OPVER / WARNVER) — Weeks 6-8.
-4. Stand up SuperCloud: Podman images, pre-stage weights, vLLM serve job.
+1. **v2 — METAR store (DONE).** `src/forecaster/store.py` is the ONLY file that touches
+   DuckDB (seam like `llm.py`). Chosen over Postgres deliberately: single-tenant,
+   reproducible (a `.duckdb` file you can ship/hash), embedded (works on the air-gapped
+   SuperCloud node, zero ops), analytics-first, queries Parquet/Arrow in place. `obs`
+   table built; `MetarObs` rows persist with year/month attached here. Numeric visibility
+   (Table 8.1) done. `climo`/`runs`/`scores`/`assets` deferred (YAGNI) — add each when the
+   code that writes it exists; keep all SQL inside `store.py`.
+2. **v2.5 — first agent TOOL + IEM ingestion (DONE).** `query_obs` tool on a read-only
+   conn + `iem.py` loader + end-to-end agent loop, all verified on the KORD snowstorm.
+   Remaining polish when needed: an intent-check that echoes the date range on manual
+   ingest; AWC API path for recent obs; copy-paste path for ad-hoc.
+3. **Harden + grow the toolset (NEXT UP).** Candidate tools: a trend query (ceiling/vis/
+   wind over last N hours), station metadata, climatology lookup. Consider thinning/paging
+   for very wide windows. Watch model reasoning errors (e.g. timestamp conflation seen in
+   testing) — these are what the benchmark must score.
+4. Build the agent loop + first GRIB tool (skew-T or 200mb winds) — Weeks 1-5.
+5. Build the AF metric harness (TAFVER / OPVER / WARNVER) — Weeks 6-8.
+6. Stand up SuperCloud: Podman images, pre-stage weights, vLLM serve job.
 
 ## Open questions to confirm with MIT SuperCloud (supercloud@mit.edu)
 - V100 variant (16 vs 32 GB) on assigned nodes.
