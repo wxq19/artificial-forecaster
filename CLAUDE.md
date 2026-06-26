@@ -53,6 +53,8 @@ must remain a `.env` edit with ZERO code change. Preserve this seam in any sugge
 - **Geospatial / GRIB tools:** eccodes, cfgrib, xarray, cartopy, matplotlib. These are
   C-library-heavy — use **conda-forge**, NOT pip. (Not built yet.)
 - Don't mix the two: app code stays uv/PyPI; the geospatial stack stays conda-forge.
+- **No emojis, ever.** Not in source, comments, docstrings, or generated log/Markdown
+  output. Use plain text (e.g. `PASS`/`FAIL`, not check/cross marks).
 
 ## Architecture (planned)
 - **Split images on HPC:** a GPU serving image (vLLM + VLM) and a CPU tools image

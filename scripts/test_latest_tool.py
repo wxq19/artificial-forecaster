@@ -85,7 +85,9 @@ for _turn in range(MAX_TURNS):
         transcript.append(("model reasoning", reasoning))
 
     if not msg.tool_calls:
-        answer = msg.content or "_(empty — check finish_reason)_"
+        answer, flag = tools.final_answer(msg, finish_reason)
+        if flag:
+            transcript.append(("harness note", flag))
         transcript.append(("model answer", answer))
         break
 
@@ -95,9 +97,9 @@ for _turn in range(MAX_TURNS):
         tool_names.append(tc.function.name)
         transcript.append(("tool call", f"{tc.function.name}({json.dumps(args)})"))
         result = tools.run_tool(tc.function.name, args)
-        transcript.append(("tool result", result))
+        transcript.append(("tool result", result.text))
         messages.append(
-            {"role": "tool", "tool_call_id": tc.id, "content": result}
+            {"role": "tool", "tool_call_id": tc.id, "content": result.text}
         )
 else:
     answer = "_(hit MAX_TURNS without a final answer)_"
