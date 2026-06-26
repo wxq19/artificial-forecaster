@@ -13,6 +13,9 @@ _ALT_HPA = re.compile(r"\bQ(\d{4})\b")            # international, e.g. Q1013
 _VIS_SM = re.compile(r"\b([MP]?(?:\d{1,2} \d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}|\d{1,3})SM)\b")
 _HPA_PER_INHG = 33.8638866667
 _SKY_CLEAR = {"CLR", "SKC", "NSC", "NCD"}         # not real cloud layers
+# A showers group with no phenomenon (VCSH, bare SH) -- the library silently
+# drops these (it keeps VCTS/VCFG/-SHRA). We re-attach from the raw body.
+_SH_ONLY = re.compile(r"^(?:VC|[+-])?SH$")
 # Table 8.1 — reportable visibility, SM <-> meters. A LOOKUP, not physics
 # (1/2SM == 800m, not 804m): the values forecasters actually report. M1/8 folds
 # into the 0.125 row. 9999m ("10 km or more") is the OCONUS max -> treated as >6SM.
@@ -134,7 +137,9 @@ def parse(line: str) -> MetarObs:
     if v := _VIS_SM.search(raw):
         visibility = v.group(1)
     elif m.visibility:
-        visibility = m.visibility.distance
+        # The library renders 9999 ('10 km or more') as '>10000', which is never
+        # how it's reported; show the actual token (9999 = unrestricted).
+        visibility = "9999" if m.visibility.distance == ">10000" else m.visibility.distance
     else:
         visibility = None
 
@@ -146,6 +151,11 @@ def parse(line: str) -> MetarObs:
         + "".join(p.value for p in wc.phenomenons)
         for wc in m.weather_conditions
     ]
+    # Re-attach a showers group the library drops (VCSH / bare SH); standard
+    # present weather. Scan the body only (pre-RMK) so RMK text can't false-match.
+    for tok in raw.split(" RMK ", 1)[0].split():
+        if _SH_ONLY.match(tok) and tok not in weather:
+            weather.append(tok)
 
     auto = bool(re.search(r"\bAUTO\b", raw))
     cavok = bool(re.search(r"\bCAVOK\b", raw))
@@ -244,7 +254,8 @@ def render(obs: list[MetarObs]) -> str:
         return "(no observations)"
     out = [
         f"{obs[0].station} — {len(obs)} observations (UTC, oldest first)",
-        "cols: DD HHMMZ | wind | vis | T/Td(°C) | altimeter | present-wx + sky(ft AGL)",
+        f"  {'DD HHMMZ':<8}  {'wind':<12} {'vis':<8} {'T/Td°C':<8} {'altimeter':<19} "
+        "present-wx + sky(ft AGL)",
     ]
     for o in obs:
         t = f"{_t(o.temp_c)}/{_t(o.dewpoint_c)}"

@@ -1,0 +1,351 @@
+"""TAF text <-> typed TafObs (the forecast input seam, symmetric to metar.py).
+
+A TAF is recursive: a header + a PREVAILING period (wind/vis/wx/sky over the
+whole validity) + a list of CHANGE groups (FM / BECMG / TEMPO, optionally
+PROBxx), each with the very same period shape plus its own validity. So one
+TafGroup models both, and a TafObs is a header + prevailing + groups.
+
+Like metar.py: the library object never escapes parse(); everything downstream
+keys off OUR fields, and the raw line is retained verbatim. The standard ICAO/US
+grammar (incl. US-SM vs intl-meters visibility, CAVOK, PROBxx, TX/TN) is fully
+handled by the library; the only military tokens it drops are QNHxxxxINS (read
+exact from raw here, like METAR pressure) and NSW (survives in the raw line).
+"""
+
+import re
+from datetime import time
+
+from pydantic import BaseModel
+from metar_taf_parser.parser.parser import TAFParser
+
+from forecaster.metar import CloudLayer, _parse_vis, _SH_ONLY
+
+_PARSER = TAFParser()
+_QNH = re.compile(r"\bQNH(\d{4})INS\b")           # US-military altimeter forecast; library drops it
+_SKY_CLEAR = {"CLR", "SKC", "NSC", "NCD"}         # not real cloud layers
+# Change-group boundaries, in raw order. PROBxx greedily absorbs a following
+# TEMPO/BECMG so 'PROB30 TEMPO' is ONE boundary (the library merges it to one trend).
+_BOUNDARY = re.compile(r"\b(?:PROB\d{2}(?:\s+(?:TEMPO|BECMG))?|FM\d{6}|BECMG|TEMPO)\b")
+# Same boundaries plus the TX/TN group, for re-inserting conventional TAF line
+# breaks in the raw view (the json feed delivers one flat line).
+_REFLOW = re.compile(r"\b(?:PROB\d{2}(?:\s+(?:TEMPO|BECMG))?|FM\d{6}|BECMG|TEMPO|TX\d{2}/)")
+
+
+class TafTemp(BaseModel):
+    temp_c: int                # forecast max (TX) or min (TN) temperature
+    day: int                   # day-of-month it occurs
+    hour: int                  # UTC hour it occurs
+
+
+class TafGroup(BaseModel):
+    """One forecast period. change_type=None is the PREVAILING group; otherwise
+    FM / BECMG / TEMPO. probability is set for PROB30/PROB40 groups."""
+
+    change_type: str | None    # None=prevailing, else 'FM' | 'BECMG' | 'TEMPO'
+    probability: int | None    # 30 or 40 for PROBxx groups, else None
+    from_day: int | None       # period start (day/hour); FM also carries minutes
+    from_hour: int | None
+    from_minute: int | None
+    to_day: int | None         # period end; None for FM (runs until the next group)
+    to_hour: int | None
+    wind_dir_deg: int | None
+    wind_dir_card: str | None  # cardinal, or 'VRB'
+    wind_speed: int | None
+    wind_gust: int | None
+    wind_unit: str | None      # KT, or MPS (some intl stations)
+    visibility: str | None     # reported token, e.g. 'P6SM', '9999m', '>10000m'
+    vis_sm: float | None       # numeric statute miles (metar Table 8.1 lookup)
+    vis_m: int | None          # numeric meters
+    vis_flag: str | None       # 'M' (<), 'P' (>), or None (exact)
+    cavok: bool
+    weather: list[str]         # forecast present-weather groups, e.g. ['-SHRA', 'VCTS']
+    clouds: list[CloudLayer]
+    qnh_inhg: float | None = None   # per-group QNHxxxxINS (US military); None for civil TAFs
+
+
+class TafObs(BaseModel):
+    """One parsed terminal aerodrome forecast. OURS — the library object never
+    escapes parse()."""
+
+    station: str
+    issue_day: int             # day-of-month the TAF was issued
+    issue_time: time           # UTC issue time
+    valid_from_day: int | None
+    valid_from_hour: int | None
+    valid_to_day: int | None
+    valid_to_hour: int | None
+    amendment: bool            # AMD
+    corrected: bool            # COR
+    nil: bool                  # NIL (no forecast)
+    canceled: bool             # CNL
+    qnh_inhg: float | None     # initial QNHxxxxINS (US military); None for civil TAFs
+    prevailing: TafGroup
+    groups: list[TafGroup]     # change groups, in TAF order
+    max_temp: TafTemp | None   # TX
+    min_temp: TafTemp | None   # TN
+    raw: str                   # original line, untouched
+
+
+def _weather(conditions) -> list[str]:
+    """Rebuild each group's METAR/TAF token from the parsed enums (.value is the
+    raw code), exactly like metar.parse does."""
+    return [
+        (wc.intensity.value if wc.intensity else "")
+        + (wc.descriptive.value if wc.descriptive else "")
+        + "".join(p.value for p in wc.phenomenons)
+        for wc in conditions
+    ]
+
+
+def _clouds(clouds) -> list[CloudLayer]:
+    return [
+        CloudLayer(
+            cover=c.quantity.name,
+            height_ft=c.height,
+            type=c.type.name if c.type else None,
+        )
+        for c in clouds
+        if c.quantity.name not in _SKY_CLEAR
+    ]
+
+
+def _vis_str(v) -> str | None:
+    """Library Visibility -> the token as actually reported: US statute miles
+    ('P6SM') or intl/military meters ('9999', '9000'). The library renders 9999 as
+    '>10000', which is never how it's reported -- map it back to 9999 (unrestricted)."""
+    if v is None:
+        return None
+    if str(v.unit).endswith("SM"):
+        return f"{v.distance}SM"
+    return "9999" if str(v.distance) == ">10000" else str(v.distance)
+
+
+# Table 8.1 fractional statute-mile labels (the reportable rows below 1 SM and the
+# eighths above), for formatting the SM equivalent shown beside meters vis.
+_SM_FRACS = {
+    0.0625: "1/16", 0.125: "1/8", 0.1875: "3/16", 0.25: "1/4", 0.3125: "5/16",
+    0.375: "3/8", 0.5: "1/2", 0.625: "5/8", 0.75: "3/4", 0.875: "7/8",
+}
+
+
+def _fmt_sm(sm: float, flag: str | None) -> str:
+    """Numeric SM -> a reported-style token: 6.0/'P' -> 'P6SM', 1.25 -> '1 1/4SM'."""
+    pre = flag or ""
+    whole = int(sm)
+    rem = round(sm - whole, 4)
+    if rem == 0:
+        body = str(whole)
+    elif (frac := _SM_FRACS.get(rem)) is None:
+        body = f"{sm:g}"
+    else:
+        body = frac if whole == 0 else f"{whole} {frac}"
+    return f"{pre}{body}SM"
+
+
+def _vis_numeric(v) -> tuple[float | None, int | None, str | None]:
+    """Numeric (sm, m, flag) via metar's Table 8.1 lookup -- reusing the single
+    source of truth so forecast vis is directly comparable to observed METAR vis.
+    Rebuilds the token metar._parse_vis expects: 'P6SM' for SM, the bare meters
+    string (with any >/M prefix) otherwise."""
+    if v is None:
+        return None, None, None
+    token = f"{v.distance}SM" if str(v.unit).endswith("SM") else str(v.distance)
+    return _parse_vis(token)
+
+
+def _validity(v) -> tuple[int | None, int | None, int | None, int | None, int | None]:
+    """(from_day, from_hour, from_minute, to_day, to_hour). FM groups carry a
+    single start instant (note the library's 'strart_minutes' typo) and no end;
+    BECMG/TEMPO/overall carry a start..end window."""
+    if v is None:
+        return (None, None, None, None, None)
+    if hasattr(v, "end_hour"):                 # Validity — a start..end window
+        return (v.start_day, v.start_hour, 0, v.end_day, v.end_hour)
+    return (v.start_day, v.start_hour, getattr(v, "strart_minutes", 0), None, None)  # FMValidity
+
+
+def _period(src, change_type: str | None, probability: int | None, valid) -> TafGroup:
+    """Build a TafGroup from a library TAF (prevailing) or TAFTrend (change group)
+    — both expose the same wind/visibility/clouds/weather_conditions/cavok shape."""
+    fd, fh, fm, td, th = valid
+    w = src.wind
+    sm, m, flag = _vis_numeric(src.visibility)
+    return TafGroup(
+        change_type=change_type,
+        probability=probability,
+        from_day=fd, from_hour=fh, from_minute=fm, to_day=td, to_hour=th,
+        wind_dir_deg=w.degrees if w else None,
+        wind_dir_card=w.direction if w else None,
+        wind_speed=w.speed if w else None,
+        wind_gust=w.gust if w else None,
+        wind_unit=w.unit if w else None,
+        visibility=_vis_str(src.visibility),
+        vis_sm=sm, vis_m=m, vis_flag=flag,
+        cavok=bool(src.cavok),
+        weather=_weather(src.weather_conditions),
+        clouds=_clouds(src.clouds),
+    )
+
+
+def _split_periods(raw: str) -> list[str]:
+    """Slice raw into chunks aligned with [prevailing, *trends], so a dropped
+    token can be re-attributed to the group it belongs to. The first chunk (up to
+    the first change-group keyword) is the prevailing conditions."""
+    bounds = [m.start() for m in _BOUNDARY.finditer(raw)]
+    if not bounds:
+        return [raw]
+    chunks = [raw[: bounds[0]]]
+    for i, b in enumerate(bounds):
+        end = bounds[i + 1] if i + 1 < len(bounds) else len(raw)
+        chunks.append(raw[b:end])
+    return chunks
+
+
+def _recover_showers(chunk: str, weather: list[str]) -> None:
+    """Append any bare-showers group (VCSH / SH) the library silently drops -- it
+    is standard present weather, common in TAFs. Mutates `weather` in place."""
+    for tok in chunk.split():
+        if _SH_ONLY.match(tok) and tok not in weather:
+            weather.append(tok)
+
+
+def parse(line: str) -> TafObs:
+    raw = line.strip().rstrip("=").strip()
+    t = _PARSER.parse(raw)                          # library handles the 'TAF [AMD|COR]' prefix
+
+    qnh = int(q.group(1)) / 100 if (q := _QNH.search(raw)) else None
+    vf = _validity(t.validity)
+    mx, mn = t.max_temperature, t.min_temperature
+
+    prevailing = _period(t, None, None, vf)
+    groups = [
+        _period(tr, tr.type.name, tr.probability, _validity(tr.validity))
+        for tr in t.trends
+    ]
+    # Re-attach showers groups the library drops. Each raw chunk lines up with
+    # [prevailing, *trends]; if the split doesn't align 1:1 we skip recovery (the
+    # token still survives in the retained raw line either way).
+    periods = [prevailing, *groups]
+    chunks = _split_periods(raw)
+    if len(chunks) == len(periods):
+        for chunk, period in zip(chunks, periods):
+            _recover_showers(chunk, period.weather)
+            # NSW ('no significant weather' -- weather is forecast to end) is also
+            # dropped by the library; re-attach it so the decoded view shows it
+            # instead of a misleading blank.
+            if "NSW" in chunk.split() and "NSW" not in period.weather:
+                period.weather.append("NSW")
+            if cq := _QNH.search(chunk):     # military TAFs carry a QNH per group
+                period.qnh_inhg = int(cq.group(1)) / 100
+
+    return TafObs(
+        station=t.station,
+        issue_day=t.day,
+        issue_time=t.time,
+        valid_from_day=vf[0], valid_from_hour=vf[1],
+        valid_to_day=vf[3], valid_to_hour=vf[4],
+        amendment=bool(t.amendment),
+        corrected=bool(t.corrected),
+        nil=bool(t.nil),
+        canceled=bool(t.canceled),
+        qnh_inhg=qnh,
+        prevailing=prevailing,
+        groups=groups,
+        max_temp=TafTemp(temp_c=mx.temperature, day=mx.day, hour=mx.hour) if mx else None,
+        min_temp=TafTemp(temp_c=mn.temperature, day=mn.day, hour=mn.hour) if mn else None,
+        raw=raw,
+    )
+
+
+def _wind(g: TafGroup) -> str:
+    if g.wind_speed is None:
+        return "—"
+    if g.wind_speed == 0:
+        return "calm"
+    d = f"{g.wind_dir_deg:03d}" if g.wind_dir_deg is not None else (g.wind_dir_card or "VRB")
+    gust = f"G{g.wind_gust}" if g.wind_gust else ""
+    return f"{d}/{g.wind_speed}{gust}{g.wind_unit}"
+
+
+def _sky(clouds: list[CloudLayer]) -> str:
+    if not clouds:
+        return "SKC"
+    return " ".join(
+        c.cover + (f"{c.height_ft}ft" if c.height_ft is not None else "") + (c.type or "")
+        for c in clouds
+    )
+
+
+def _vis_display(g: TafGroup) -> str:
+    """Reported token, with the statute-mile equivalent appended for meters vis so
+    the AF (SM) reader isn't left converting: '9999 (P6SM)', '4800 (3SM)'. SM
+    reports and CAVOK stand alone."""
+    if g.cavok:
+        return "CAVOK"
+    if g.visibility is None:
+        return "—"
+    if g.visibility.endswith("SM") or g.vis_sm is None:
+        return g.visibility
+    return f"{g.visibility} ({_fmt_sm(g.vis_sm, g.vis_flag)})"
+
+
+def _group_line(g: TafGroup, show_qnh: bool) -> str:
+    if g.change_type is None:
+        head = "INIT"
+    elif g.change_type == "FM":
+        head = f"FM {g.from_day:02d}{g.from_hour:02d}{g.from_minute:02d}Z"
+    else:
+        window = f"{g.from_day:02d}{g.from_hour:02d}/{g.to_day:02d}{g.to_hour:02d}"
+        if not g.probability:
+            head = f"{g.change_type} {window}"
+        elif g.change_type == "PROB":              # bare PROBxx group: PROB is the keyword
+            head = f"PROB{g.probability} {window}"
+        else:                                      # PROBxx qualifying a TEMPO/BECMG
+            head = f"PROB{g.probability} {g.change_type} {window}"
+    vis = _vis_display(g)
+    wx = " ".join(g.weather)
+    tail = f"{wx}  {_sky(g.clouds)}" if wx else _sky(g.clouds)
+    cols = f"  {head:<22} {_wind(g):<13} {vis:<12}"
+    if show_qnh:                                  # only for military TAFs that carry QNH
+        cols += f" {(f'{g.qnh_inhg:.2f}inHg' if g.qnh_inhg else ''):<10}"
+    return f"{cols} {tail}"
+
+
+def _reflow(raw: str) -> str:
+    """Re-insert the conventional TAF line breaks the json feed strips: each change
+    group (and the TX/TN group) onto its own indented continuation line."""
+    return _REFLOW.sub(lambda m: "\n     " + m.group(0), raw)
+
+
+def render(obs: TafObs) -> str:
+    """Decoded view for the messages array, with the raw TAF underneath (line
+    breaks restored) so nothing the decoder dropped (NSW, RMK) is lost to the model."""
+    flags = " ".join(
+        f for f, on in [("AMD", obs.amendment), ("COR", obs.corrected),
+                        ("NIL", obs.nil), ("CNL", obs.canceled)] if on
+    )
+    valid = (
+        f"{obs.valid_from_day:02d}{obs.valid_from_hour:02d}/"
+        f"{obs.valid_to_day:02d}{obs.valid_to_hour:02d}"
+        if obs.valid_from_day is not None else "—"
+    )
+    periods = [obs.prevailing, *obs.groups]
+    show_qnh = any(g.qnh_inhg for g in periods)
+    header = (
+        f"  {'group':<22} {'wind':<13} {'vis':<12}"
+        + (f" {'QNH':<10}" if show_qnh else "")
+        + " present-wx + sky(ft AGL)"
+    )
+    out = [
+        f"{obs.station} TAF {('[' + flags + '] ') if flags else ''}"
+        f"issued {obs.issue_day:02d} {obs.issue_time.strftime('%H%MZ')}, valid {valid}",
+        header,
+    ]
+    out += [_group_line(g, show_qnh) for g in periods]
+    if obs.max_temp:
+        line = f"  TX {obs.max_temp.temp_c}C @ {obs.max_temp.day:02d}{obs.max_temp.hour:02d}Z"
+        if obs.min_temp:
+            line += f"   TN {obs.min_temp.temp_c}C @ {obs.min_temp.day:02d}{obs.min_temp.hour:02d}Z"
+        out.append(line)
+    out += ["", "Raw:", f"  {_reflow(obs.raw)}"]
+    return "\n".join(out)

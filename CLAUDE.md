@@ -79,8 +79,17 @@ artificial-forecaster/
 ├── pyproject.toml        # has [tool.hatch.build.targets.wheel] + [tool.uv] package=true
 ├── src/forecaster/
 │   ├── config.py         # typed settings, reads .env (the ONLY config source)
-│   └── llm.py            # the ONLY file that builds the OpenAI client
-└── test_endpoint.py      # text + vision smoke test
+│   ├── llm.py            # the ONLY file that builds the OpenAI client (seam)
+│   ├── metar.py          # METAR text <-> typed MetarObs (input seam)
+│   ├── store.py          # the ONLY file that touches DuckDB (seam)
+│   ├── iem.py            # historical METAR ingestion (IEM)
+│   ├── wxcodes.py        # present-weather classify + deterministic severity rule
+│   ├── charts.py         # the ONLY file that imports matplotlib (meteogram/wx_timeline)
+│   └── tools.py          # agent-facing read tools + loop plumbing (-> agent.py later)
+├── scripts/              # dev + end-to-end test drivers (markdown logs -> logs/)
+├── docs/                 # references (FMH-1 wx table, AFMAN 15-124, AFH 15-101)
+├── data/                 # GITIGNORED: forecaster.duckdb, charts/temp/ (throwaway)
+└── logs/                 # run transcripts (markdown)
 ```
 
 ## Secrets hygiene (hard rule)
@@ -156,7 +165,84 @@ artificial-forecaster/
   spilled the whole answer into the `reasoning` field, leaving `content` EMPTY (finish_reason
   `stop`, not `length` — so it's not a token cap). Mitigated by a "state it ONCE and stop"
   instruction in the prompt (8340→5050 completion tok, content populated, answer still right).
-  NOT eliminated — see harness guard in next steps.
+  NOT eliminated — mitigated by the harness guard below.
+- HARNESS GUARD (DONE): `tools.final_answer(msg, finish_reason)` recovers a correct answer
+  stranded in the `reasoning` field (content empty + reasoning present + finish_reason `stop`)
+  instead of logging blank — the rumination case above. Wired into the drivers.
+- THIRD tool = a METEOGRAM image (the architecture keystone): `get_trend` renders a 5-panel
+  meteogram (T/Td, wind, vis, ceiling, pressure) + a CURATED colored present-weather band → PNG,
+  fed BACK to the VLM as a base64 image. `src/forecaster/charts.py` is the ONLY file that imports
+  matplotlib (seam; Agg backend; returns PNG bytes, no disk I/O). Two charts: `meteogram()` (band
+  = top-2-frequent ∪ top-3-severe families + a small phenomenon×intensity key) and standalone
+  `wx_timeline()` (ALL families + full legend). matplotlib is PyPI-clean → stays in the uv app
+  tier (conda is still only for cfgrib/cartopy later). Model/dev charts write to `data/charts/temp/`
+  (throwaway, recreatable). Default look-back 24h, cap 48h.
+- Present-weather SEVERITY is a deterministic manual rule: `src/forecaster/wxcodes.py` maps each
+  METAR wx group to (family=color, intensity=opacity, severity 0-10). Grounded in the FMH-1 table
+  (docs/Present Weather Values.png). Fixed tiers for convective/frozen precip (TS/FZ descriptors
+  dominate; left-most-in-tier worse via decimal fractions); +/-/VC adjusts precip; OBSCURATIONS are
+  vis-driven (severity = associated visibility via FAA flight-category buckets) since they have no
+  -/+ — except VA (engine hazard, fixed high). DZ treated as an obscuration. Deferred as cosmetic:
+  BL/MI/SH/UP descriptor nuances (severity already comes from the code + values).
+- IMAGE-RETURN plumbing: a tool reply is text-only in the OpenAI format, so a chart can't ride in
+  the `tool` message. `run_tool` returns `ToolResult(text, images: list[bytes], window)`;
+  `tools.tool_messages(call_id, result)` emits the required `tool` receipt PLUS a follow-up `user`
+  message carrying each PNG as a base64 image_url. `images` is a LIST so one call can return several
+  charts (v2). Verified: model calls get_trend → reads the meteogram → reasons over panels AND the
+  color band.
+- IMAGE-vs-TEXT finding (benchmark-relevant): the model reads the chart's SHAPE well, but raw-METAR
+  TEXT caught what the image can't — wind DIRECTION shift + BLSN + exact values. Using BOTH is best
+  ONLY when the two tools cover the SAME window; when windows desync the model fuses contradictory
+  inputs into a confident WRONG answer and won't self-flag the conflict.
+- TIME-CORRELATION fixes (1+2+3) from that finding, all in `tools.py`:
+  - Fix 1: `query_obs` gained a RELATIVE `hours` mode anchored SERVER-SIDE on the latest ob —
+    identical anchor to get_trend, so "last 24h" resolves to the SAME window via our code; the model
+    never computes timestamps. Absolute start/end kept for historical ranges.
+  - Fix 2: every time-bounded result echoes a canonical `window: <start>Z .. <end>Z` line.
+  - Fix 3: `tools.window_conflict(windows)` — conversation-wide, flags ANY distinct windows with a
+    non-blocking advisory injected as a `user` message before the next turn. `ToolResult.window`
+    carries the machine-readable span.
+  - Two bugs found+fixed: (a) tz-AWARE (`fromisoformat('...Z')`) vs naive obs_time windows compared
+    unequal → false-positive note; normalized to naive UTC (`_naive_utc`) — the naive-UTC seam
+    contract again. (b) a mid-conversation `role:system` message → Together 400; inject notes as
+    `role:user`. Finding: Fixes 1+2 are robust enough the model self-aligns even when coerced toward
+    absolute dates (chains get_latest to anchor, or copies the echoed window); Fix 3 is the backstop.
+    All loop plumbing (final_answer, tool_messages, window_conflict) → migrate to a future `agent.py`.
+- AWC LIVE client + TAF PARSE SEAM (this session). `src/forecaster/awc.py` — live aviationweather.gov
+  client (seam like `iem.py`, no SQL/duckdb of its own). `fetch_metar`/`fetch_taf` use format=json so every
+  report arrives with an AUTHORITATIVE epoch/ISO timestamp (and, for METARs, metarType=METAR/SPECI — no
+  second fetch like IEM needs); the raw TAF is ONE line (the raw text format wraps). Serves the military
+  aerodromes IEM does NOT. `awc.load_metar` = the orchestrator half (fetch→metar.parse→store.insert_obs,
+  source='awc'); idempotent + dedups against IEM rows via the (station, obs_time) PK. Verified KORD/KIND live.
+- `src/forecaster/taf.py` — TAF text → typed `TafObs` (the forecast INPUT seam, symmetric to metar.py). Uses
+  the SAME library's `TAFParser` (no new dep). Recursive shape: one `TafGroup` models the PREVAILING period
+  AND each change group (FM/BECMG/TEMPO, optional PROBxx). Library handles the full ICAO/US grammar (US-SM vs
+  intl-meters vis, CAVOK, PROBxx, TX/TN, FM minutes); object never escapes; raw retained.
+- TAF library gaps found empirically (all survive in raw): (a) QNHxxxxINS (US-military altimeter) dropped →
+  read EXACT from raw, PER-GROUP (`TafGroup.qnh_inhg`), rendered as a column ONLY for military TAFs. (b) NSW
+  ('no significant weather' = weather forecast to END) dropped → re-attached to the group's weather so the
+  decoded view isn't a misleading blank. (c) VCSH / bare SH (a showers descriptor with NO phenomenon) silently
+  dropped — the library keeps VCTS/VCFG/-SHRA. Recovered from raw in BOTH taf.py AND metar.py (same library,
+  same blind spot; `_SH_ONLY` lives in metar.py, imported by taf). Per-group recovery rides a `_split_periods`
+  chunk-align (PROBxx absorbs a trailing TEMPO/BECMG = one boundary); skips if it can't align 1:1.
+- TAF/METAR vis DISPLAY: never show the library's '>10000' (9999 = unrestricted, never reported as >10000) —
+  both modules show the reported token (P6SM / 9999). TAF meters vis carries the SM equivalent inline
+  ('9999 (P6SM)', '4800 (3SM)') via `metar._parse_vis` (Table 8.1, single source) so the AF SM reader (TAFVER
+  unit) isn't left converting; numeric `vis_sm/vis_m/vis_flag` on `TafGroup`. TAF raw view is REFLOWED (json is
+  one flat line) onto conventional per-group lines. Render bugs shaken out by the drivers: the 'm'-suffix wart;
+  a BARE PROBxx group printing 'PROB30 PROB ...' (change_type IS 'PROB') → 'PROB30 2621/2701'; and metar.py's
+  prose 'cols:' legend → a real aligned column header.
+- Drivers: `scripts/test_taf.py` (live fetch → parse → render → model; military+civil+intl spread) and
+  `scripts/test_taf_verify.py` (the FULL new path: load_metar ingest → store read-back → render → manual TAFVER
+  reasoning over the elapsed validity). Both use the final_answer guard + a 'state once' nudge + MAX_TOKENS 12288.
+- MODEL FINDING (benchmark-relevant): Qwen3.5 RUMINATES to the token cap on TAF tasks (finish_reason=length,
+  content empty) — model-specific, NOT prompt-fixable; the guard flags it cleanly vs a silent blank. Gemma
+  (`google/gemma-4-31B-it`) answered the SAME tasks cleanly+concisely (stop, ~800-1300 tok) and read every
+  render feature (dual-unit vis, per-line QNH, ceiling=lowest BKN/OVC, recovered NSW/VCSH). Tier choice matters.
+- TAFVER TIME-ALIGNMENT finding (from test_taf_verify): a FRESHLY-issued TAF has ~0 elapsed validity, so
+  'current TAF + last 24h obs' is degenerate — only ob(s) after valid_from overlap (1 ob in the KIND run; the
+  other 29 predate the TAF). The verification REASONING works; it needs a TIME-ALIGNED TAF (an archived TAF
+  valid over the window, or persist-then-score via a future `taf` table). Deferred with TAFVER (step 7).
 
 ## Likely next steps
 1. **v2 — METAR store (DONE).** `src/forecaster/store.py` is the ONLY file that touches
@@ -170,22 +256,28 @@ artificial-forecaster/
    conn + `iem.py` loader + end-to-end agent loop, all verified on the KORD snowstorm.
    Remaining polish when needed: an intent-check that echoes the date range on manual
    ingest; AWC API path for recent obs; copy-paste path for ad-hoc.
-3. **Harden + grow the toolset (IN PROGRESS).** `get_latest_obs` added; tool-selection +
-   dependent-chain both verified. Candidate tools still open: a trend query (ceiling/vis/
-   wind over last N hours), station metadata, climatology lookup. Consider thinning/paging
-   for very wide windows. Watch model reasoning errors (timestamp conflation, rumination) —
-   these are what the benchmark must score. On tool count: don't fold tools into one
-   mode-switch mega-tool (moves the choice into arg-filling, muddies descriptions); keep
-   distinct verbs, namespace by data domain, and subset `TOOLS` per task phase as the
-   catalog grows — the "5-10 tools" limit is about CONFUSABILITY, not raw count.
-   - HARNESS GUARD (TODO, deferred this session): the agent loop reads the answer from
-     `msg.content` only. When a reasoning model leaves `content` empty but `reasoning` is
-     non-empty (the rumination case above), a CORRECT answer logs as blank — a silent
-     scoring bug. Add: if `content` is empty + `reasoning` present + finish_reason `stop`,
-     surface/flag the reasoning. Cheap insurance once the eval harness scores real runs.
-4. Build the agent loop + first GRIB tool (skew-T or 200mb winds) — Weeks 1-5.
-5. Build the AF metric harness (TAFVER / OPVER / WARNVER) — Weeks 6-8.
-6. Stand up SuperCloud: Podman images, pre-stage weights, vLLM serve job.
+3. **Harden + grow the toolset (DONE).** `get_latest_obs` + `get_trend` (meteogram image),
+   tool-selection + dependent-chain + image-return all verified; harness guard + time-correlation
+   Fixes 1-3 landed (see Status). Tool-count guidance still holds: distinct verbs, namespace by
+   data domain, subset `TOOLS` per phase — the "5-10 tools" limit is about CONFUSABILITY, not raw
+   count. Still-open candidate tools if needed: station metadata, climatology lookup.
+4. **TAF + METAR LIVE grabber from AWC (DONE).** `src/forecaster/awc.py` (fetch_metar/fetch_taf +
+   load_metar) pulls live obs AND TAFs — incl. the military sites IEM does NOT serve — and the
+   `src/forecaster/taf.py` PARSE seam (TafObs) is built and validated (see Status). Live METARs persist
+   via `load_metar` (source='awc'); TAFs are fetch+parse only (no `taf` table yet — see step 7).
+5. **TAF output seam + parse checker (from AFMAN 15-124 Ch.1, in docs/).** Define a `TafProduct`
+   structure (validity period, FM/BECMG/TEMPO/PROB groups, wind/vis/wx/sky) that renders to VALID
+   TAF text AND parses back — the OUTPUT seam symmetric to `MetarObs` on the input side — plus a
+   format/parse checker that validates a TAF against the AFMAN 15-124 rules.
+6. **Generate a first TAF.** Agent: obs up to a cutoff T + the trend meteogram → emit a TafProduct.
+   A persistence-only TAF is KNOWN to verify badly — expected; the point is the end-to-end product.
+7. **TAFVER scoring (LATER).** Score a generated TAF against the observed METARs T→T+24h — we
+   already own the truth in the DB, so self-scoring needs NO TAF source. Compare vs human TAF + raw
+   NWP (GFS/GALWEM) once those inputs exist. NOTE (from test_taf_verify): verification needs a
+   TIME-ALIGNED TAF — a current TAF barely overlaps PAST obs. Build the deferred `taf` table here
+   (persist each TAF as issued → score once obs accumulate under its validity), or pull an archived TAF.
+8. Later: first GRIB tool (skew-T / 200mb winds) + the conda geospatial stack; AF metric harness
+   (OPVER/WARNVER); SuperCloud (Podman images, pre-stage weights, vLLM serve job).
 
 ## Open questions to confirm with MIT SuperCloud (supercloud@mit.edu)
 - V100 variant (16 vs 32 GB) on assigned nodes.
