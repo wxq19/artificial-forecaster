@@ -44,21 +44,49 @@ QUERY_OBS = {
     },
 }
 
-TOOLS = [QUERY_OBS]
+GET_LATEST = {
+    "type": "function",
+    "function": {
+        "name": "get_latest_obs",
+        "description": (
+            "Most recent observation(s) for an airport, newest first. Use this "
+            "when asked about current conditions or 'right now' and NO explicit "
+            "time range is given; use query_obs when a date/time range is given."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {
+                    "type": "string",
+                    "description": "4-letter ICAO identifier, e.g. KORD",
+                },
+                "n": {
+                    "type": "integer",
+                    "description": "How many recent obs to return (default 1)",
+                },
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+TOOLS = [QUERY_OBS, GET_LATEST]
 
 
-def _fmt(rows: list[dict]) -> str:
+def _fmt(rows: list[dict], order: str = "oldest first") -> str:
     """Per ob: a decoded summary line (our normalized vis_sm/ceiling_ft) followed
     by the RAW METAR beneath it, so nothing the decoder skips — RMK, RVR, exact
     pressure, peak wind — is lost to the model. The raw line is the ground truth;
-    the decoded line is a scannable convenience."""
+    the decoded line is a scannable convenience. `order` only labels the header to
+    match how the caller sorted the rows (range reads run oldest-first; a 'latest'
+    read stays newest-first — the sort order carries intent, so we don't flatten it)."""
     if not rows:
         return "(no observations in range)"
     out = [
-        f"{len(rows)} observations (UTC, oldest first). Each ob: decoded summary, "
+        f"{len(rows)} observations (UTC, {order}). Each ob: decoded summary, "
         "then the raw METAR/SPECI beneath. A SPECI means weather forced an "
         "off-cycle report — treat it as a significance signal.",
-        "decoded cols: DDHHMMz | type | wind | vis | ceiling | present-wx | T/Td(C)",
+        "decoded cols: UTC time (ISO) | type | wind | vis | ceiling | present-wx | T/Td(C)",
     ]
     for r in rows:
         wind = "—"
@@ -76,7 +104,7 @@ def _fmt(rows: list[dict]) -> str:
         td = f"{r['temp_c']}/{r['dewpoint_c']}"
         kind = r["report_type"] or "—"
         out.append(
-            f"  {r['obs_time']:%d%H%MZ} {kind:<5} {wind:<11} {vis:<7} {ceil:<7} {wx:<14} {td}"
+            f"  {r['obs_time']:%Y-%m-%dT%H:%MZ} {kind:<5} {wind:<11} {vis:<7} {ceil:<7} {wx:<14} {td}"
         )
         out.append(f"    {r['raw']}")
     return "\n".join(out)
@@ -84,20 +112,26 @@ def _fmt(rows: list[dict]) -> str:
 
 def run_tool(name: str, args: dict, *, db_path: str | None = None) -> str:
     """Execute a model-issued tool call against a READ-ONLY connection."""
-    if name != "query_obs":
-        return f"error: unknown tool {name!r}"
     con = (
         store.connect(db_path, read_only=True)
         if db_path
         else store.connect(read_only=True)
     )
     try:
-        rows = store.window(
-            con,
-            args["station"].upper(),
-            datetime.fromisoformat(args["start"]),
-            datetime.fromisoformat(args["end"]),
-        )
+        station = args["station"].upper()
+        if name == "query_obs":
+            rows = store.window(
+                con,
+                station,
+                datetime.fromisoformat(args["start"]),
+                datetime.fromisoformat(args["end"]),
+            )
+            order = "oldest first"
+        elif name == "get_latest_obs":
+            rows = store.latest(con, station, args.get("n", 1))
+            order = "newest first"
+        else:
+            return f"error: unknown tool {name!r}"
     finally:
         con.close()
-    return _fmt(rows)
+    return _fmt(rows, order)

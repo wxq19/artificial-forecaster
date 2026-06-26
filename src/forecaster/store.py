@@ -7,7 +7,7 @@ time (see insert_obs). All times are UTC.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 import duckdb
 
@@ -131,13 +131,27 @@ def insert_obs(
 
 
 def latest(con: duckdb.DuckDBPyConnection, station: str, limit: int = 1) -> list[dict]:
-    """Most-recent obs for a station, newest first — a basic round-trip read."""
+    """Most-recent obs for a station, newest first — a basic round-trip read. Like
+    window(), deserializes the JSON columns so callers get `weather: list[str]` and
+    `clouds: list[dict]`, not raw JSON text — the store boundary always hands back
+    Python objects."""
     cur = con.execute(
         "SELECT * FROM obs WHERE station = ? ORDER BY obs_time DESC LIMIT ?",
         [station, limit],
     )
     cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    for row in rows:
+        row["weather"] = json.loads(row["weather"]) if row["weather"] else []
+        row["clouds"] = json.loads(row["clouds"]) if row["clouds"] else []
+    return rows
+
+
+def _to_naive_utc(dt: datetime) -> datetime:
+    """obs_time is stored naive-UTC; coerce any tz-aware bound to naive UTC so a
+    'Z'/offset suffix can't shift the window by the session's local offset (DuckDB
+    reconciles a tz-aware param against the naive column via local time)."""
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
 def window(
@@ -149,6 +163,7 @@ def window(
     """Obs for a station within [start, end] (UTC), chronological. The JSON
     columns are deserialized back to Python here — callers (e.g. the agent tool)
     get `weather: list[str]` and `clouds: list[dict]`, not raw JSON text."""
+    start, end = _to_naive_utc(start), _to_naive_utc(end)
     cur = con.execute(
         "SELECT * FROM obs WHERE station = ? AND obs_time BETWEEN ? AND ? "
         "ORDER BY obs_time",

@@ -129,12 +129,32 @@ artificial-forecaster/
   (AWC/Skyvector show routine+SPECI only). Module-level min-interval throttle spaces every
   request (IEM rate-limits bursts hard). Validated: KORD Jan 2024 snowstorm → 97 obs
   (48 METAR + 49 SPECI), 0 MADISHF.
-- First agent TOOL + loop built: `src/forecaster/tools.py` exposes `query_obs` (the ONLY
-  registered tool) → `store.window` on a `read_only=True` conn. Returns a decoded summary
-  + the RAW METAR/SPECI beneath each ob (so RMK/RVR/SLP/peak-wind aren't lost) + the type
-  tag. The model CANNOT reach IEM — only this DB read is on its menu. `scripts/test_iem_tool.py`
-  drives the end-to-end loop (NL question → tool call → answer) with a markdown log;
-  skips ingest if the station is already loaded.
+- First agent TOOL + loop built: `src/forecaster/tools.py` exposes read tools →
+  `store` on a `read_only=True` conn. Returns a decoded summary + the RAW METAR/SPECI
+  beneath each ob (so RMK/RVR/SLP/peak-wind aren't lost) + the type tag. The model
+  CANNOT reach IEM — only DB reads are on its menu. `scripts/test_iem_tool.py` drives
+  the end-to-end loop (NL question → tool call → answer) with a markdown log; skips
+  ingest if the station is already loaded.
+- SECOND tool: `get_latest_obs` (most recent N obs, newest-first) → `store.latest`.
+  `TOOLS = [query_obs, get_latest]`. Tested two-tool SELECTION (`scripts/test_latest_tool.py`:
+  no-range "what now" → picks get_latest, not query_obs) and a DEPENDENT two-call chain
+  (`scripts/test_vis_match.py`: get_latest anchors "now" → query_obs builds the 24h window).
+  Parallel vs sequential: independent calls go in ONE turn (`for tc in msg.tool_calls`);
+  dependent calls need the outer turn loop (B's args come from A's result).
+- Three seam/render bugs shaken out by those tests, each a benchmark-relevant finding:
+  (a) `store.latest` now deserializes the JSON cols like `window` — it was returning JSON
+  STRINGS, so `_fmt` joined chars and garbled present-wx. (b) `_fmt`'s decoded line now
+  prints a FULL ISO UTC stamp (`2024-01-13T23:51Z`) not bare `DDHHMMZ` — killed the model's
+  DDHHMM→HH:MM:SS misparse AND its year-GUESSING (year now read from data; the raw line
+  still shows DDHHMMZ for fidelity). (c) `store.window` coerces tz-aware bounds to naive
+  UTC via `_to_naive_utc` — a `Z`-suffixed start/end shifted the window by the host's local
+  offset (8h) → silent undercount even though the model reasoned PERFECTLY. The seam owns
+  the naive-UTC contract; this is the "infra bug masquerading as a model error" class.
+- Qwen3.5 RUMINATES: on a multi-step count it re-derived the same (correct) answer ~10× and
+  spilled the whole answer into the `reasoning` field, leaving `content` EMPTY (finish_reason
+  `stop`, not `length` — so it's not a token cap). Mitigated by a "state it ONCE and stop"
+  instruction in the prompt (8340→5050 completion tok, content populated, answer still right).
+  NOT eliminated — see harness guard in next steps.
 
 ## Likely next steps
 1. **v2 — METAR store (DONE).** `src/forecaster/store.py` is the ONLY file that touches
@@ -148,10 +168,19 @@ artificial-forecaster/
    conn + `iem.py` loader + end-to-end agent loop, all verified on the KORD snowstorm.
    Remaining polish when needed: an intent-check that echoes the date range on manual
    ingest; AWC API path for recent obs; copy-paste path for ad-hoc.
-3. **Harden + grow the toolset (NEXT UP).** Candidate tools: a trend query (ceiling/vis/
+3. **Harden + grow the toolset (IN PROGRESS).** `get_latest_obs` added; tool-selection +
+   dependent-chain both verified. Candidate tools still open: a trend query (ceiling/vis/
    wind over last N hours), station metadata, climatology lookup. Consider thinning/paging
-   for very wide windows. Watch model reasoning errors (e.g. timestamp conflation seen in
-   testing) — these are what the benchmark must score.
+   for very wide windows. Watch model reasoning errors (timestamp conflation, rumination) —
+   these are what the benchmark must score. On tool count: don't fold tools into one
+   mode-switch mega-tool (moves the choice into arg-filling, muddies descriptions); keep
+   distinct verbs, namespace by data domain, and subset `TOOLS` per task phase as the
+   catalog grows — the "5-10 tools" limit is about CONFUSABILITY, not raw count.
+   - HARNESS GUARD (TODO, deferred this session): the agent loop reads the answer from
+     `msg.content` only. When a reasoning model leaves `content` empty but `reasoning` is
+     non-empty (the rumination case above), a CORRECT answer logs as blank — a silent
+     scoring bug. Add: if `content` is empty + `reasoning` present + finish_reason `stop`,
+     surface/flag the reasoning. Cheap insurance once the eval harness scores real runs.
 4. Build the agent loop + first GRIB tool (skew-T or 200mb winds) — Weeks 1-5.
 5. Build the AF metric harness (TAFVER / OPVER / WARNVER) — Weeks 6-8.
 6. Stand up SuperCloud: Podman images, pre-stage weights, vLLM serve job.
