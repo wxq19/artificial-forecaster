@@ -11,3 +11,4 @@ docs/
 logs/
 *.egg-info/
 *:Zone.Identifier
+CLAUDE.md
