@@ -29,12 +29,70 @@ _BOUNDARY = re.compile(r"\b(?:PROB\d{2}(?:\s+(?:TEMPO|BECMG))?|FM\d{6}|BECMG|TEM
 # Same boundaries plus the TX/TN group, for re-inserting conventional TAF line
 # breaks in the raw view (the json feed delivers one flat line).
 _REFLOW = re.compile(r"\b(?:PROB\d{2}(?:\s+(?:TEMPO|BECMG))?|FM\d{6}|BECMG|TEMPO|TX\d{2}/)")
+# AF total-obscuration + hazard groups the library drops or ignores; recovered
+# per-group from the raw chunk (like QNH/NSW). Heights are hundreds of feet; the
+# bare 6-/5-digit icing/turbulence tokens are safe because nothing else in a TAF
+# body is a 6-digit run starting 6/5 with word boundaries (validity has a slash,
+# winds end in KT, temps carry TX/TN, AF remark times are 4-digit).
+_VV = re.compile(r"\bVV(\d{3})\b")                          # total obscuration (1.3.7.2)
+_WS = re.compile(r"\bWS(\d{3})/(\d{3})(\d{2,3})KT\b")       # low-level wind shear (1.3.9.2)
+_VA_GRP = re.compile(r"\bVA(\d{3})(\d{3})\b")               # volcanic-ash plume VAbbbttt (1.3.9.1)
+_ICING = re.compile(r"\b6(\d)(\d{3})(\d)\b")                # icing 6IchihihitL (1.3.10)
+_TURB = re.compile(r"\b5([\dX])(\d{3})(\d)\b")              # turbulence 5BhBhBhBtL (1.3.11)
 
 
 class TafTemp(BaseModel):
     temp_c: int                # forecast max (TX) or min (TN) temperature
     day: int                   # day-of-month it occurs
     hour: int                  # UTC hour it occurs
+
+
+# AF hazard groups (AFMAN 15-124 1.3.9-1.3.11). Defined here on the PARSE side
+# (the seam that owns the typed representation, like metar.CloudLayer); tafgen
+# imports these for the OUTPUT side, so generation and parsing share one shape.
+
+class WindShear(BaseModel):
+    """Non-convective low-level wind shear WShxhxhx/dddfffKT (1.3.9.2). Surface to
+    2000ft AGL; VRB not allowed for the shear direction."""
+
+    height_ft: int             # hxhxhx -- base of the shear, hundreds of feet
+    wind_dir: int              # ddd -- tens of degrees true (no VRB)
+    wind_speed: int            # ff -- knots above the shear
+
+
+class VolcanicAsh(BaseModel):
+    """Volcanic-ash plume VAbbbttt (1.3.9.1). Surface-based when base_ft == 0, in
+    which case VA is also encoded as present weather (1.3.9.1.3)."""
+
+    base_ft: int               # bbb -- base of ash, hundreds of feet AGL
+    top_ft: int                # ttt -- top of ash, hundreds of feet AGL
+
+
+class IcingLayer(BaseModel):
+    """Forecast icing 6IchihihitL (1.3.10), repeatable. Ic is the Table 1.5 code:
+      0 trace            1 light (mixed)    2 light in cloud (rime)
+      3 light in precip  4 mod (mixed)      5 mod in cloud (rime)
+      6 mod in precip    7 severe (mixed)   8 severe in cloud (rime)
+      9 severe in precip (clear)
+    """
+
+    ic: int                    # Table 1.5 type/intensity code figure 0-9
+    base_ft: int               # hihihi -- base AGL (Table 1.4)
+    thickness_ft: int          # tL -- layer thickness 1000-9000ft (Table 1.6)
+
+
+class TurbulenceLayer(BaseModel):
+    """Forecast turbulence 5BhBhBhBtL (1.3.11), repeatable. B is the Table 1.7 code:
+      0 none             1 light            2 mod clear-air, occasional
+      3 mod clear-air, frequent             4 mod in cloud, occasional
+      5 mod in cloud, frequent              6 severe clear-air, occasional
+      7 severe clear-air, frequent          8 severe in cloud, occasional
+      9 severe in cloud, frequent           X extreme
+    """
+
+    b: int | str               # Table 1.7 code figure 0-9 or 'X' (extreme)
+    base_ft: int               # hBhBhB -- base AGL (Table 1.4)
+    thickness_ft: int          # tL -- layer thickness 1000-9000ft (Table 1.6)
 
 
 class TafGroup(BaseModel):
@@ -61,6 +119,11 @@ class TafGroup(BaseModel):
     weather: list[str]         # forecast present-weather groups, e.g. ['-SHRA', 'VCTS']
     clouds: list[CloudLayer]
     qnh_inhg: float | None = None   # per-group QNHxxxxINS (US military); None for civil TAFs
+    vert_vis_ft: int | None = None  # VVhshshs total obscuration; library drops it, recovered from raw
+    wind_shear: "WindShear | None" = None      # AF hazard groups; library ignores them, recovered from raw
+    volcanic_ash: "VolcanicAsh | None" = None
+    icing: list[IcingLayer] = []
+    turbulence: list[TurbulenceLayer] = []
 
 
 class TafObs(BaseModel):
@@ -155,13 +218,16 @@ def _vis_numeric(v) -> tuple[float | None, int | None, str | None]:
 
 def _validity(v) -> tuple[int | None, int | None, int | None, int | None, int | None]:
     """(from_day, from_hour, from_minute, to_day, to_hour). FM groups carry a
-    single start instant (note the library's 'strart_minutes' typo) and no end;
-    BECMG/TEMPO/overall carry a start..end window."""
+    single start instant (incl. minutes) and no end; BECMG/TEMPO/overall carry a
+    start..end window."""
     if v is None:
         return (None, None, None, None, None)
     if hasattr(v, "end_hour"):                 # Validity — a start..end window
         return (v.start_day, v.start_hour, 0, v.end_day, v.end_hour)
-    return (v.start_day, v.start_hour, getattr(v, "strart_minutes", 0), None, None)  # FMValidity
+    # FMValidity. Newer library spells it start_minutes; older releases had the
+    # typo strart_minutes -- read the correct name first, fall back for old versions.
+    mins = getattr(v, "start_minutes", getattr(v, "strart_minutes", 0))
+    return (v.start_day, v.start_hour, mins, None, None)
 
 
 def _period(src, change_type: str | None, probability: int | None, valid) -> TafGroup:
@@ -209,6 +275,28 @@ def _recover_showers(chunk: str, weather: list[str]) -> None:
             weather.append(tok)
 
 
+def _recover_hazards(chunk: str, g: TafGroup) -> None:
+    """Re-attach the AF total-obscuration + hazard groups the library drops/ignores
+    (VV, WS, VA, icing, turbulence). Mutates `g` in place. Heights are hundreds of feet."""
+    if (m := _VV.search(chunk)) and g.vert_vis_ft is None:
+        g.vert_vis_ft = int(m.group(1)) * 100
+    if (m := _WS.search(chunk)) and g.wind_shear is None:
+        g.wind_shear = WindShear(
+            height_ft=int(m.group(1)) * 100, wind_dir=int(m.group(2)), wind_speed=int(m.group(3))
+        )
+    if (m := _VA_GRP.search(chunk)) and g.volcanic_ash is None:
+        g.volcanic_ash = VolcanicAsh(base_ft=int(m.group(1)) * 100, top_ft=int(m.group(2)) * 100)
+    g.icing = [
+        IcingLayer(ic=int(code), base_ft=int(base) * 100, thickness_ft=int(thick) * 1000)
+        for code, base, thick in _ICING.findall(chunk)
+    ]
+    g.turbulence = [
+        TurbulenceLayer(b=int(code) if code.isdigit() else code,
+                        base_ft=int(base) * 100, thickness_ft=int(thick) * 1000)
+        for code, base, thick in _TURB.findall(chunk)
+    ]
+
+
 def parse(line: str) -> TafObs:
     raw = line.strip().rstrip("=").strip()
     t = _PARSER.parse(raw)                          # library handles the 'TAF [AMD|COR]' prefix
@@ -237,6 +325,7 @@ def parse(line: str) -> TafObs:
                 period.weather.append("NSW")
             if cq := _QNH.search(chunk):     # military TAFs carry a QNH per group
                 period.qnh_inhg = int(cq.group(1)) / 100
+            _recover_hazards(chunk, period)
 
     return TafObs(
         station=t.station,
@@ -276,6 +365,20 @@ def _sky(clouds: list[CloudLayer]) -> str:
     )
 
 
+def _hazards(g: TafGroup) -> str:
+    """Compact decoded view of the recovered hazard groups, or '' if none."""
+    parts = []
+    if g.wind_shear:
+        ws = g.wind_shear
+        parts.append(f"WS {ws.height_ft}ft {ws.wind_dir:03d}/{ws.wind_speed}KT")
+    if g.volcanic_ash:
+        va = g.volcanic_ash
+        parts.append(f"VA {va.base_ft}-{va.top_ft}ft")
+    parts += [f"ICE(Ic{ic.ic}) {ic.base_ft}ft +{ic.thickness_ft}ft" for ic in g.icing]
+    parts += [f"TURB(B{tb.b}) {tb.base_ft}ft +{tb.thickness_ft}ft" for tb in g.turbulence]
+    return "  ".join(parts)
+
+
 def _vis_display(g: TafGroup) -> str:
     """Reported token, with the statute-mile equivalent appended for meters vis so
     the AF (SM) reader isn't left converting: '9999 (P6SM)', '4800 (3SM)'. SM
@@ -304,7 +407,10 @@ def _group_line(g: TafGroup, show_qnh: bool) -> str:
             head = f"PROB{g.probability} {g.change_type} {window}"
     vis = _vis_display(g)
     wx = " ".join(g.weather)
-    tail = f"{wx}  {_sky(g.clouds)}" if wx else _sky(g.clouds)
+    sky = f"VV{g.vert_vis_ft}ft" if g.vert_vis_ft is not None else _sky(g.clouds)
+    tail = f"{wx}  {sky}" if wx else sky
+    if hz := _hazards(g):
+        tail = f"{tail}  [{hz}]"
     cols = f"  {head:<22} {_wind(g):<13} {vis:<12}"
     if show_qnh:                                  # only for military TAFs that carry QNH
         cols += f" {(f'{g.qnh_inhg:.2f}inHg' if g.qnh_inhg else ''):<10}"

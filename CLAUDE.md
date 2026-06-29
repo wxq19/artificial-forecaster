@@ -81,11 +81,14 @@ artificial-forecaster/
 │   ├── config.py         # typed settings, reads .env (the ONLY config source)
 │   ├── llm.py            # the ONLY file that builds the OpenAI client (seam)
 │   ├── metar.py          # METAR text <-> typed MetarObs (input seam)
+│   ├── tafparse.py       # TAF text -> typed TafObs (input seam; was taf.py)
+│   ├── tafgen.py         # typed TafProduct -> valid AF TAF text (OUTPUT seam) + validate/roundtrip
+│   ├── awc.py            # live aviationweather.gov client (METARs + TAFs; serves military fields)
 │   ├── store.py          # the ONLY file that touches DuckDB (seam)
 │   ├── iem.py            # historical METAR ingestion (IEM)
 │   ├── wxcodes.py        # present-weather classify + deterministic severity rule
 │   ├── charts.py         # the ONLY file that imports matplotlib (meteogram/wx_timeline)
-│   └── tools.py          # agent-facing read tools + loop plumbing (-> agent.py later)
+│   └── tools.py          # agent read tools + emit_taf OUTPUT tool + loop plumbing (-> agent.py later)
 ├── scripts/              # dev + end-to-end test drivers (markdown logs -> logs/)
 ├── docs/                 # references (FMH-1 wx table, AFMAN 15-124, AFH 15-101)
 ├── data/                 # GITIGNORED: forecaster.duckdb, charts/temp/ (throwaway)
@@ -242,7 +245,44 @@ artificial-forecaster/
 - TAFVER TIME-ALIGNMENT finding (from test_taf_verify): a FRESHLY-issued TAF has ~0 elapsed validity, so
   'current TAF + last 24h obs' is degenerate — only ob(s) after valid_from overlap (1 ob in the KIND run; the
   other 29 predate the TAF). The verification REASONING works; it needs a TIME-ALIGNED TAF (an archived TAF
-  valid over the window, or persist-then-score via a future `taf` table). Deferred with TAFVER (step 7).
+  valid over the window, or persist-then-score via a future `taf` table). Deferred with TAFVER.
+- TAF SEAM RENAME: `taf.py` -> `tafparse.py` (input seam) so the new `tafgen.py` (output seam) can't be
+  confused with it. `awc.py` does NOT import it; the two test_taf scripts import `tafparse as taf`.
+- TAF OUTPUT SEAM (`tafgen.py`, step 5 DONE): `TafProduct`/`TafProductGroup` pydantic models -> `render_taf()`
+  emits canonical AF TAF text (AFMAN 15-124 ch.1, docs/TAF Coding.pdf). AF-specific vs the civil parse seam:
+  30h validity, vis in METERS (Table 1.1, round DOWN), QNH on prevailing/FM/BECMG never TEMPO, NO PROB30/40
+  (deliberately no `prob` field), TX/TN, LAST NO AMDS / LIMITED METWATCH remark helpers. Validated BYTE-EXACT
+  against AFMAN Figures 1.3/1.4/1.6/1.7.
+- HAZARD GROUPS baked in early (both seams): non-convective wind shear (WS), volcanic ash (VA), icing (6IchihihitL),
+  turbulence (5BhBhBhBtL), Tables 1.4-1.7 + total-obscuration VV. `tafparse` RECOVERS all five from raw (the
+  library drops/ignores them, like QNH/NSW); the four hazard sub-models live in `tafparse` and `tafgen` imports
+  them (one shape, no circular import).
+- `validate(p)` = AFMAN rule checker (returns findings, doesn't raise): 30h span, midnight END=24 not 00, wind /10,
+  gust>mean (NOT a 10kt gap — AF gusts can be 10kt over the LULL, which isn't encoded), vis<9999 needs a cause,
+  cloud summation + first-OVC, TS->CB, BECMG <=2h, TEMPO no-QNH/no-WS, FM self-contained, chronological groups,
+  TX>=TN in first 24h. `roundtrip(p)` = render -> tafparse.parse -> compare (proves the two seams agree); EXCLUDES
+  free-text remarks (AF remarks have NO delimiter, so a parser folds them into the groups — strip before parsing
+  HUMAN TAFs for TAFVER). Round-trip caught a latent bug: FM minutes were read from the library's old typo
+  `strart_minutes`; this version spells it `start_minutes` -> FM minutes were silently zeroed. Fixed.
+- ERGONOMICS + GUARDRAILS: `TafProduct.issue(...)` computes the 30h end (midnight 00/24) so a routine TAF can't
+  have the wrong span; `TafProduct.amend(orig, at=...)` clips validity + drops expired groups (1.3.2.1.2.1).
+  Pydantic guardrails reject IMPOSSIBLE values at construction (station 4-letter, change in FM/BECMG/TEMPO,
+  wind_dir 0-360, cover FEW/SCT/BKN/OVC); validate() catches well-formed-but-rule-breaking values. Three layers:
+  guardrails -> validate() -> roundtrip(). Self-test `scripts/test_tafgen.py` (no model/network): 7/7, byte-exact
+  figures + a negative case.
+- emit_taf OUTPUT TOOL (`tools.py`, step 6 DONE): the model's first OUTPUT tool. Parameter schema IS
+  `TafProduct.model_json_schema()` (the one class is tool contract AND validator). `_emit_taf` builds the product
+  (guardrails fire), renders + validate()s, returns the AFMAN check as the receipt with the product on
+  `ToolResult.taf`; render is guarded and roundtrip skipped when findings exist (a malformed group is feedback,
+  not a crash). It's a SINK — findings go back so the model RE-EMITS a fix. `scripts/test_emit_taf.py` drives the
+  loop (pre-cutoff obs + meteogram -> reason -> emit -> validate -> re-emit), tool_choice='auto' so reasoning lands
+  in the log.
+- EMIT FINDINGS (benchmark-relevant): Together's function-calling accepts the nested $ref/$defs/anyOf pydantic
+  schema AS-IS (no flattening). The model emits JSON loosely — quotes numbers (`"wind_dir":"240"`; the int|str
+  union blocks pydantic's auto-coerce, so the validator coerces) and omits optional fields (gave `CloudLayer.type`
+  a default). Verified end-to-end on KBLV valid 291600Z with a STRICT pre-cutoff feed: Gemma reasoned over the
+  meteogram (spotted the diurnal wind dip), emitted, hit 4 AFMAN findings (BECMG>2h, missing QNH), READ them and
+  self-corrected to a clean, round-trippable TAF in 2 steps.
 
 ## Likely next steps
 1. **v2 — METAR store (DONE).** `src/forecaster/store.py` is the ONLY file that touches
@@ -264,20 +304,30 @@ artificial-forecaster/
 4. **TAF + METAR LIVE grabber from AWC (DONE).** `src/forecaster/awc.py` (fetch_metar/fetch_taf +
    load_metar) pulls live obs AND TAFs — incl. the military sites IEM does NOT serve — and the
    `src/forecaster/taf.py` PARSE seam (TafObs) is built and validated (see Status). Live METARs persist
-   via `load_metar` (source='awc'); TAFs are fetch+parse only (no `taf` table yet — see step 7).
-5. **TAF output seam + parse checker (from AFMAN 15-124 Ch.1, in docs/).** Define a `TafProduct`
-   structure (validity period, FM/BECMG/TEMPO/PROB groups, wind/vis/wx/sky) that renders to VALID
-   TAF text AND parses back — the OUTPUT seam symmetric to `MetarObs` on the input side — plus a
-   format/parse checker that validates a TAF against the AFMAN 15-124 rules.
-6. **Generate a first TAF.** Agent: obs up to a cutoff T + the trend meteogram → emit a TafProduct.
-   A persistence-only TAF is KNOWN to verify badly — expected; the point is the end-to-end product.
-7. **TAFVER scoring (LATER).** Score a generated TAF against the observed METARs T→T+24h — we
-   already own the truth in the DB, so self-scoring needs NO TAF source. Compare vs human TAF + raw
-   NWP (GFS/GALWEM) once those inputs exist. NOTE (from test_taf_verify): verification needs a
-   TIME-ALIGNED TAF — a current TAF barely overlaps PAST obs. Build the deferred `taf` table here
-   (persist each TAF as issued → score once obs accumulate under its validity), or pull an archived TAF.
-8. Later: first GRIB tool (skew-T / 200mb winds) + the conda geospatial stack; AF metric harness
-   (OPVER/WARNVER); SuperCloud (Podman images, pre-stage weights, vLLM serve job).
+   via `load_metar` (source='awc'); TAFs are fetch+parse only (no `taf` table yet — see step 9).
+5. **TAF output seam + parse checker (DONE).** `src/forecaster/tafgen.py` — `TafProduct` -> valid AF TAF
+   text (`render_taf`) + the AFMAN rule checker (`validate`) + the render↔parse round-trip (`roundtrip`).
+   Hazard groups, ergonomic constructors (`issue`/`amend`), and pydantic guardrails all landed; the
+   `scripts/test_tafgen.py` self-test is 7/7 (byte-exact AFMAN figures + a negative case). See Status.
+6. **Generate a first TAF (DONE).** `emit_taf` OUTPUT tool (schema = `TafProduct.model_json_schema()`) +
+   `scripts/test_emit_taf.py`: pre-cutoff obs + meteogram → reason → emit → validate → re-emit. Verified
+   end-to-end on KBLV valid 291600Z (Gemma read the meteogram, self-corrected 4 AFMAN findings to a clean,
+   round-trippable TAF). See Status for the emit-schema findings.
+7. **Forecasting charts + Skew-Ts — the first GRIB tools (NEXT).** Stand up the conda-forge geospatial stack
+   (eccodes/cfgrib/xarray/cartopy/matplotlib) as the CPU tools image, and add agent chart tools that render
+   NWP (GFS/GALWEM GRIB) to PNGs the VLM reads — at least a skew-T sounding and an upper-air chart (e.g.
+   200mb wind/isotach), plus surface fields as needed. Goal: give the model the same diagnostic charts a human
+   forecaster uses BEFORE we ask it to produce real, verifiable TAFs. Keep matplotlib output in the existing
+   `charts.py` seam pattern; GRIB/array work stays conda-forge, SEPARATE from the uv app tier (do NOT mix).
+8. **Climatology tool (BEFORE TAFVER).** A station-climatology lookup the agent can call (normals / extremes /
+   frequency-by-month or -hour) so a forecast can be anchored to what is typical, not just the last 24h of obs.
+   This is the deferred `climo` table in `store.py` (or a climo source) — build it when this tool needs it.
+9. **TAFVER scoring (LATER — after charts + climo).** Score a generated TAF against the observed METARs
+   T→T+24/30h — we already own the truth in the DB, so self-scoring needs NO TAF source. NOTE: needs a
+   TIME-ALIGNED TAF (a current TAF barely overlaps PAST obs); build the deferred `taf` table (persist each TAF
+   as issued → score once obs accumulate under its validity), and STRIP free-text remarks before parsing human
+   TAFs (AF remarks have no delimiter). Compare vs human TAF + raw NWP (GFS/GALWEM) once those inputs exist.
+10. Later: AF metric harness (OPVER/WARNVER); SuperCloud (Podman images, pre-stage weights, vLLM serve job).
 
 ## Open questions to confirm with MIT SuperCloud (supercloud@mit.edu)
 - V100 variant (16 vs 32 GB) on assigned nodes.

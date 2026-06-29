@@ -11,7 +11,7 @@ written to a self-contained markdown log under logs/.
 from datetime import datetime
 from pathlib import Path
 
-from forecaster import awc, taf
+from forecaster import awc, tafparse as taf
 from forecaster.config import settings
 from forecaster.llm import client
 from forecaster.tools import final_answer

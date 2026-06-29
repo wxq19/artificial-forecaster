@@ -1,10 +1,10 @@
 # Artificial Forecaster
 ## Goal:
-Test whether a multi-modal language model (some kind of vision language model) can replicate Air Force Weather forecaster tasks. It needs to do the following:
+Test whether a multi-modal language model (some kind of vision language model) can replicate Weather forecaster tasks. It needs to do the following:
 
 - Ingest forecasting data
-  - METARs
-  - TAFs
+  - METARs (X)
+  - TAFs (X)
   - NWP GRIB files
   - Satellite imagery
   - Radar imagery

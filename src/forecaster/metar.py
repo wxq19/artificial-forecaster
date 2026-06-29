@@ -32,7 +32,7 @@ _VIS_TABLE: list[tuple[float, int]] = [
 class CloudLayer(BaseModel):
     cover: str                 # BKN, OVC, SCT, FEW
     height_ft: int | None      # feet AGL
-    type: str | None           # CB, TCU, or None
+    type: str | None = None    # CB, TCU, or None (optional: models/TAFs omit it for plain layers)
 
 
 class MetarObs(BaseModel):

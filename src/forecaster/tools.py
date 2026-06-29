@@ -12,7 +12,10 @@ import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from forecaster import charts, store
+from pydantic import ValidationError
+
+from forecaster import charts, store, tafgen
+from forecaster.tafgen import TafProduct
 
 
 @dataclass
@@ -25,6 +28,7 @@ class ToolResult:
     text: str
     images: list[bytes] = field(default_factory=list)
     window: tuple | None = None   # (start, end) for time-bounded tools (Fix 3 guard)
+    taf: TafProduct | None = None   # emit_taf hands back the captured forecast object
 
 QUERY_OBS = {
     "type": "function",
@@ -126,6 +130,29 @@ GET_TREND = {
 
 TOOLS = [QUERY_OBS, GET_LATEST, GET_TREND]
 
+# The OUTPUT tool: the model emits its forecast as the fields of a TafProduct, and
+# our code renders + checks it. The parameter schema IS the pydantic model's JSON
+# schema, so the one class is both the tool contract and the validator. Unlike the
+# read tools, emit_taf is a SINK -- its result is the AFMAN check, not data to
+# reason over -- so the loop can feed validate() findings back for a re-emit.
+EMIT_TAF = {
+    "type": "function",
+    "function": {
+        "name": "emit_taf",
+        "description": (
+            "Emit a complete Air Force terminal aerodrome forecast (TAF) as "
+            "structured fields. Fill the prevailing period and any FM/BECMG/TEMPO "
+            "change groups. Rules: a routine TAF is valid 30 hours; visibility is in "
+            "METERS (9999 = unrestricted, >=7SM); wind direction is degrees to the "
+            "nearest 10 as an INTEGER (or 'VRB'); QNH is the altimeter in inches of "
+            "mercury (e.g. 29.92); include CB cloud type whenever a thunderstorm (TS) "
+            "is forecast; do not put QNH in a TEMPO group. Base the forecast only on "
+            "the observations and trend provided."
+        ),
+        "parameters": TafProduct.model_json_schema(),
+    },
+}
+
 
 def _fmt(rows: list[dict], order: str = "oldest first") -> str:
     """Per ob: a decoded summary line (our normalized vis_sm/ceiling_ft) followed
@@ -195,10 +222,44 @@ def _naive_utc(iso: str) -> datetime:
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
+def _emit_taf(args: dict) -> ToolResult:
+    """Capture the model's structured forecast: build a TafProduct (guardrails fire
+    here), render it, and run the AFMAN rule check + round-trip. The receipt is that
+    check, phrased so the model can re-emit a fix; the built product rides back on
+    ToolResult.taf. A schema/guardrail failure is reported as text, not raised, so a
+    malformed call becomes correctable feedback rather than a crashed loop."""
+    try:
+        product = TafProduct(**args)
+    except ValidationError as e:
+        errs = "\n".join(f"  - {'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+                         for err in e.errors())
+        return ToolResult(f"emit_taf rejected ({e.error_count()} schema error(s)); fix and "
+                          f"re-emit:\n{errs}")
+    findings = tafgen.validate(product)
+    try:
+        text = tafgen.render_taf(product)
+    except Exception as e:  # noqa: BLE001 -- a group missing required timing; report, don't crash
+        return ToolResult(
+            f"emit_taf built but could not render ({type(e).__name__}: {e}); a change group "
+            "is likely missing its day/hour fields. Fix and re-emit.", taf=product)
+    lines = ["TAF emitted:", "", text, ""]
+    if findings:
+        lines.append(f"AFMAN check found {len(findings)} issue(s) -- correct them and re-emit:")
+        lines += [f"  - {f}" for f in findings]
+        return ToolResult("\n".join(lines), taf=product)   # skip round-trip on a known-bad TAF
+    diffs = tafgen.roundtrip(product)
+    lines.append("AFMAN check: clean.")
+    if diffs:
+        lines.append("round-trip differences: " + "; ".join(diffs))
+    return ToolResult("\n".join(lines), taf=product)
+
+
 def run_tool(name: str, args: dict, *, db_path: str | None = None) -> ToolResult:
-    """Execute a model-issued tool call against a READ-ONLY connection. Returns a
-    ToolResult: a text receipt + any rendered PNGs (charts go to the model as
-    images via tool_messages, since a tool reply is text-only)."""
+    """Execute a model-issued tool call. The read tools run against a READ-ONLY
+    connection; emit_taf is an output sink (no DB) handled first. Returns a
+    ToolResult: a text receipt + any rendered PNGs / captured TAF."""
+    if name == "emit_taf":
+        return _emit_taf(args)
     con = (
         store.connect(db_path, read_only=True)
         if db_path

@@ -15,7 +15,7 @@ exchange is written to a self-contained markdown log under logs/.
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from forecaster import awc, metar, store, taf
+from forecaster import awc, metar, store, tafparse as taf
 from forecaster.config import settings
 from forecaster.llm import client
 from forecaster.tools import final_answer
