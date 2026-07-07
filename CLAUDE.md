@@ -339,3 +339,12 @@ artificial-forecaster/
   provider docs at build time rather than trusting any hardcoded list.
 - If real (non-open-source) AF weather data is ever used, hosting may need an
   authorized DoD environment, not commercial cloud. Flag this if it comes up.
+
+## Known problems to address
+- TAF AMEND TX/TN clipping (tafgen.py `TafProduct.amend`): `amend()` clips the validity
+  and drops expired change groups, but carries `max_temp`/`min_temp` (TX/TN) forward
+  UNCHANGED. TX/TN times are absolute and AFMAN 1.3.13.1 says they cover the FIRST 24h of
+  the (now-clipped) validity, so after an amendment a TX/TN can fall OUTSIDE the amended
+  window — an invalid TAF. Fix: on amend, drop or re-anchor any TX/TN whose time no longer
+  lands in the amended first-24h; validate() should also flag it. (Surfaced during the
+  2026-07-06 review while fixing d.5 amend()-remarks; tracked in review-findings-2026-07-06.md.)

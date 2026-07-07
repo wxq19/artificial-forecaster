@@ -124,11 +124,15 @@ def parse(line: str) -> MetarObs:
 
     # Pressure: read inHg straight from the raw token rather than trusting the
     # library's lossy integer-hPa conversion. US METARs report inHg only.
+    # Search only the BODY (before RMK): many intl stations report Q#### in the body
+    # AND echo an A#### in remarks, so scanning the whole line would derive hPa from
+    # the inHg remark instead of reading the exact reported Q token.
+    body = raw.split(" RMK", 1)[0]
     inhg = hpa = None
-    if a := _ALT_INHG.search(raw):
+    if a := _ALT_INHG.search(body):
         inhg = int(a.group(1)) / 100
         hpa = round(inhg * _HPA_PER_INHG, 1)
-    elif q := _ALT_HPA.search(raw):
+    elif q := _ALT_HPA.search(body):
         hpa = float(int(q.group(1)))
         inhg = round(hpa / _HPA_PER_INHG, 2)
 
@@ -248,7 +252,11 @@ def render(obs: list[MetarObs]) -> str:
     raw strings underneath so nothing the decoder dropped is lost to the model.
 
     Fixed-width columns come first so trends scan down cleanly; the variable-width
-    present-weather and sky trail at the end of each row to keep the grid aligned."""
+    present-weather and sky trail at the end of each row to keep the grid aligned.
+
+    NOTE: sorts by (day, time) because a MetarObs carries no month; assumes a
+    within-month batch (the file/paste path). A batch crossing a month end would sort
+    day 31 after day 1 — use the store path (real obs_time) for month-spanning reads."""
     obs = sorted(obs, key=lambda o: (o.day, o.time))
     if not obs:
         return "(no observations)"

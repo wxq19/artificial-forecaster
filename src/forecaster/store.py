@@ -7,12 +7,17 @@ time (see insert_obs). All times are UTC.
 """
 
 import json
+import re
 from datetime import datetime, timezone
 
 import duckdb
 
 from forecaster.config import settings
 from forecaster.metar import MetarObs
+
+# A COR modifier marks a corrected report (re-issued with fixed values for the same
+# station+time). Detected from the raw so a correction can win the ON CONFLICT race.
+_COR = re.compile(r"\bCOR\b")
 
 _OBS_DDL = """
 CREATE TABLE IF NOT EXISTS obs (
@@ -41,6 +46,7 @@ CREATE TABLE IF NOT EXISTS obs (
     remarks        VARCHAR,
     raw            VARCHAR   NOT NULL,
     source         VARCHAR,              -- data lineage: 'iem' | 'awc' | 'manual'
+    corrected      BOOLEAN,              -- a COR report; a correction wins the ON CONFLICT race
     PRIMARY KEY (station, obs_time)      -- natural key -> idempotent re-ingest
 );
 """
@@ -52,10 +58,25 @@ INSERT INTO obs VALUES (
     $visibility, $vis_sm, $vis_m, $vis_flag,
     $ceiling_ft, $vertical_visibility_ft,
     $temp_c, $dewpoint_c, $altimeter_inhg, $altimeter_hpa,
-    $weather, $clouds, $remarks, $raw, $source
+    $weather, $clouds, $remarks, $raw, $source, $corrected
 )
-ON CONFLICT DO NOTHING
+ON CONFLICT (station, obs_time) DO UPDATE SET
+    report_type = excluded.report_type, auto = excluded.auto, cavok = excluded.cavok,
+    wind_dir_deg = excluded.wind_dir_deg, wind_dir_card = excluded.wind_dir_card,
+    wind_speed = excluded.wind_speed, wind_gust = excluded.wind_gust, wind_unit = excluded.wind_unit,
+    visibility = excluded.visibility, vis_sm = excluded.vis_sm, vis_m = excluded.vis_m,
+    vis_flag = excluded.vis_flag, ceiling_ft = excluded.ceiling_ft,
+    vertical_visibility_ft = excluded.vertical_visibility_ft,
+    temp_c = excluded.temp_c, dewpoint_c = excluded.dewpoint_c,
+    altimeter_inhg = excluded.altimeter_inhg, altimeter_hpa = excluded.altimeter_hpa,
+    weather = excluded.weather, clouds = excluded.clouds, remarks = excluded.remarks,
+    raw = excluded.raw, source = excluded.source, corrected = excluded.corrected
+WHERE excluded.corrected AND NOT COALESCE(obs.corrected, FALSE)
 """
+# Policy (#8b): keep-first stays the default (idempotent re-ingest), with ONE new
+# behavior -- an incoming COR overwrites a previously-stored non-COR. The WHERE guard
+# means a correction always wins regardless of arrival order, and a plain report can
+# never downgrade a stored correction.
 
 
 def connect(
@@ -67,8 +88,10 @@ def connect(
 
 
 def init_schema(con: duckdb.DuckDBPyConnection) -> None:
-    """Create the obs table if absent. Idempotent — safe on every startup."""
+    """Create the obs table if absent. Idempotent — safe on every startup. The ADD
+    COLUMN migrates a DB created before the `corrected` column existed (#8b)."""
     con.execute(_OBS_DDL)
+    con.execute("ALTER TABLE obs ADD COLUMN IF NOT EXISTS corrected BOOLEAN")
 
 
 def _row(o: MetarObs, year: int, month: int, source: str) -> dict:
@@ -100,6 +123,7 @@ def _row(o: MetarObs, year: int, month: int, source: str) -> dict:
         "remarks": o.remarks,
         "raw": o.raw,
         "source": source,
+        "corrected": bool(_COR.search(o.raw)),
     }
 
 

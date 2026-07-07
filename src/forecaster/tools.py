@@ -182,7 +182,9 @@ def _fmt(rows: list[dict], order: str = "oldest first") -> str:
         vis = "—" if r["vis_sm"] is None else f"{(r['vis_flag'] or '')}{r['vis_sm']:g}SM"
         ceil = "unlim" if r["ceiling_ft"] is None else f"{r['ceiling_ft']}ft"
         wx = " ".join(r["weather"]) or "-"
-        td = f"{r['temp_c']}/{r['dewpoint_c']}"
+        t = "—" if r["temp_c"] is None else f"{r['temp_c']}"
+        dp = "—" if r["dewpoint_c"] is None else f"{r['dewpoint_c']}"
+        td = f"{t}/{dp}"
         kind = r["report_type"] or "—"
         out.append(
             f"  {r['obs_time']:%Y-%m-%dT%H:%MZ} {kind:<5} {wind:<11} {vis:<7} {ceil:<7} {wx:<14} {td}"
@@ -201,25 +203,37 @@ def _resolve_window(con, station, args):
     """Resolve a query window. Relative mode (preferred for recent/trend): `hours`
     anchors on the latest ob — IDENTICAL to get_trend, so windows align across
     tools. Absolute mode: explicit ISO start+end. The seam owns the arithmetic;
-    the model never computes timestamps. Returns (start, end) or (None, None)."""
+    the model never computes timestamps. Returns (start, end, None) on success, or
+    (None, None, reason) — the reason DISTINGUISHES 'no obs for this station' from
+    'no window arguments given' so the model gets accurate feedback (#9)."""
     if args.get("hours") is not None:
         anchor = store.latest(con, station, 1)
         if not anchor:
-            return None, None
+            return None, None, f"no observations stored for {station} to anchor a relative window"
         end = anchor[0]["obs_time"]
-        return end - timedelta(hours=int(args["hours"])), end
+        return end - timedelta(hours=_int_arg(args["hours"], 24, lo=1)), end, None
     if args.get("start") and args.get("end"):
         # Normalize to NAIVE UTC: fromisoformat('...Z') yields a tz-AWARE datetime,
         # which would compare unequal to get_trend's naive obs_time window and
         # false-trip the guard. The seam owns the naive-UTC contract (see store).
-        return _naive_utc(args["start"]), _naive_utc(args["end"])
-    return None, None
+        return _naive_utc(args["start"]), _naive_utc(args["end"]), None
+    return None, None, ("give either hours (relative to the latest ob) or both start "
+                        "and end (ISO UTC)")
 
 
 def _naive_utc(iso: str) -> datetime:
     """Parse an ISO datetime to naive UTC (drop any 'Z'/offset)."""
     dt = datetime.fromisoformat(iso)
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+
+def _int_arg(v, default: int, *, lo: int, hi: int | None = None) -> int:
+    """Coerce a model-supplied count/duration to an int and clamp. Models emit numbers
+    as strings; a value that will not parse raises ValueError, which run_tool turns into
+    tool feedback rather than a dead loop."""
+    n = default if v is None else int(v)
+    n = max(lo, n)
+    return n if hi is None else min(n, hi)
 
 
 def _emit_taf(args: dict) -> ToolResult:
@@ -247,7 +261,13 @@ def _emit_taf(args: dict) -> ToolResult:
         lines.append(f"AFMAN check found {len(findings)} issue(s) -- correct them and re-emit:")
         lines += [f"  - {f}" for f in findings]
         return ToolResult("\n".join(lines), taf=product)   # skip round-trip on a known-bad TAF
-    diffs = tafgen.roundtrip(product)
+    try:
+        diffs = tafgen.roundtrip(product)
+    except Exception as e:  # noqa: BLE001 -- a group that renders but won't re-parse is feedback, not a crash
+        return ToolResult(
+            f"emit_taf passed the AFMAN check but its render could not be parsed back "
+            f"({type(e).__name__}: {e}); a change group is likely missing timing fields. "
+            "Fix and re-emit.", taf=product)
     lines.append("AFMAN check: clean.")
     if diffs:
         lines.append("round-trip differences: " + "; ".join(diffs))
@@ -266,30 +286,36 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None) -> ToolResult
         else store.connect(read_only=True)
     )
     try:
-        station = args["station"].upper()
+        station = args.get("station")
+        if not station:
+            return ToolResult('error: this tool needs a "station" ICAO id, e.g. "station": "KBLV"')
+        station = str(station).upper()
         if name == "query_obs":
-            start, end = _resolve_window(con, station, args)
-            if start is None:
-                return ToolResult(
-                    "error: give either hours (relative to the latest ob) or both "
-                    "start and end (ISO UTC)"
-                )
+            start, end, err = _resolve_window(con, station, args)
+            if err:
+                return ToolResult(f"error: {err}")
             rows = store.window(con, station, start, end)
             return ToolResult(
                 _window_line(start, end) + "\n" + _fmt(rows, "oldest first"),
                 window=(start, end),
             )
         if name == "get_latest_obs":
-            rows = store.latest(con, station, args.get("n", 1))
+            n = _int_arg(args.get("n"), 1, lo=1, hi=200)
+            rows = store.latest(con, station, n)
             return ToolResult(_fmt(rows, "newest first"))
         if name == "get_trend":
-            hours = min(int(args.get("hours", 24)), 48)  # cap the look-back
+            hours = _int_arg(args.get("hours"), 24, lo=1, hi=48)  # coerce + clamp the look-back
             anchor = store.latest(con, station, 1)
             if not anchor:
                 return ToolResult(f"(no observations for {station})")
             end = anchor[0]["obs_time"]
             start = end - timedelta(hours=hours)
             rows = store.window(con, station, start, end)
+            if not rows:
+                return ToolResult(
+                    f"{_window_line(start, end)}\n"
+                    f"(no observations for {station} in the last {hours}h)"
+                )
             png = charts.meteogram(rows, station=station, hours=hours)
             receipt = (
                 f"{_window_line(start, end)}\n"
@@ -297,6 +323,8 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None) -> ToolResult
             )
             return ToolResult(receipt, images=[png], window=(start, end))
         return ToolResult(f"error: unknown tool {name!r}")
+    except Exception as e:  # noqa: BLE001 -- any read-tool failure becomes feedback, not a dead loop
+        return ToolResult(f"error: {name} failed ({type(e).__name__}: {e})")
     finally:
         con.close()
 

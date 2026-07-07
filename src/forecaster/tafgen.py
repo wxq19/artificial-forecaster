@@ -46,14 +46,20 @@ from pydantic import BaseModel, Field, field_validator
 _VIS_METERS = sorted({m for _, m in _VIS_TABLE} | {9999})
 
 
-def _end_plus_hours(day: int, hour: int, hours: int) -> tuple[int, int]:
+def _end_plus_hours(day: int, hour: int, hours: int, *, days_in_month: int | None = None) -> tuple[int, int]:
     """(day, hour) + N hours, applying the AFMAN midnight convention: a period that
     ENDS at midnight UTC is encoded hour 24 of the previous day, not 00 (1.3.2.1.5).
-    Month-blind (no month on a TAF) -- a span into the next month needs the real end
-    day from the caller; same caveat as validate()."""
+    A TAF carries no month, so pass days_in_month (28-31) when the end may fall in the
+    next month: the day then WRAPS (e.g. day 32 -> day 1 of a 31-day month) instead of
+    overflowing the 1-31 field. Without it the math is month-blind (same caveat as
+    validate())."""
     end = day * 24 + hour + hours
     d, h = divmod(end, 24)
-    return (d - 1, 24) if h == 0 else (d, h)
+    if h == 0:                                   # ends at midnight -> hour 24 of the previous day
+        d, h = d - 1, 24
+    if days_in_month is not None and d > days_in_month:
+        d -= days_in_month                       # wrap into the next month
+    return d, h
 
 
 # ---- Forecast period + product ----------------------------------------------
@@ -73,7 +79,9 @@ class TafProductGroup(BaseModel):
     from_minute: int = Field(0, ge=0, le=59)   # only FM uses minutes; 4-digit time is FM-only
     to_day: int | None = Field(None, ge=1, le=31)    # BECMG/TEMPO window end; None for FM/prevailing
     to_hour: int | None = Field(None, ge=0, le=24)
-    # Wind (dddffGfmfmKT). wind_dir: degrees (rendered to nearest 10), 'VRB', or None+speed 0 = calm.
+    # Wind (dddffGfmfmKT). wind_dir: degrees (rendered to nearest 10), 'VRB', or None.
+    # Calm is EXPLICIT: wind_dir 0 + speed 0 -> 00000KT (1.3.4.1.1). dir None + speed 0
+    # means "no wind provided" (a change group carrying it over, or an omission).
     wind_dir: int | str | None = None
     wind_speed: int = Field(0, ge=0)
     wind_gust: int | None = Field(None, ge=0)
@@ -122,7 +130,7 @@ class TafProduct(BaseModel):
     issue_hour: int = Field(ge=0, le=23)
     issue_minute: int = Field(ge=0, le=59)
     valid_from_day: int = Field(ge=1, le=31)          # YYG1G1/YYG2G2 (30h for non-amended)
-    valid_from_hour: int = Field(ge=0, le=24)
+    valid_from_hour: int = Field(ge=0, le=23)         # a START is 00-23; only an END uses 24 (midnight)
     valid_to_day: int = Field(ge=1, le=31)
     valid_to_hour: int = Field(ge=0, le=24)
     amendment: bool = False          # AMD (only one modifier at a time, 1.3.2.1.2)
@@ -138,12 +146,17 @@ class TafProduct(BaseModel):
               valid_from_day: int, valid_from_hour: int, prevailing: TafProductGroup,
               groups: list[TafProductGroup] | None = None,
               max_temp: TafTemp | None = None, min_temp: TafTemp | None = None,
-              remarks: list[str] | None = None, corrected: bool = False) -> "TafProduct":
+              remarks: list[str] | None = None, corrected: bool = False,
+              days_in_month: int | None = None) -> "TafProduct":
         """Build a routine (or COR) TAF, computing the 30-hour valid_to with the
         midnight 00/24 convention (1.3.1.1, 1.3.2.1.5). You give the issue time and
         the whole-hour validity START; the end is start+30h, so the span is correct
-        by construction -- you can never author a non-30h routine TAF this way."""
-        vt_day, vt_hour = _end_plus_hours(valid_from_day, valid_from_hour, 30)
+        by construction -- you can never author a non-30h routine TAF this way.
+        Pass days_in_month (28-31) whenever the validity can cross the month end (a TAF
+        issued on the last day or two of a month), so valid_to wraps to day 1 of the
+        next month instead of overflowing the day field (1-31) and failing to build."""
+        vt_day, vt_hour = _end_plus_hours(valid_from_day, valid_from_hour, 30,
+                                          days_in_month=days_in_month)
         return cls(
             station=station, issue_day=issue_day, issue_hour=issue_hour, issue_minute=issue_minute,
             valid_from_day=valid_from_day, valid_from_hour=valid_from_hour,
@@ -154,12 +167,17 @@ class TafProduct(BaseModel):
 
     @classmethod
     def amend(cls, original: "TafProduct", *, at_day: int, at_hour: int, at_minute: int,
-              prevailing: TafProductGroup | None = None) -> "TafProduct":
+              prevailing: TafProductGroup | None = None,
+              remarks: list[str] | None = None) -> "TafProduct":
         """Build an amendment (AMD) of `original` at the given time (1.3.2.1.2.1): new
         header/issue time, validity clipped to [current whole hour .. original end],
         and change groups no longer valid (ending at/before the clip hour) dropped. An
         FM's effective end is the next group's start. The prevailing carries over
-        unless you pass a new one describing the conditions now in effect."""
+        unless you pass a new one describing the conditions now in effect.
+        TAF-level remarks are NOT carried over by default: a duty remark can be stale
+        (its times are absolute) or self-contradicting on an amendment (e.g. LAST NO
+        AMDS). Pass `remarks` to re-supply the ones that should survive -- the caller
+        knows the duty situation; tafgen does not guess it."""
         clip = at_day * 24 + at_hour
         orig_end = original.valid_to_day * 24 + original.valid_to_hour
         kept: list[TafProductGroup] = []
@@ -178,6 +196,7 @@ class TafProduct(BaseModel):
             valid_to_day=original.valid_to_day, valid_to_hour=original.valid_to_hour,
             amendment=True, prevailing=prevailing or original.prevailing,
             groups=kept, max_temp=original.max_temp, min_temp=original.min_temp,
+            remarks=remarks or [],
         )
 
 
@@ -188,11 +207,30 @@ def _round_down_vis(m: int) -> int:
     return max(v for v in _VIS_METERS if v <= m) if m >= _VIS_METERS[0] else _VIS_METERS[0]
 
 
-def _wind(g: TafProductGroup) -> str:
-    if g.wind_speed == 0 and g.wind_dir in (None, 0):
+def _wind_omitted(g: TafProductGroup) -> bool:
+    """True when the group carries no wind at all. Explicit calm (dir 0, speed 0) is
+    NOT omitted -- it is a real forecast (1.3.4.1.1)."""
+    return g.wind_dir is None and g.wind_speed == 0 and g.wind_gust is None
+
+
+def _wind(g: TafProductGroup) -> str | None:
+    """Wind group, or None when no wind is provided. Explicit calm (dir 0 + speed 0)
+    renders 00000KT (1.3.4.1.1). 'No wind provided' returns None so a BECMG/TEMPO that
+    does not change the wind omits the group (change groups repeat only changed
+    elements, 1.3.3.1/.2); validate() flags it on the prevailing/FM period, where wind
+    is mandatory (Fig 1.1 / 1.3.3.3)."""
+    if g.wind_speed == 0 and g.wind_dir == 0:
         return "00000KT"                                  # calm (1.3.4.1.1)
+    if _wind_omitted(g):
+        return None
     spd = f"{g.wind_speed:03d}" if g.wind_speed >= 100 else f"{g.wind_speed:02d}"
-    d = "VRB" if g.wind_dir == "VRB" else f"{int(g.wind_dir):03d}"
+    if g.wind_dir == "VRB":
+        d = "VRB"
+    elif g.wind_dir is None:
+        d = "///"                                         # speed without a direction; validate() flags it
+    else:
+        deg = int(g.wind_dir)
+        d = "360" if deg == 0 else f"{deg:03d}"           # a real north wind is 360; 000 is calm-only
     gust = ""
     if g.wind_gust:
         gust = f"G{g.wind_gust:03d}" if g.wind_gust >= 100 else f"G{g.wind_gust:02d}"
@@ -263,7 +301,9 @@ def _head(g: TafProductGroup) -> str | None:
 def _body(g: TafProductGroup) -> str:
     """Element sequence (Fig 1.1): wind, vis, weather, clouds, [WS, VA, icing,
     turbulence], QNH, remarks."""
-    parts = [_wind(g)]
+    parts: list[str] = []
+    if (w := _wind(g)) is not None:                       # omitted in a change group => no wind element
+        parts.append(w)
     if (v := _vis(g)) is not None:
         parts.append(v)
     if g.weather:
@@ -332,6 +372,8 @@ def _check_group(g: TafProductGroup, tag: str, out: list[str]) -> None:
             out.append(f"{tag}: wind direction to nearest 10 deg (1.3.4.1)")
     if g.wind_dir == "VRB" and g.wind_speed > 6:
         out.append(f"{tag}: VRB only for wind <=6kt or air-mass TS (1.3.4.2)")
+    if g.wind_dir is None and g.wind_speed > 0:
+        out.append(f"{tag}: wind speed given without a direction; set wind_dir (VRB if variable) (1.3.4.1)")
     if g.wind_gust is not None and g.wind_gust <= g.wind_speed:
         # The 10kt threshold (over mean OR lull) cannot be checked -- the lull is
         # not encoded -- but a gust must at least exceed the mean (1.3.4.2.2).
@@ -361,24 +403,41 @@ def _check_group(g: TafProductGroup, tag: str, out: list[str]) -> None:
     for layer in (*g.icing, *g.turbulence):
         if not 1000 <= layer.thickness_ft <= 9000:
             out.append(f"{tag}: icing/turbulence thickness must be 1000-9000ft (Table 1.6)")
+        elif layer.thickness_ft % 1000 != 0:
+            out.append(f"{tag}: icing/turbulence thickness must be whole thousands of ft (Table 1.6)")
+    if g.wind_shear is not None:                          # non-convective low-level wind shear (1.3.9.2)
+        ws = g.wind_shear
+        if not 0 < ws.height_ft <= 2000:
+            out.append(f"{tag}: wind shear height must be <=2000ft AGL (1.3.9.2)")
+        if not 0 <= ws.wind_dir <= 360:
+            out.append(f"{tag}: wind shear direction out of range 0-360 (1.3.9.2.1.3)")
+        elif ws.wind_dir % 10 != 0:
+            out.append(f"{tag}: wind shear direction to nearest 10 deg (1.3.9.2.1.3)")
 
 
-def validate(p: TafProduct) -> list[str]:
+def validate(p: TafProduct, *, days_in_month: int | None = None) -> list[str]:
     """Check a TafProduct against the AFMAN 15-124 rules. Returns a list of human-
     readable findings (empty = clean). A format CHECKER, not an exception raiser, so
     a caller (or the agent) can see every rule it broke at once.
 
-    NOTE: span/within-24h checks work in absolute day*24+hour and so cannot see a
-    month boundary (a TAF whose validity crosses into the next month) -- there is no
-    month on a TAF. Flagged here; correct for any TAF that stays within one month.
+    A TAF carries no month, so the span check works in absolute day*24+hour. Pass
+    days_in_month (28-31) when the validity may cross a month boundary and the span is
+    sized correctly; WITHOUT it, a detected month-crossing span is SKIPPED (not falsely
+    flagged) rather than computed as a bogus negative. Within one month it is exact
+    either way.
     """
     out: list[str] = []
 
-    # Validity (1.3.1.1 / 1.3.2.1.5)
-    span = (p.valid_to_day * 24 + p.valid_to_hour) - (p.valid_from_day * 24 + p.valid_from_hour)
-    if not p.amendment and span != 30:
+    # Validity (1.3.1.1 / 1.3.2.1.5). A validity that wraps past the month end has
+    # to_abs <= from_abs; days_in_month sizes it, else the span check is skipped.
+    from_abs = p.valid_from_day * 24 + p.valid_from_hour
+    to_abs = p.valid_to_day * 24 + p.valid_to_hour
+    if to_abs <= from_abs and days_in_month is not None:
+        to_abs += days_in_month * 24
+    span = to_abs - from_abs if to_abs > from_abs else None
+    if span is not None and not p.amendment and span != 30:
         out.append(f"non-amended TAF must be valid 30h (1.3.1.1); got {span}h")
-    if p.amendment and not (0 < span <= 30):
+    if span is not None and p.amendment and not (0 < span <= 30):
         out.append(f"amended TAF validity must be >0 and <=30h (1.3.2.1.5); got {span}h")
     if p.valid_to_hour == 0:
         out.append("validity END at midnight must be encoded hour 24, not 00 (1.3.2.1.5)")
@@ -387,12 +446,19 @@ def validate(p: TafProduct) -> list[str]:
     _check_group(p.prevailing, "prevailing", out)
     if p.prevailing.qnh_inhg is None:
         out.append("prevailing: QNH expected on the initial period (1.3.12)")
+    if _wind_omitted(p.prevailing):
+        out.append("prevailing: wind is mandatory in the main body; encode calm as dir 0 speed 0 (Fig 1.1)")
 
     starts: list[tuple[int, int, int]] = []
     for i, g in enumerate(p.groups):
         tag = f"group {i} ({g.change})"
         _check_group(g, tag, out)
 
+        if g.change is None:
+            out.append(f"{tag}: a group in `groups` must set change (FM/BECMG/TEMPO); "
+                       "only the prevailing period has none (1.3.3)")
+        if g.change in ("FM", "BECMG", "TEMPO") and (g.from_day is None or g.from_hour is None):
+            out.append(f"{tag}: change group needs a start day/hour YYGG (1.3.3)")
         if g.change in ("BECMG", "TEMPO") and (g.to_day is None or g.to_hour is None):
             out.append(f"{tag}: BECMG/TEMPO need a YYGG/YYGeGe window (1.3.3)")
         if g.change in ("BECMG", "TEMPO") and g.to_hour == 0:
@@ -410,6 +476,8 @@ def validate(p: TafProduct) -> list[str]:
             out.append(f"{tag}: QNH expected on FM/BECMG (1.3.12)")
         if g.change == "FM" and g.vis_m is None:
             out.append(f"{tag}: FM is self-contained -- must include visibility (1.3.3.3)")
+        if g.change == "FM" and _wind_omitted(g):
+            out.append(f"{tag}: FM is self-contained -- must include wind (1.3.3.3)")
         if g.from_day is not None and g.from_hour is not None:
             starts.append((g.from_day, g.from_hour, g.from_minute))
 
