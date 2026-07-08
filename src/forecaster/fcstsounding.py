@@ -151,8 +151,15 @@ def parse(text: str, fhr: int, *, station: str, model: str, run: datetime, url: 
             elif toks and vals:            # first non-numeric line after data -> profile ends
                 break
         levels = [vals[i:i + 9] for i in range(0, len(vals) - 8, 9)]
-        # drop fill rows (BUFKIT tops the profile with Td/T = -9999 in the near-vacuum levels)
-        levels = [lv for lv in levels if lv[_COLS["dwpc"]] > _FILL and lv[_COLS["tmpc"]] > _FILL]
+        # drop fill rows (BUFKIT tops the profile with Td/T = -9999 in the near-vacuum
+        # levels); also drop a level whose WIND is fill -- a good-temp level can still carry
+        # DRCT/SKNT = -9999, which reaches MetPy as a bogus direction (the "input over
+        # 12.566 radians" warning). A real direction is 0-360; a real speed is >= 0.
+        levels = [
+            lv for lv in levels
+            if lv[_COLS["dwpc"]] > _FILL and lv[_COLS["tmpc"]] > _FILL
+            and 0.0 <= lv[_COLS["drct"]] <= 360.0 and lv[_COLS["sknt"]] >= 0.0
+        ]
         cols = {name: [lv[i] for lv in levels] for name, i in _COLS.items()}
         return FcstProfile(
             station=station.upper(), model=model, run=run, fhr=fhr, valid=valid,
@@ -220,7 +227,10 @@ def _parse_surface(text: str) -> list[dict]:
     for k in range(0, len(nums) - n + 1, n):
         r = nums[k:k + n]
         ymd, hm = r[idx["YYMMDD/HHMM"]].split("/")   # e.g. 260707/1800
-        row = {key: float(r[idx[b]]) for key, b in _SFC.items()}
+        # Map the -9999 fill sentinel to None so a missing surface field reads as a dash
+        # in the point table, not a bogus -9999 (or a garbage wind from _uv_to_dirspd).
+        row = {key: (None if (val := float(r[idx[b]])) <= _FILL else val)
+               for key, b in _SFC.items()}
         row["valid"] = datetime(2000 + int(ymd[:2]), int(ymd[2:4]), int(ymd[4:6]),
                                 int(hm[:2]), int(hm[2:4]))
         out.append(row)

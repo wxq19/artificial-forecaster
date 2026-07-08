@@ -356,7 +356,7 @@ artificial-forecaster/
   30h TAF for KLSV valid 2300Z. KLSV has AWC obs but NO BUFKIT output, so the prompt points at nearby KLAS for the
   model tools. Robust loop: all tool receipts appended, then images BATCHED into one follow-up user msg (avoids the
   OpenAI "tool replies must immediately follow the tool_calls msg" rule); per-model failures recorded not fatal.
-  RESULTS: MiniMax + Gemma emitted AFMAN-CLEAN TAFs (identical -- persistence off the current 25017G22KT);
+  RESULTS: MiniMax + Gemma emitted AFMAN-CLEAN TAFs (both anchored on the current 25017G22KT, each with a late change group -- see CORRECTION below);
   MiniMax most efficient (4 steps/6.3k completion tok), Gemma thorough (6 steps, widest tool set incl get_map, 4
   emit->fix cycles). Qwen RUMINATED to ~35.5k tok and stalled at 3 structural findings (issued 24h not 30h,
   missing TX/TN) -- ran out of runway before fixing. Kimi FAILED distinctly: 40+ tool calls (get_map x22,
@@ -364,9 +364,54 @@ artificial-forecaster/
   with no convergence. HEADLINE (benchmark-relevant): agentic ORCHESTRATION != chart reasoning -- Kimi/MiniMax were
   the strongest chart READERS in the map A/B, but here the discriminator is CONVERGENCE (stop gathering, emit, fix
   findings); MiniMax/Gemma converged, Kimi/Qwen did not -- the benchmark must score orchestration as its own axis.
-  Infra held across 60+ calls (no crashes; KLAS-proxy worked; mixed GIF/PNG flowed). Even the CLEAN TAFs are
-  PERSISTENCE (gusty wind + SKC held flat 30h, ignoring overnight diurnal easing) -- the emit-quality gap, next
-  frontier. Log: `logs/taf_agent_KLSV_20260707-174247.md`.
+  Infra held across 60+ calls (no crashes; KLAS-proxy worked; mixed GIF/PNG flowed).
+  CORRECTION (2026-07-08 review): the clean TAFs are NOT flat 30h persistence -- both encode the diurnal WIND
+  shift + a per-group QNH trend (Gemma: FM090000 23020G25KT, QNH 2975->2952; MiniMax: BECMG to 25010KT). What
+  they persisted is SKY/VIS (SKC 9999), correct for a bone-dry July ridge. The REAL emit-quality gaps this run
+  exposed: Qwen misread the observed DEWPOINT (-5C) as the overnight MIN temp (TN in reasoning) and then stalled
+  in the emit_taf schema spiral, never emitting TX/TN (the Tier-2 emit_taf guide targets exactly this); and Gemma
+  converted the SAME MSLP to different inHg at different points (1008 hPa -> 29.77 and 29.79; 1011 -> 29.85/29.86/
+  29.88), a hand-conversion slip whose final QNH happened to land right. Log: `logs/taf_agent_KLSV_20260707-174247.md`.
+
+## NEXT SESSION -- pick up here (paused 2026-07-08)
+This session landed ALL 11 fixes in `review-findings-2026-07-08.md` (every box now [x]): Tier 1
+(soundings 2h post-lag, get_map f0 default + single run pick, fcstsounding DRCT/SKNT + surface fill
+masks -> point-table dashes, point-table valid-TIME slice, labeled batched images), Tier 2
+(`tafgen.emit_taf_guide()` model-facing OUTPUT shape + TX/TN + clear-sky contract, injected into the
+driver SYSTEM prompt; prescriptive emit rejections), Tier 3 (step-budget loop guard in
+`test_taf_agent.py`: SYSTEM budget + one-time N-2 nudge + `TOOL_CAPS`=8; per-step token + End-ctx +
+convergence reporting). All verified deterministically/stub; ruff clean; `test_tafgen.py` 9/9.
+
+Then TWO live KLSV/072300Z runs (both this repo's target) surfaced the real frontier:
+- OBS LEAKAGE (FIXED): re-running a PAST valid time leaked 16 obs from INSIDE the 30h window via the
+  DB tools. Fix = `awc.load_metar(before=)` point-in-time ingest + a throwaway temp DB in
+  `test_taf_agent.py` (`db_path` threaded to every `run_tool`); verified 0 leak, latest ob 072255Z.
+  RESIDUAL leak (open): the network model tools (get_point_forecast/get_fcst_sounding/get_map) still
+  fetch the LATEST run, which is post-start for a past valid time -- would need archived model runs to
+  be airtight for historical dates. Weigh only if the benchmark must score historical dates.
+- max_tokens=8000 is TOO LOW: it BROKE MiniMax (hit `length` mid-emit -> the loop's break-on-no-
+  toolcall killed it) and did NOT fix Qwen (ruminates to any cap). Gemma RECOVERED once the leak was
+  gone -- its earlier 30k rumination was the RETROSPECTIVE-obs confusion, not tokens.
+
+DO NEXT, in order:
+1. FIX break-on-`length` (the real convergence blocker): in `test_taf_agent.py`, when
+   `finish_reason == "length"` AND no tool_calls, inject a user nudge ("you were cut off; be concise
+   and call emit_taf now") and CONTINUE the loop instead of taking the final_answer/break path. Then
+   set `max_tokens` ~12-16k and re-run. Expect MiniMax + Qwen to get a recovery path.
+2. (Optional) Persist the vs-obs VERIFICATION below as a scoring note -- it is the first real TAFVER
+   signal and seeds next-steps step 9.
+3. The forecasting WORKSHEET (next-steps step 12) is the quality lever for the two systematic misses.
+
+VERIFICATION vs observed METARs (KLSV 072255Z..081555Z = ~first 17h of validity; scored BOTH the
+2026-07-07 leaked run and the 2026-07-08 leak-free run). Models get SKY/VIS right (SKC 9999 held the
+whole period) and CAPTURE THE DIURNAL WIND cycle (gusty SW afternoon -> light/variable/calm overnight
+-> next-afternoon pickup). Shared REAL misses, present WITH and WITHOUT leakage: overnight low +5C
+(forecast TN32, actual 27C, timed too early) and the pressure RISE (obs climbed to A2990; TAFs held
+~2975). Leak-free run additionally exposed an honest EVENING WIND-PEAK under-call (forecast 22G16 off
+the 2255Z ob; winds actually built to 25017G22 in the first valid hours -- the leaked run had "seen"
+that ob). Best converged TAFs: Gemma+Kimi (leak-free run `logs/taf_agent_KLSV_20260708-094810.md`),
+Gemma+MiniMax (leaked run `..._20260707-174247.md`); Qwen incomplete both times; Kimi went from
+never-emit -> clean once the loop guard/caps landed.
 
 ## Likely next steps
 1. **v2 — METAR store (DONE).** `src/forecaster/store.py` is the ONLY file that touches
@@ -427,8 +472,10 @@ artificial-forecaster/
     fields).
 12. **Forecasting WORKSHEET -- intermediate tasks before emit (agent-quality).** Instead of one
     "reason-then-emit" turn, give the model a structured pre-forecast worksheet (like a human forecaster's):
-    explicit intermediate sub-tasks -- current trend, DIURNAL wind/gust cycle per valid day, TX/TN value+timing,
-    pressure/QNH trend, restriction/convective risks -- filled BEFORE calling emit_taf. The KLSV A/B showed a
+    explicit intermediate sub-tasks -- current trend, DIURNAL wind/gust cycle per valid day, TX/TN value+timing
+    (SANITY-CHECK TX/TN against the diurnal range of OBSERVED temps, so a dewpoint isn't read as the min temp --
+    the Qwen slip), pressure/QNH trend (DOUBLE-CHECK any unit conversion ONCE -- the Gemma MSLP->inHg slip),
+    restriction/convective risks -- filled BEFORE calling emit_taf. The KLSV A/B showed a
     single general "diurnal recurrence" nudge already recovered gust INCLUSION and a much better TX, and REDUCED
     rumination (clearer direction -> fewer loops, not more). A worksheet generalizes that: decompose the task to
     direct convergence and improve quality (gust PLACEMENT, QNH trend, TEMPO usage -- all things the human TAF
@@ -460,25 +507,34 @@ artificial-forecaster/
   authorized DoD environment, not commercial cloud. Flag this if it comes up.
 
 ## Known problems to address
-- **MetPy wind-direction fill in forecast soundings (FIX NEXT).** `charts.skewt` -> `mpcalc.wind_components` warns
-  `Input over 12.566 radians` (12.566 = 4pi) when a BUFKIT level carries a FILL/garbage wind DIRECTION (e.g. 9999
-  or -9999 deg -> ~174 rad, far past a real 0-360 dir), so MetPy suspects a units mistake. Root cause: our
-  `fcstsounding.parse` masks fill rows only on Td/T (`> -9000`); it does NOT validate DRCT/SKNT, so a level with a
-  good temp but a fill wind survives. Benign for the render (the bad barb/hodograph point is ignored), but a real
-  data-hygiene bug. FIX: in `fcstsounding.parse` also drop levels whose wind direction is outside [0,360] (and/or
-  speed < 0). Surfaced on KLAS, not KMSP.
+- **break-on-`length` kills a truncated emit turn (FIX FIRST -- see NEXT SESSION handoff).** In
+  `test_taf_agent.py`, a turn that hits the completion cap comes back `finish_reason=length` with no
+  tool_calls; the loop treats that as "model answered" and BREAKS. So a model whose emit-reasoning turn
+  exceeds max_tokens is killed with no TAF. Confirmed live: at max_tokens=8000, MiniMax (a reliable
+  converger) died mid-emit on step 3; Qwen dies to it at any cap. Fix = nudge-and-continue on
+  length+no-toolcall, then run max_tokens ~12-16k. This, not the token value, is the real blocker.
 - **Qwen agentic rumination (mitigate).** On the full-agent TAF task Qwen burned ~35.5k completion tokens and
   stalled at structural AFMAN findings without converging (issued 24h not 30h, no TX/TN). Model-specific
-  (Gemma/MiniMax converge). Try: the forecasting WORKSHEET (next-steps step 12) to direct convergence; lower
-  per-turn max_tokens with more steps; and/or a "state once, emit when ready" nudge.
-- **Kimi no-emit gather-loop (add a loop guard).** Kimi called 40+ read tools and never emitted a TAF. Add a
-  backstop (like `window_conflict`): after N tool-gathering steps with no emit_taf, inject a user nudge
-  ("you have enough data; call emit_taf now"), plus a per-tool call cap to stop the get_map x22 spam.
-- **emit quality = persistence (quality frontier, not a bug).** Even the AFMAN-clean TAFs just persist current
-  conditions for 30h (gusty wind + SKC), ignoring diurnal easing. Addressed by the worksheet/diurnal-nudge work
-  (steps 11-12), not a code fix.
+  (Gemma/MiniMax converge). The step-budget loop guard (below) now states the budget + nudges at turn N-2; the
+  Tier-2 emit_taf guide removes the TX/TN schema thrash. Still open: the forecasting WORKSHEET (step 12) to
+  direct convergence; and/or lower per-turn max_tokens with more steps. Re-test at the next live run.
+- **Kimi no-emit gather-loop (loop guard BUILT 2026-07-08; live re-test pending).** Kimi called 40+ read tools
+  and never emitted a TAF. `scripts/test_taf_agent.py` now has the three-layer backstop: the budget is stated in
+  SYSTEM, a one-time user nudge fires at turn N-2 if no emit yet, and per-tool call caps (`TOOL_CAPS`, default 8)
+  make a call past the cap return feedback instead of executing (kills the get_map x22 spam). Convergence is now
+  scored per model (unprompted/nudged/never). Logic verified by a stub sim; confirm on a live Kimi re-run.
+- **emit quality: sky/vis persistence + value slips (quality frontier).** The clean TAFs DO encode the diurnal
+  wind cycle + per-group QNH trend; what they persist is sky/vis (SKC 9999), correct for a dry ridge. The real
+  gaps (see the Status CORRECTION): a TX/TN value error (Qwen read the dewpoint as the min temp) and a repeated-
+  unit-conversion inconsistency (Gemma MSLP->inHg). Addressed by the worksheet (step 12), not a code fix.
 
 ## Resolved
+- MetPy wind-direction fill in forecast soundings — FIXED 2026-07-08. `fcstsounding.parse`
+  masked fill rows on Td/T only, so a level with a good temp but a -9999 wind DIRECTION reached
+  `charts.skewt` -> `mpcalc.wind_components` and warned `Input over 12.566 radians`. The profile
+  mask now also drops levels with DRCT outside [0,360] or SKNT < 0; `_parse_surface` maps the
+  -9999 surface sentinel to None (rendered as `--` in the point table). Verified: live KLAS GFS
+  f012 renders with DRCT 129..277, SKNT min 4.0, and ZERO wind/radians warnings. (Tier-1 item 3.)
 - TAF AMEND TX/TN clipping (tafgen.py `TafProduct.amend`) — FIXED 2026-07-07. Per the
   lead meteorologists: the AF NEVER issues a TAF (amended or not) without TX/TN, and on an
   amendment they cover the REMAINDER of the ORIGINAL 24h temp period (not "drop", which was

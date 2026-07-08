@@ -21,7 +21,7 @@ we actually want to keep.
 
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Anchor the cache at the repo root (like config.py), NOT the cwd, so a job whose
@@ -33,15 +33,22 @@ _CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "soundings"
 _MIN_REQUEST_INTERVAL_S = 1.0
 _last_request = 0.0
 
+# A radiosonde posts ~60-90 min after its 00Z/12Z launch. Back off this much before
+# snapping so a call just after the hour doesn't target a sounding not yet on the server
+# (a 404 that reads as a bad site id). Same pattern as wxmaps/fcstsounding post lags.
+_POST_LAG_H = 2.0
+
 # A descriptive agent -- some providers reject the default urllib user-agent.
 _UA = "artificial-forecaster/0.1 (research; contact wquinten@proton.me)"
 
 
 def synoptic_time(when: datetime | None = None) -> datetime:
-    """Most recent radiosonde synoptic hour (00Z or 12Z) at or before `when`
-    (default: now), as naive UTC to match the store's tz contract. Soundings only
-    exist at 00/12Z, so any wall-clock time must snap down to one of them."""
-    now = when or datetime.now(timezone.utc).replace(tzinfo=None)
+    """Most recent radiosonde synoptic hour (00Z or 12Z) that has had time to POST, at
+    or before `when` (default: now), as naive UTC to match the store's tz contract.
+    Soundings exist only at 00/12Z, so we snap down to one of them -- but only after
+    backing off _POST_LAG_H, so a 12:30Z call still targets the prior 00Z (the 12Z
+    image is not up yet) instead of 404ing."""
+    now = (when or datetime.now(timezone.utc).replace(tzinfo=None)) - timedelta(hours=_POST_LAG_H)
     return now.replace(hour=12 if now.hour >= 12 else 0, minute=0, second=0, microsecond=0)
 
 

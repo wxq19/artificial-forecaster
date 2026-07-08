@@ -92,6 +92,7 @@ if DIURNAL_NUDGE:
         "front without ruling out a diurnal cause; if it gusted in a past afternoon, expect "
         "gusts again in the valid afternoons unless the pattern is clearly changing."
     )
+system_content += "\n\n" + tafgen.emit_taf_guide()
 messages = [
     {"role": "system", "content": system_content},
     {"role": "user", "content": [

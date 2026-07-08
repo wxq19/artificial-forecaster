@@ -97,6 +97,7 @@ def load_metar(
     *,
     hours: float | None = None,
     db_path: str | None = None,
+    before: datetime | None = None,
 ) -> dict:
     """Fetch live METAR(s) from AWC, parse, tag report_type, and persist via the
     store seam (source='awc'). The orchestrator half that fetch_metar lacks -- it
@@ -106,11 +107,17 @@ def load_metar(
     IEM-loaded data, add 0 rows via the (station, obs_time) primary key.
 
     `hours` widens the pull to a recent back-window; omit it for just the latest
-    ob. Returns a fetch/parse/insert summary."""
+    ob. `before` (a UTC datetime) drops any ob at or after that time -- a point-in-time
+    snapshot for forecast benchmarking, so a store built with it holds only what was
+    observed BEFORE the cutoff (no peeking past the valid time). Returns a summary."""
     by_month: dict[tuple[int, int], list[MetarObs]] = defaultdict(list)
     errors: list[tuple[str, str]] = []
-    fetched = 0
+    fetched = skipped = 0
+    before_naive = before.replace(tzinfo=None) if before and before.tzinfo else before
     for ts, raw, rtype in fetch_metar(station, hours=hours):
+        if before_naive is not None and ts.replace(tzinfo=None) >= before_naive:
+            skipped += 1
+            continue
         fetched += 1
         try:
             obs = parse(raw)
@@ -136,6 +143,7 @@ def load_metar(
     return {
         "station": station,
         "fetched": fetched,
+        "skipped_after_cutoff": skipped,
         "parsed": parsed,
         "inserted": inserted,
         "errors": errors,

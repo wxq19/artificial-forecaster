@@ -18,7 +18,7 @@ from pathlib import Path
 
 from forecaster.metar import CloudLayer
 from forecaster.tafgen import (
-    TafProduct, TafProductGroup, last_no_amds, render_taf, roundtrip, validate,
+    TafProduct, TafProductGroup, _example_product, last_no_amds, render_taf, roundtrip, validate,
 )
 from forecaster.tafparse import IcingLayer, TafTemp, TurbulenceLayer, VolcanicAsh, WindShear
 
@@ -188,6 +188,8 @@ CASES = [
     Case("Amend() carry-forward", "amend() keeps TX/TN; both still land in the remaining first-24h window.",
          amended_ctor),
     Case("Limited-duty", "LAST NO AMDS limited-METWATCH remark.", limited),
+    Case("emit_taf guide example", "The worked example shipped in emit_taf_guide() -- must stay valid + round-trippable.",
+         _example_product()),
     Case("Invalid (negative test)", "Bad span, off-10 wind, gust<mean, uncaused vis, summation, missing/misplaced QNH.",
          broken, expect_invalid=True),
 ]

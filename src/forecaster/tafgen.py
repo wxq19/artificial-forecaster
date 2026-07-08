@@ -31,6 +31,7 @@ input seams are held to agree on every shared field. tafparse now recovers the h
 groups + VV from raw, so those round-trip too (not just wind/vis/wx/sky/QNH/temps).
 """
 
+import json
 from typing import Literal
 
 from forecaster.metar import CloudLayer, _VIS_TABLE
@@ -117,6 +118,13 @@ class TafProductGroup(BaseModel):
         """A TAF cloud group uses FEW/SCT/BKN/OVC only; total obscuration is vert_vis_ft."""
         bad = [c.cover for c in v if c.cover not in {"FEW", "SCT", "BKN", "OVC"}]
         if bad:
+            # A clear-sky token (SKC/CLR/NSC/NCD) is the common mistake -- the input side
+            # has no clear-sky layer value; an empty clouds list renders SKC. Name the fix
+            # rather than only listing the legal covers.
+            if any(b.upper() in {"SKC", "CLR", "NSC", "NCD"} for b in bad):
+                raise ValueError(
+                    "for clear skies pass an empty clouds list (it renders as SKC); "
+                    f"SKC/CLR are not valid layer covers; got {bad}")
             raise ValueError(f"cloud cover must be FEW/SCT/BKN/OVC; got {bad}")
         return v
 
@@ -624,3 +632,90 @@ def roundtrip(p: TafProduct) -> list[str]:
             out.append(f"{name} {t.temp_c}@{t.day:02d}{t.hour:02d}Z -> "
                        f"parsed {ot.temp_c}@{ot.day:02d}{ot.hour:02d}Z")
     return out
+
+
+# ---- Model-facing reference guide (emit_taf) --------------------------------
+# The pydantic schema on the emit_taf tool tells the model WHICH fields exist, but
+# nested optional models render as anyOf[$ref, null], so their inner fields (TafTemp's
+# temp_c/day/hour, a cloud layer's shape) are invisible -- the model then guesses the
+# shape from validation errors, which burns turns and fed the observed rumination loop.
+# This guide spells the shape out. It is generated FROM a live TafProduct, and
+# test_tafgen.py validate()s + roundtrip()s that same object, so the guide physically
+# cannot drift from the rules the tool enforces.
+
+
+def _example_product() -> TafProduct:
+    """A worked, VALID TafProduct for emit_taf_guide() and its self-test. Deliberately
+    simple (one FM group, no hazards) so the shape reads clearly; validate() and
+    roundtrip() must both come back clean (asserted by the self-test)."""
+    return TafProduct.issue(
+        station="KBLV",
+        issue_day=15, issue_hour=17, issue_minute=0,
+        valid_from_day=15, valid_from_hour=18,
+        prevailing=TafProductGroup(
+            wind_dir=240, wind_speed=9, wind_gust=18,
+            vis_m=9999,
+            clouds=[CloudLayer(cover="SCT", height_ft=25000)],
+            qnh_inhg=29.92,
+        ),
+        groups=[
+            TafProductGroup(
+                change="FM", from_day=16, from_hour=2, from_minute=0,
+                wind_dir="VRB", wind_speed=3,
+                vis_m=9999, clouds=[],                       # empty list => SKC
+                qnh_inhg=29.85,
+            ),
+        ],
+        max_temp=TafTemp(temp_c=34, day=15, hour=22),
+        min_temp=TafTemp(temp_c=21, day=16, hour=12),
+    )
+
+
+def emit_taf_guide() -> str:
+    """A model-facing reference for the emit_taf OUTPUT shape: a worked valid TafProduct
+    (as JSON, plus the TAF text it renders to) and a flattened field guide that names the
+    fields the JSON schema hides behind anyOf[$ref, null]. Intended for the driver's
+    system prompt -- NOT a replacement for the pydantic schema, which stays the validator."""
+    p = _example_product()
+    example_json = json.dumps(p.model_dump(exclude_defaults=True), indent=2)
+    return "\n".join([
+        "emit_taf OUTPUT SHAPE -- fill these fields; do NOT type raw TAF grammar.",
+        "",
+        "Worked example (a valid 30h AF TAF, as emit_taf arguments):",
+        "```json",
+        example_json,
+        "```",
+        "which renders to:",
+        "```text",
+        render_taf(p),
+        "```",
+        "",
+        "Field guide (type -- meaning):",
+        "  station            str   -- 4-letter ICAO, e.g. \"KBLV\".",
+        "  issue_day/hour/minute int -- when the TAF is issued (UTC): day 1-31, hour 0-23, minute 0-59.",
+        "  valid_from_day/hour  int -- when the 30h validity STARTS (hour 0-23). The end is start+30h.",
+        "  valid_to_day/hour    int -- when validity ENDS; a midnight end is hour 24, not 00.",
+        "  prevailing         group -- the initial/base period (see GROUP); no change/timing fields.",
+        "  groups             list  -- FM/BECMG/TEMPO change periods in chronological order (see GROUP).",
+        "  max_temp, min_temp temp  -- REQUIRED on every AF TAF. Each is three integers:",
+        "                              {\"temp_c\": <Celsius, may be negative>, \"day\": 1-31, \"hour\": 0-23}.",
+        "                              day/hour = the UTC time the max (TX) / min (TN) occurs, in the first 24h.",
+        "",
+        "GROUP fields (the prevailing period and each change group use the same shape):",
+        "  change             str   -- \"FM\", \"BECMG\", or \"TEMPO\" on a change group; OMIT on prevailing.",
+        "  from_day/from_hour int   -- when the group starts. from_minute (int) applies to FM only.",
+        "  to_day/to_hour     int   -- window END; BECMG/TEMPO only (FM is an instant).",
+        "  wind_dir           int|str -- degrees to the nearest 10 (e.g. 240) or \"VRB\". Calm = 0 with speed 0.",
+        "  wind_speed, wind_gust int -- knots. Omit wind_gust unless gusts are forecast.",
+        "  vis_m              int   -- visibility in METERS (9999 = unrestricted, >=7SM). NOT statute miles.",
+        "  weather            list  -- present-wx tokens, e.g. [\"-SHRA\", \"BR\"]; [\"NSW\"] cancels weather.",
+        "  clouds             list  -- ascending layers {\"cover\": \"FEW\"|\"SCT\"|\"BKN\"|\"OVC\", \"height_ft\": int,",
+        "                              \"type\": \"CB\" or null}. CLEAR SKIES = an EMPTY list [] (renders SKC).",
+        "                              \"SKC\"/\"CLR\" are NOT valid cover values.",
+        "  qnh_inhg           float -- altimeter in inches Hg, e.g. 29.92. REQUIRED on prevailing/FM/BECMG,",
+        "                              FORBIDDEN in TEMPO.",
+        "",
+        "The emit_taf reply is an AFMAN check, not data: a routine TAF is valid exactly 30h;",
+        "every FM must carry wind AND vis; a vis below 9999 needs a weather cause; TS needs a CB",
+        "layer; TX >= TN. Correct any findings it returns and re-emit until the check is clean.",
+    ])

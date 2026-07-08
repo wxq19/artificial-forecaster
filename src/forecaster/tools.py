@@ -171,7 +171,8 @@ GET_MAP = {
             "flow, moisture, and how the pattern is forecast to evolve. Analysis charts "
             "(surface_*, ocean_*, meso_*) show CURRENT conditions; gfs_* are GFS "
             "FORECAST panels -- for those, pass `fhr`, the forecast hour (a multiple of "
-            "6, e.g. 0, 6, 12, 24, 36). Charts: " + _MAP_MENU + "."
+            "6, e.g. 0, 6, 12, 24, 36); averaged-field charts (gfs_mslp_precip) start at "
+            "f006, not f000. Charts: " + _MAP_MENU + "."
         ),
         "parameters": {
             "type": "object",
@@ -267,8 +268,11 @@ EMIT_TAF = {
             "METERS (9999 = unrestricted, >=7SM); wind direction is degrees to the "
             "nearest 10 as an INTEGER (or 'VRB'); QNH is the altimeter in inches of "
             "mercury (e.g. 29.92); include CB cloud type whenever a thunderstorm (TS) "
-            "is forecast; do not put QNH in a TEMPO group. Base the forecast only on "
-            "the observations and trend provided."
+            "is forecast; do not put QNH in a TEMPO group. Every AF TAF must include a "
+            "max (TX) and min (TN) temperature, each as "
+            '{"temp_c": <Celsius>, "day": <1-31>, "hour": <0-23 UTC>}. For clear skies '
+            "pass an EMPTY clouds list (it renders SKC); SKC/CLR are not valid cloud "
+            "cover values. Base the forecast only on the observations and trend provided."
         ),
         "parameters": TafProduct.model_json_schema(),
     },
@@ -357,6 +361,24 @@ def _int_arg(v, default: int, *, lo: int, hi: int | None = None) -> int:
     return n if hi is None else min(n, hi)
 
 
+_CLEAR_SKY_COVERS = {"SKC", "CLR", "NSC", "NCD"}
+
+
+def _has_clear_sky_layer(args: dict) -> bool:
+    """True if any authored cloud layer uses a clear-sky token as its cover. A
+    CloudLayer has no clear-sky value (clear = an empty clouds list), and its required
+    height_ft can trip first and mask the cover mistake, so we detect it from the raw
+    args to attach the right hint regardless of which schema error fired."""
+    periods = [args.get("prevailing") or {}, *(args.get("groups") or [])]
+    for period in periods:
+        if not isinstance(period, dict):
+            continue
+        for layer in period.get("clouds") or []:
+            if isinstance(layer, dict) and str(layer.get("cover", "")).upper() in _CLEAR_SKY_COVERS:
+                return True
+    return False
+
+
 def _emit_taf(args: dict) -> ToolResult:
     """Capture the model's structured forecast: build a TafProduct (guardrails fire
     here), render it, and run the AFMAN rule check + round-trip. The receipt is that
@@ -368,8 +390,21 @@ def _emit_taf(args: dict) -> ToolResult:
     except ValidationError as e:
         errs = "\n".join(f"  - {'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
                          for err in e.errors())
+        # Name the fix for the two shapes the schema hides, so the model does not
+        # reverse-engineer it from a terse error (which fed the observed rumination).
+        hints = []
+        # (a) TafTemp: a None|TafTemp union failure is a terse two-branch error.
+        if any(err["loc"] and str(err["loc"][0]) in ("max_temp", "min_temp") for err in e.errors()):
+            hints.append('max_temp/min_temp each need three integers -- '
+                         '{"temp_c": <Celsius>, "day": <1-31>, "hour": <0-23>}.')
+        # (b) Clear-sky token as a cloud cover: a CloudLayer has no clear-sky value, and
+        # its required height_ft can mask the cover error -- so detect it from the args.
+        if _has_clear_sky_layer(args):
+            hints.append("for clear skies pass an EMPTY clouds list [] (renders SKC); "
+                         "SKC/CLR/NSC are not valid cloud covers.")
+        hint = "".join(f"\n  note: {h}" for h in hints)
         return ToolResult(f"emit_taf rejected ({e.error_count()} schema error(s)); fix and "
-                          f"re-emit:\n{errs}")
+                          f"re-emit:\n{errs}{hint}")
     findings = tafgen.validate(product)
     try:
         text = tafgen.render_taf(product)
@@ -413,7 +448,8 @@ def _get_sounding(args: dict) -> ToolResult:
     except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
         return ToolResult(
             f"error: could not fetch {source} sounding for {str(site).upper()} "
-            f"({type(e).__name__}: {e}); check the site id for this provider"
+            f"({type(e).__name__}: {e}); the site may have no launch at this synoptic time, "
+            "or the id may be wrong for this provider (SPC: 3-letter site or WMO; Wyoming: WMO)"
         )
     receipt = (
         f"Observed skew-T for {str(site).upper()} at {t:%Y-%m-%dT%H:%MZ} "
@@ -433,15 +469,21 @@ def _get_map(args: dict) -> ToolResult:
         )
     spec = wxmaps.CATALOG[name]
     fhr = 0
+    run = None
     if spec.source == "tt":
-        fhr = _int_arg(args.get("fhr"), 0, lo=0, hi=wxmaps.GFS_MAX_FHR)
+        # An averaged-field chart's first frame is f0 (e.g. gfs_mslp_precip starts at
+        # f006), so default AND floor fhr at f0 -- a model that omits fhr or passes 0
+        # gets a valid first frame, not a "must be a multiple of 6" rejection.
+        f0 = spec.params.get("f0", 0)
+        fhr = _int_arg(args.get("fhr"), f0, lo=f0, hi=wxmaps.GFS_MAX_FHR)
         fhr -= fhr % wxmaps.GFS_STEP_H          # snap down to the 6h GFS grid
+        run = wxmaps.latest_gfs_run()           # resolve once so the receipt and image agree
     try:
-        url = wxmaps.map_url(name, fhr=fhr)
-        img = wxmaps.fetch_map(name, fhr=fhr)
+        url = wxmaps.map_url(name, fhr=fhr, run=run)
+        img = wxmaps.fetch_map(name, fhr=fhr, run=run)
     except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
         return ToolResult(f"error: could not fetch chart {name} ({type(e).__name__}: {e})")
-    lead = f", GFS f{fhr:03d}" if spec.source == "tt" else ""
+    lead = f", GFS f{fhr:03d} run {run:%Y-%m-%dT%H:%MZ}" if spec.source == "tt" else ""
     return ToolResult(
         f"{spec.label} [{name}]{lead} (source: {spec.source}, {url}); image follows.",
         images=[img],
@@ -481,7 +523,13 @@ def _uv_to_dirspd(u: float, v: float) -> tuple[int, int]:
 def _fmt_point(pf, n: int) -> str:
     """Format a PointForecast as a text table: one row per forecast hour, columns are the
     raw surface variables (wind shown as dir/speed). Read a column down for a trend."""
-    rows = pf.rows[:n]
+    # Slice by valid TIME, not row count: the BUFKIT surface series is hourly early but
+    # goes 3-hourly at longer ranges, so `n` rows would silently cover more than n hours.
+    if pf.rows:
+        cutoff = pf.rows[0]["valid"] + timedelta(hours=n)
+        rows = [r for r in pf.rows if r["valid"] <= cutoff]
+    else:
+        rows = []
     out = [
         f"{pf.model.upper()} point forecast for {pf.station} -- run {pf.run:%Y-%m-%dT%H:%MZ}, "
         f"{len(rows)} hourly steps (source: {pf.url}). Raw model surface fields; each row is "
@@ -489,13 +537,18 @@ def _fmt_point(pf, n: int) -> str:
         (f"{'Valid (UTC)':<18}{'T C':>5}{'Td C':>6}{'Wind kt':>10}{'MSLP':>7}"
          f"{'Cld L/M/H %':>14}{'P01 mm':>8}"),
     ]
+    def _d(v, fmt: str = "{:.0f}") -> str:
+        return "--" if v is None else fmt.format(v)
+
     for r in rows:
-        wd, ws = _uv_to_dirspd(r["uwnd_ms"], r["vwnd_ms"])
+        u, v = r["uwnd_ms"], r["vwnd_ms"]
+        wind = "--" if u is None or v is None else "{:03d}/{}".format(*_uv_to_dirspd(u, v))
         vt = f"{r['valid']:%Y-%m-%dT%H:%MZ}"
-        cloud = f"{r['lcld']:.0f}/{r['mcld']:.0f}/{r['hcld']:.0f}"
+        trip = (r["lcld"], r["mcld"], r["hcld"])
+        cloud = "--" if any(c is None for c in trip) else "/".join(f"{c:.0f}" for c in trip)
         out.append(
-            f"{vt:<18}{r['t2m_c']:>5.0f}{r['td2m_c']:>6.0f}{f'{wd:03d}/{ws}':>10}"
-            f"{r['mslp_hpa']:>7.0f}{cloud:>14}{r['p01_mm']:>8.1f}"
+            f"{vt:<18}{_d(r['t2m_c']):>5}{_d(r['td2m_c']):>6}{wind:>10}"
+            f"{_d(r['mslp_hpa']):>7}{cloud:>14}{_d(r['p01_mm'], '{:.1f}'):>8}"
         )
     return "\n".join(out)
 
