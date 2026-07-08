@@ -17,6 +17,11 @@ also closed the `n`-coerce half of 9; 8 done as policy B; d.5 parameterized. Not
 FOLLOW-UP (new, not in original review): amend() carries max_temp/min_temp forward
 unchanged, but TX/TN times are absolute and can fall outside the clipped validity after an
 amendment (AFMAN: TX/TN cover the first 24h). Separate from d.5; track if it matters.
+  RESOLVED 2026-07-07: per the lead meteorologists, the AF never issues a TAF without TX/TN,
+  and on amendment they cover the REMAINDER of the ORIGINAL 24h period. validate() now
+  hard-requires both (gated on a new TafProduct.military flag so civil/NWS TAFs are exempt)
+  and checks the uniform window [valid_from, valid_to-6]; amend() carries TX/TN forward with
+  optional max_temp/min_temp overrides. Self-test 8/8. See CLAUDE.md "Resolved".
 
 ---
 

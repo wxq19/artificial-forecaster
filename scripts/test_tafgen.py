@@ -34,6 +34,7 @@ class Case:
     product: TafProduct
     expected: str | None = None      # byte-exact AFMAN text, when this reproduces a figure
     expect_invalid: bool = False     # True => validate() SHOULD report findings
+    render_only: bool = False        # partial doc example (e.g. Fig 1.6): check render+roundtrip, not validate-clean
 
 
 # --- AFMAN 15-124 Figure 1.3: KBAD winter TAF (icing, VV, partial obscuration) ---
@@ -143,6 +144,7 @@ amended = TafProduct(
     groups=[TafProductGroup(change="BECMG", from_day=1, from_hour=20, to_day=1, to_hour=21,
         wind_dir=240, wind_speed=12, vis_m=8000, weather=["-RA"],
         clouds=[C("BKN", 2000)], qnh_inhg=29.92)],
+    max_temp=TafTemp(temp_c=17, day=2, hour=15), min_temp=TafTemp(temp_c=9, day=2, hour=10),
 )
 
 # --- Limited-duty TAF: LAST NO AMDS remark (1.3.13.2.1) ---
@@ -151,6 +153,7 @@ limited = TafProduct(
     valid_from_day=1, valid_from_hour=12, valid_to_day=2, valid_to_hour=18,
     prevailing=TafProductGroup(wind_dir=270, wind_speed=8, vis_m=9999,
         clouds=[C("SCT", 5000)], qnh_inhg=30.00),
+    max_temp=TafTemp(temp_c=20, day=1, hour=20), min_temp=TafTemp(temp_c=10, day=2, hour=11),
     remarks=[last_no_amds(2, 6, 2, 12)],
 )
 
@@ -164,13 +167,26 @@ broken = TafProduct(
         wind_dir=300, wind_speed=15, vis_m=9999, qnh_inhg=29.9)],             # QNH in a TEMPO
 )
 
+# --- Amendment via amend(): TX/TN carry into the remaining first-24h temp window ---
+_orig = TafProduct.issue(station="KADW", issue_day=1, issue_hour=12, issue_minute=0,
+    valid_from_day=1, valid_from_hour=12,
+    prevailing=TafProductGroup(wind_dir=200, wind_speed=10, vis_m=9999,
+        clouds=[C("SCT", 4000)], qnh_inhg=29.95),
+    max_temp=TafTemp(temp_c=18, day=1, hour=20), min_temp=TafTemp(temp_c=8, day=2, hour=10))
+amended_ctor = TafProduct.amend(_orig, at_day=1, at_hour=16, at_minute=30,
+    prevailing=TafProductGroup(wind_dir=240, wind_speed=12, vis_m=8000,
+        weather=["-RA"], clouds=[C("BKN", 2000)], qnh_inhg=29.92))
+
 CASES = [
     Case("Fig 1.3 — KBAD winter", "Icing, VV total obscuration, partial-obscuration remarks, FM minutes.",
          fig13, expected=fig13_txt),
     Case("Fig 1.4 — ETAR COR", "Corrected TAF with an icing AND a turbulence group.", fig14, expected=fig14_txt),
-    Case("Fig 1.6 — volcanic ash", "VA plume aloft, following the cloud group.", fig16, expected=fig16_txt),
+    Case("Fig 1.6 — volcanic ash", "VA plume aloft (a partial example LINE, not a full TAF -- no TX/TN).",
+         fig16, expected=fig16_txt, render_only=True),
     Case("Fig 1.7 — wind shear", "Non-convective low-level wind shear; FM at :30.", fig17, expected=fig17_txt),
     Case("Amended TAF", "AMD clipped to the remaining validity (<30h is correct for an amendment).", amended),
+    Case("Amend() carry-forward", "amend() keeps TX/TN; both still land in the remaining first-24h window.",
+         amended_ctor),
     Case("Limited-duty", "LAST NO AMDS limited-METWATCH remark.", limited),
     Case("Invalid (negative test)", "Bad span, off-10 wind, gust<mean, uncaused vis, summation, missing/misplaced QNH.",
          broken, expect_invalid=True),
@@ -197,7 +213,10 @@ def run(case: Case) -> Result:
     findings = validate(case.product)
     diffs = roundtrip(case.product)
     byte_ok = case.expected is None or rendered == case.expected
-    validate_ok = bool(findings) if case.expect_invalid else not findings
+    if case.render_only:
+        validate_ok = True                       # partial doc example: presence rules N/A
+    else:
+        validate_ok = bool(findings) if case.expect_invalid else not findings
     # An intentionally-invalid TAF need not round-trip; everything else must.
     rt_ok = True if case.expect_invalid else not diffs
     return Result(case, rendered, findings, diffs, byte_ok, validate_ok, rt_ok)

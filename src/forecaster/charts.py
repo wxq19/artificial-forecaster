@@ -9,11 +9,18 @@ so legibility at small size matters more than polish.
 import io
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")  # headless: no display on WSL/SuperCloud
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+
+# MetPy is PyPI (no conda) and drives matplotlib, so the skew-T renderer stays inside
+# this seam rather than adding a second plotting file.
+import metpy.calc as mpcalc
+from metpy.plots import Hodograph, SkewT
+from metpy.units import units
 
 from forecaster import wxcodes
 
@@ -220,3 +227,91 @@ def _wx_legend(lax, families) -> None:
     lax.set_yticks([])
     for spine in lax.spines.values():
         spine.set_visible(False)
+
+
+def skewt(profile) -> bytes:
+    """Enriched forecast skew-T from a fcstsounding.FcstProfile -> PNG bytes.
+
+    Plots temperature/dewpoint, a surface-parcel path with CAPE/CIN shading and the LCL,
+    a height-colored hodograph, and the model's stability indices. `profile` is
+    duck-typed: any object exposing pres/tmpc/dwpc/drct/sknt/hght (lists), indices (dict),
+    and station/model/run/fhr/valid metadata. The right column is pinned to the skew-T
+    box so the hodograph top and indices bottom align with the chart."""
+    p = np.array(profile.pres) * units.hPa
+    T = np.array(profile.tmpc) * units.degC
+    Td = np.array(profile.dwpc) * units.degC
+    u, v = mpcalc.wind_components(np.array(profile.sknt) * units.knots,
+                                  np.array(profile.drct) * units.degrees)
+    hght = np.array(profile.hght) * units.m
+
+    fig = plt.figure(figsize=(11, 9))
+    gs = fig.add_gridspec(1, 2, width_ratios=[2.5, 1])
+    skew = SkewT(fig, rotation=45, subplot=gs[0, 0])
+    skew.plot(p, T, "r", linewidth=2, label="Temperature")
+    skew.plot(p, Td, "g", linewidth=2, label="Dewpoint")
+    skew.plot_barbs(p[::3], u[::3], v[::3])
+    skew.ax.set_ylim(1000, 150)
+    skew.ax.set_xlim(-40, 50)
+    skew.ax.set_xlabel("Temperature (°C)")
+    skew.ax.set_ylabel("Pressure (hPa)")
+    skew.plot_dry_adiabats(alpha=0.25)
+    skew.plot_moist_adiabats(alpha=0.25)
+    skew.plot_mixing_lines(alpha=0.25)
+
+    # surface-parcel path + CAPE/CIN shading + LCL (MetPy does the thermo)
+    try:
+        parcel = mpcalc.parcel_profile(p, T[0], Td[0]).to("degC")
+        skew.plot(p, parcel, "k", linewidth=1.2, linestyle="--", label="Parcel")
+        skew.shade_cape(p, T, parcel)
+        skew.shade_cin(p, T, parcel, Td)
+        lcl_p, lcl_t = mpcalc.lcl(p[0], T[0], Td[0])
+        skew.plot(lcl_p, lcl_t, "ko", markerfacecolor="black")
+        skew.ax.text(lcl_t.m + 1, lcl_p.m, "LCL", fontsize=8, va="center")
+    except Exception:  # noqa: BLE001 -- thermo edge cases shouldn't kill the plot
+        pass
+    skew.ax.legend(loc="upper center", fontsize=8, ncol=4, frameon=False)
+
+    # right column: hodograph on top, indices box beneath
+    gs_r = gs[0, 1].subgridspec(2, 1, height_ratios=[1.2, 1], hspace=0.08)
+    ax_h = fig.add_subplot(gs_r[0])
+    ax_txt = fig.add_subplot(gs_r[1])
+    ax_txt.axis("off")
+
+    top = p >= 200 * units.hPa            # keep the hodograph to the troposphere
+    spd = np.hypot(u[top].m, v[top].m)
+    rng = max(30, int(np.ceil((spd.max() if spd.size else 30) / 10) * 10) + 10)
+    hod = Hodograph(ax_h, component_range=rng)
+    hod.add_grid(increment=10 if rng <= 40 else 20)
+    hod.plot_colormapped(u[top], v[top], hght[top])
+    ax_h.set_title("Hodograph (kt, by height)", fontsize=9)
+
+    order = ("CAPE", "CINS", "LIFT", "SHOW", "KINX", "TOTL", "PWAT", "LCLP")
+    lines = [f"{n:<5}{profile.indices[n]:>8.0f}" if n in ("CAPE", "CINS")
+             else f"{n:<5}{profile.indices[n]:>8.1f}"
+             for n in order if n in profile.indices]
+    ax_txt.text(0.0, 0.0, f"{profile.model.upper()} indices\n" + "\n".join(lines),
+                family="monospace", fontsize=9, va="bottom", ha="left",
+                transform=ax_txt.transAxes,
+                bbox=dict(boxstyle="round", facecolor="#f4f4f4", edgecolor="#bbb"))
+
+    fig.suptitle(
+        f"{profile.model.upper()} forecast skew-T  |  {profile.station}  "
+        f"run {profile.run:%Y-%m-%d %HZ}  f{profile.fhr:03d}  valid {profile.valid}",
+        fontsize=11)
+
+    # SkewT under-fills its gridspec cell; pin hodograph top -> chart top and indices
+    # bottom -> chart bottom by reading the skew-T box after a draw (uniform tight-crop
+    # at save then preserves the alignment).
+    fig.canvas.draw()
+    sp = skew.ax.get_position()
+    fw, fh = fig.get_size_inches()
+    hp = ax_h.get_position()
+    hh = hp.width * fw / fh                # square hodograph (equal aspect fills it)
+    ax_h.set_position([hp.x0, sp.y1 - hh, hp.width, hh])
+    tp = ax_txt.get_position()
+    ax_txt.set_position([tp.x0, sp.y0, tp.width, (sp.y1 - hh - 0.03) - sp.y0])
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    plt.close(fig)  # release the figure - matplotlib leaks if you don't
+    return buf.getvalue()

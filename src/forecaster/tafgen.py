@@ -135,6 +135,7 @@ class TafProduct(BaseModel):
     valid_to_hour: int = Field(ge=0, le=24)
     amendment: bool = False          # AMD (only one modifier at a time, 1.3.2.1.2)
     corrected: bool = False          # COR
+    military: bool = True            # AF/US-military TAF: QNH + TX/TN required. NWS/civil (False) omit both.
     prevailing: TafProductGroup
     groups: list[TafProductGroup] = []   # change groups, in TAF order
     max_temp: TafTemp | None = None  # TX (first 24h)
@@ -168,12 +169,17 @@ class TafProduct(BaseModel):
     @classmethod
     def amend(cls, original: "TafProduct", *, at_day: int, at_hour: int, at_minute: int,
               prevailing: TafProductGroup | None = None,
+              max_temp: TafTemp | None = None, min_temp: TafTemp | None = None,
               remarks: list[str] | None = None) -> "TafProduct":
         """Build an amendment (AMD) of `original` at the given time (1.3.2.1.2.1): new
         header/issue time, validity clipped to [current whole hour .. original end],
         and change groups no longer valid (ending at/before the clip hour) dropped. An
         FM's effective end is the next group's start. The prevailing carries over
         unless you pass a new one describing the conditions now in effect.
+        TX/TN carry forward too (the AF issues both on every TAF, amendments included)
+        and still cover the REMAINDER of the original 24h temp period. Pass max_temp/
+        min_temp to re-forecast that remainder; validate() flags any carried-forward
+        temp whose hour has already elapsed (now outside [now .. original_start+24h]).
         TAF-level remarks are NOT carried over by default: a duty remark can be stale
         (its times are absolute) or self-contradicting on an amendment (e.g. LAST NO
         AMDS). Pass `remarks` to re-supply the ones that should survive -- the caller
@@ -194,8 +200,10 @@ class TafProduct(BaseModel):
             issue_day=at_day, issue_hour=at_hour, issue_minute=at_minute,
             valid_from_day=at_day, valid_from_hour=at_hour,
             valid_to_day=original.valid_to_day, valid_to_hour=original.valid_to_hour,
-            amendment=True, prevailing=prevailing or original.prevailing,
-            groups=kept, max_temp=original.max_temp, min_temp=original.min_temp,
+            amendment=True, military=original.military,
+            prevailing=prevailing or original.prevailing, groups=kept,
+            max_temp=max_temp or original.max_temp,
+            min_temp=min_temp or original.min_temp,
             remarks=remarks or [],
         )
 
@@ -425,6 +433,10 @@ def validate(p: TafProduct, *, days_in_month: int | None = None) -> list[str]:
     sized correctly; WITHOUT it, a detected month-crossing span is SKIPPED (not falsely
     flagged) rather than computed as a bogus negative. Within one month it is exact
     either way.
+
+    The QNH-required and TX/TN-required checks apply only to military TAFs
+    (p.military, the default); a civil/NWS TAF (military=False) carries neither, so
+    those presence checks are skipped and it is not falsely flagged.
     """
     out: list[str] = []
 
@@ -444,7 +456,7 @@ def validate(p: TafProduct, *, days_in_month: int | None = None) -> list[str]:
 
     # Prevailing period + each change group
     _check_group(p.prevailing, "prevailing", out)
-    if p.prevailing.qnh_inhg is None:
+    if p.military and p.prevailing.qnh_inhg is None:
         out.append("prevailing: QNH expected on the initial period (1.3.12)")
     if _wind_omitted(p.prevailing):
         out.append("prevailing: wind is mandatory in the main body; encode calm as dir 0 speed 0 (Fig 1.1)")
@@ -472,7 +484,7 @@ def validate(p: TafProduct, *, days_in_month: int | None = None) -> list[str]:
                 out.append(f"{tag}: QNH not allowed in TEMPO (1.3.12)")
             if g.wind_shear is not None:
                 out.append(f"{tag}: wind shear not allowed in TEMPO (1.3.9.2.2)")
-        if g.change in (None, "FM", "BECMG") and g.qnh_inhg is None:
+        if p.military and g.change in (None, "FM", "BECMG") and g.qnh_inhg is None:
             out.append(f"{tag}: QNH expected on FM/BECMG (1.3.12)")
         if g.change == "FM" and g.vis_m is None:
             out.append(f"{tag}: FM is self-contained -- must include visibility (1.3.3.3)")
@@ -484,13 +496,22 @@ def validate(p: TafProduct, *, days_in_month: int | None = None) -> list[str]:
     if starts != sorted(starts):
         out.append("change groups must be in chronological order (1.3.3)")
 
-    # Temperatures (1.3.13.1)
+    # Temperatures (1.3.13.1). AF practice: EVERY military TAF -- routine or amended --
+    # carries both TX and TN (NWS/civil TAFs, military=False, carry neither, so the
+    # presence check is gated). On an amendment they cover the REMAINDER of the original
+    # 24h temp period; since valid_to always encodes original_start+30h, that window is
+    # uniformly [valid_from, valid_to-6] for routine and amended alike (no AMD branch).
+    if p.military:
+        for t, name in ((p.max_temp, "TX"), (p.min_temp, "TN")):
+            if t is None:
+                out.append(f"{name} is required on every AF TAF (1.3.13.1)")
     if p.max_temp and p.min_temp and p.max_temp.temp_c < p.min_temp.temp_c:
         out.append("TX (max) should be >= TN (min) (1.3.13.1)")
-    start = p.valid_from_day * 24 + p.valid_from_hour
+    lo = p.valid_from_day * 24 + p.valid_from_hour
+    hi = p.valid_to_day * 24 + p.valid_to_hour - 6
     for t, name in ((p.max_temp, "TX"), (p.min_temp, "TN")):
-        if t and not 0 <= (t.day * 24 + t.hour) - start <= 24:
-            out.append(f"{name} time must fall in the first 24h of validity (1.3.13.1)")
+        if t and not lo <= t.day * 24 + t.hour <= hi:
+            out.append(f"{name} time must fall in the remaining first-24h temp window (1.3.13.1)")
     return out
 
 

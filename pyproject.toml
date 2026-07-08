@@ -8,6 +8,7 @@ dependencies = [
     "duckdb>=1.5.4",
     "matplotlib>=3.11.0",
     "metar-taf-parser-mivek>=1.13.1",
+    "metpy>=1.7.1",
     "openai>=2.43.0",
     "pydantic-settings>=2.14.2",
     "python-dotenv>=1.2.2",

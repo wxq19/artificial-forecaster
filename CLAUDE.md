@@ -48,7 +48,7 @@ must remain a `.env` edit with ZERO code change. Preserve this seam in any sugge
 
 ## Tech stack
 - **App / serving code:** Python, managed with `uv`. Pure-PyPI deps (openai,
-  pydantic-settings, python-dotenv). Run things with `uv run python ...`.
+  pydantic-settings, python-dotenv, matplotlib, metpy). Run things with `uv run python ...`.
   Lint/format with `uv run ruff ...`.
 - **Geospatial / GRIB tools:** eccodes, cfgrib, xarray, cartopy, matplotlib. These are
   C-library-heavy — use **conda-forge**, NOT pip. (Not built yet.)
@@ -87,11 +87,14 @@ artificial-forecaster/
 │   ├── store.py          # the ONLY file that touches DuckDB (seam)
 │   ├── iem.py            # historical METAR ingestion (IEM)
 │   ├── wxcodes.py        # present-weather classify + deterministic severity rule
-│   ├── charts.py         # the ONLY file that imports matplotlib (meteogram/wx_timeline)
+│   ├── charts.py         # the ONLY file that imports matplotlib/metpy (meteogram/wx_timeline/skewt)
+│   ├── soundings.py      # live skew-T image client (SPC/Wyoming); fetch pixels, don't draw (seam)
+│   ├── wxmaps.py         # live synoptic map client (WPC/OPC/SPC-meso/TT GFS); fetch charts (seam)
+│   ├── fcstsounding.py   # model BUFKIT forecast-sounding fetch+parse (rendered by charts.skewt) (seam)
 │   └── tools.py          # agent read tools + emit_taf OUTPUT tool + loop plumbing (-> agent.py later)
 ├── scripts/              # dev + end-to-end test drivers (markdown logs -> logs/)
 ├── docs/                 # references (FMH-1 wx table, AFMAN 15-124, AFH 15-101)
-├── data/                 # GITIGNORED: forecaster.duckdb, charts/temp/ (throwaway)
+├── data/                 # GITIGNORED: forecaster.duckdb, charts/temp/, soundings/, maps/, fcstsoundings/ (throwaway)
 └── logs/                 # run transcripts (markdown)
 ```
 
@@ -268,8 +271,8 @@ artificial-forecaster/
   have the wrong span; `TafProduct.amend(orig, at=...)` clips validity + drops expired groups (1.3.2.1.2.1).
   Pydantic guardrails reject IMPOSSIBLE values at construction (station 4-letter, change in FM/BECMG/TEMPO,
   wind_dir 0-360, cover FEW/SCT/BKN/OVC); validate() catches well-formed-but-rule-breaking values. Three layers:
-  guardrails -> validate() -> roundtrip(). Self-test `scripts/test_tafgen.py` (no model/network): 7/7, byte-exact
-  figures + a negative case.
+  guardrails -> validate() -> roundtrip(). Self-test `scripts/test_tafgen.py` (no model/network): 8/8, byte-exact
+  figures + a negative case + an amend() carry-forward case.
 - emit_taf OUTPUT TOOL (`tools.py`, step 6 DONE): the model's first OUTPUT tool. Parameter schema IS
   `TafProduct.model_json_schema()` (the one class is tool contract AND validator). `_emit_taf` builds the product
   (guardrails fire), renders + validate()s, returns the AFMAN check as the receipt with the product on
@@ -283,6 +286,87 @@ artificial-forecaster/
   a default). Verified end-to-end on KBLV valid 291600Z with a STRICT pre-cutoff feed: Gemma reasoned over the
   meteogram (spotted the diurnal wind dip), emitted, hit 4 AFMAN findings (BECMG>2h, missing QNH), READ them and
   self-corrected to a clean, round-trippable TAF in 2 steps.
+- SKEW-T IMAGE SEAM (`soundings.py`, this session): a live upper-air client, sibling to `awc.py`/`iem.py` -- it
+  FETCHES pre-rendered skew-T images and returns raw bytes. No matplotlib (we fetch pixels, we don't draw them,
+  so `charts.py` stays the ONLY matplotlib file) and no SQL/DuckDB. A forecaster reads these exact products, so
+  feeding the model the same image keeps the human-vs-model comparison honest. Two OBSERVED providers (RAOB,
+  00Z/12Z only): SPC (spc.noaa.gov/exper/soundings -- SHARPpy-analyzed GIF with the derived indices printed ON
+  the plot; CONUS/North America) and Wyoming (weather.uwyo.edu -- bare skew-T PNG, indices on a separate text
+  page; GLOBAL coverage + a deep historical archive). Each names stations in its OWN id space (SPC: 3-letter
+  site like MPX/OUN, or a WMO number; Wyoming: a WMO number like 72649 -- which IS MPX), so the caller passes the
+  id that matches `source`. `synoptic_time()` snaps any time to the latest 00/12Z; `skewt_url()` builds the exact
+  provider URL (Wyoming's wsgi page is an HTML WRAPPER -- the image itself is a stable
+  /upperair/imgs/YYYYMMDDHH.<WMO>.skewt.png path, fetched directly, no HTML parse); `fetch_skewt()` returns bytes
+  with an OPT-IN disk cache under `data/soundings/` (the air-gap/reproducibility path -- SuperCloud nodes have no
+  internet -- but live-first while prototyping; `cache_path()` exposes where a cached image lands). Module-level
+  throttle + a descriptive User-Agent, like iem/awc. `get_sounding` tool wired into `tools.py`, dispatched BEFORE
+  the DB connect (it's a network fetch, needs no DB, like emit_taf) + `_image_mime()` magic-byte sniff so SPC's
+  GIF and Wyoming's PNG both ride the EXISTING image-return plumbing (tool_messages was hardcoded image/png).
+  Drivers: `scripts/test_sounding.py` (tool loop -- model calls get_sounding -> reads the image -> reasons;
+  `--fetch-only` caches + prints the path for pre-review) and `scripts/test_sounding_ab.py` (a controlled
+  SPC-vs-Wyoming A/B, same station+time, image fed directly so the source is the only variable). Conda-forge
+  GRIB stack DEFERRED -- prototype off fetched images first.
+- SYNOPTIC MAP SEAM (`wxmaps.py`, this session): a live surface/upper-air CHART client, sibling to `soundings.py`
+  -- fetches PRE-RENDERED forecaster maps and returns raw bytes (no matplotlib, no SQL). A `CATALOG` of 14 charts
+  (semantic name + the review-manifest code A1..C4), FOUR provider families: WPC (CONUS surface analysis +
+  Day1/Day2 progs, GIF), OPC (Atlantic + Pacific oceanic surface analysis, PNG -- the OCONUS/maritime coverage
+  WPC's CONUS view lacks), SPC mesoanalysis (hourly RAP ANALYSIS at MSLP/850/700/500/300mb, National sector s19,
+  GIF), and TropicalTidbits (GFS FORECAST panels: 500mb hgt/vort, 250mb jet, MSLP+precip, 850mb temp; PNG).
+  Analysis charts are "now" (no time arg); forecast charts sample GFS 6-hourly to f384 (frame = fhr//6 + 1;
+  `latest_gfs_run()` picks the freshest posted cycle with a 5h post-lag; fhr must be a multiple of 6). `fetch_map
+  (name, fhr=, run=, use_cache=)` returns bytes; `map_url()` gives provenance; opt-in cache under `data/maps/`;
+  module throttle + descriptive UA. TT is THIRD-PARTY + hotlink-gated -- it needs a Referer header (`_REFERER`),
+  and its URL scheme can change (fragile: watched, not trusted); the NOAA sources (WPC/OPC/SPC) are official and
+  stable. `get_map` tool wired into `tools.py` (TOOLS now 5), dispatched BEFORE the DB connect like get_sounding;
+  the enum is GENERATED from CATALOG so the tool contract can't drift; forecast `fhr` snaps to the 6h grid; rides
+  the existing image plumbing (`_image_mime` handles GIF and PNG). Driver `scripts/fetch_maps.py` pulls the whole
+  approved set (analysis once + forecast across a horizon, default f000-f036/6h) into `data/charts/temp/` with
+  code-prefixed names for review; verified 38/38 on the GFS 12Z run.
+- FORECAST SOUNDING SEAM (`fcstsounding.py` + `charts.skewt`, this session): MODEL forecast soundings, the
+  forward-looking complement to the OBSERVED skew-Ts. `fcstsounding.py` is a fetch+parse client (sibling to
+  soundings/wxmaps): pulls a model BUFKIT file (ISU mtarchive: `.../YYYY/MM/DD/bufkit/HH/<model>/<prefix>_<icao>.buf`)
+  and parses ONE forecast-hour block into a plain `FcstProfile` (pres/tmpc/dwpc/drct/sknt/hght lists +
+  CAPE/CIN/LIFT/SHOW/KINX/TOTL/PWAT/LCLP indices + lat/lon/elev/valid). No matplotlib, no SQL. 5 models
+  (gfs/nam/nam4km/rap/hrrr): per-model file prefix (gfs->`gfs3_`, others match the name) + cycle/lag live in
+  `_MODELS`; `latest_run()` snaps to the freshest posted cycle; `bufkit_url()` = provenance; opt-in cache under
+  `data/fcstsoundings/`; module throttle. BUFKIT is TEXT, so unlike the observed soundings we RENDER the skew-T
+  ourselves: `charts.skewt(profile)` (in the matplotlib seam; MetPy is PyPI -- NO conda) draws T/Td, a surface
+  parcel path + CAPE/CIN shading + LCL, a height-colored AUTO-SCALED hodograph, and the indices box, with the
+  right column pinned to the chart's top/bottom (SkewT under-fills its gridspec cell -- read the box after a draw,
+  set_position, then a uniform tight-crop keeps the alignment). Fill rows (BUFKIT tops the profile with Td=-9999
+  in the near-vacuum levels) are dropped in the parser. COVERAGE: dense over North America (US/Canada/Alaska/
+  Hawaii/Mexico; ~2100 GFS stations); OCONUS SPARSE and GFS-ONLY (mesoscale models are N.America-only), specific
+  AF bases hit-or-miss (Yokota yes; Kadena/Ramstein/Al Udeid no). `get_fcst_sounding` tool (station, model enum,
+  fhr) wired into `tools.py` (TOOLS now 6), dispatched BEFORE the DB connect like get_sounding/get_map; a missing
+  station (404) or forecast hour raises a ValueError the tool returns as FEEDBACK (with available hours), not a
+  crash. Verified end-to-end (KMSP GFS f024). Added `metpy` (PyPI) via uv. FINDING: no clean pre-rendered
+  forecast-sounding IMAGE exists (TT/TwisterData/COD render client-side; Pivotal 403s; rucsoundings was DOWN +
+  text-only) -- BUFKIT-text -> our-render is the robust path. Spike `scripts/test_bufkit.py` kept as an
+  SPC/Wyoming/BUFKIT comparison generator.
+- POINT FORECAST TOOL (`get_point_forecast` + `fcstsounding.fetch_point`, this session): hourly MODEL point
+  forecast TABLE from the BUFKIT SURFACE section (reuses the sounding fetch -- one `.buf` carries both profiles
+  AND a surface time series). `_parse_surface` -> `PointForecast` (per forecast hour: RAW surface fields
+  T2MS/TD2M/UWND/VWND/PMSL/LCLD/MCLD/HCLD/P01M + valid datetime). The tool renders a TEXT table (`tools._fmt_point`):
+  rows = forecast hours, cols = variables (wind shown as dir/speed, everything else raw native units), default 48h.
+  NO derived fields (RH/heat-index/gen-wx/ceiling/vis/gust/probabilities) -- DEFERRED per decision; v1 is raw
+  model surface data. Modeled on `docs/TarpViewer-GenWx.csv`. TOOLS now 7. Verified (KLSV not in BUFKIT -> use
+  KLAS). Spike `scripts/test_bufkit_point.py` writes the full transposed CSV for review.
+- FULL-AGENT TAF TEST (`scripts/test_taf_agent.py`, this session): first end-to-end exercise of the WHOLE tool
+  suite -- each of 4 models (Gemma/Qwen/Kimi/MiniMax) given all 7 read/data tools + emit_taf and asked to build a
+  30h TAF for KLSV valid 2300Z. KLSV has AWC obs but NO BUFKIT output, so the prompt points at nearby KLAS for the
+  model tools. Robust loop: all tool receipts appended, then images BATCHED into one follow-up user msg (avoids the
+  OpenAI "tool replies must immediately follow the tool_calls msg" rule); per-model failures recorded not fatal.
+  RESULTS: MiniMax + Gemma emitted AFMAN-CLEAN TAFs (identical -- persistence off the current 25017G22KT);
+  MiniMax most efficient (4 steps/6.3k completion tok), Gemma thorough (6 steps, widest tool set incl get_map, 4
+  emit->fix cycles). Qwen RUMINATED to ~35.5k tok and stalled at 3 structural findings (issued 24h not 30h,
+  missing TX/TN) -- ran out of runway before fixing. Kimi FAILED distinctly: 40+ tool calls (get_map x22,
+  fcst_sounding x13) across all 12 steps with ~zero reasoning (1.8k tok) and NEVER called emit_taf -- a gather-loop
+  with no convergence. HEADLINE (benchmark-relevant): agentic ORCHESTRATION != chart reasoning -- Kimi/MiniMax were
+  the strongest chart READERS in the map A/B, but here the discriminator is CONVERGENCE (stop gathering, emit, fix
+  findings); MiniMax/Gemma converged, Kimi/Qwen did not -- the benchmark must score orchestration as its own axis.
+  Infra held across 60+ calls (no crashes; KLAS-proxy worked; mixed GIF/PNG flowed). Even the CLEAN TAFs are
+  PERSISTENCE (gusty wind + SKC held flat 30h, ignoring overnight diurnal easing) -- the emit-quality gap, next
+  frontier. Log: `logs/taf_agent_KLSV_20260707-174247.md`.
 
 ## Likely next steps
 1. **v2 — METAR store (DONE).** `src/forecaster/store.py` is the ONLY file that touches
@@ -313,12 +397,15 @@ artificial-forecaster/
    `scripts/test_emit_taf.py`: pre-cutoff obs + meteogram → reason → emit → validate → re-emit. Verified
    end-to-end on KBLV valid 291600Z (Gemma read the meteogram, self-corrected 4 AFMAN findings to a clean,
    round-trippable TAF). See Status for the emit-schema findings.
-7. **Forecasting charts + Skew-Ts — the first GRIB tools (NEXT).** Stand up the conda-forge geospatial stack
-   (eccodes/cfgrib/xarray/cartopy/matplotlib) as the CPU tools image, and add agent chart tools that render
-   NWP (GFS/GALWEM GRIB) to PNGs the VLM reads — at least a skew-T sounding and an upper-air chart (e.g.
-   200mb wind/isotach), plus surface fields as needed. Goal: give the model the same diagnostic charts a human
-   forecaster uses BEFORE we ask it to produce real, verifiable TAFs. Keep matplotlib output in the existing
-   `charts.py` seam pattern; GRIB/array work stays conda-forge, SEPARATE from the uv app tier (do NOT mix).
+7. **Skew-Ts + forecasting charts via FETCH (DONE).** Observed skew-Ts via `soundings.py` (SPC/Wyoming);
+   surface + upper-air CHARTS via `wxmaps.py` (14-chart CATALOG: WPC/OPC surface, SPC mesoanalysis upper-air, TT
+   GFS forecast panels); MODEL forecast SOUNDINGS via `fcstsounding.py` + `charts.skewt` (GFS/mesoscale BUFKIT
+   text -> we render the skew-T with MetPy, uv tier). All fetch pre-rendered products or render from text, NOT
+   GRIB. The conda-forge geospatial stack (eccodes/cfgrib/xarray/cartopy) stays DEFERRED -- GRIB self-render
+   returns LATER only if fetched/text products prove insufficient. FINDING: no clean pre-rendered forecast-
+   sounding IMAGE exists (all render client-side; rucsoundings was down + text-only), so BUFKIT-text->our-render
+   is the robust path. Any matplotlib stays in the `charts.py` seam; clients stay network-only like
+   `soundings.py`/`wxmaps.py`/`fcstsounding.py` (do NOT mix the two tiers).
 8. **Climatology tool (BEFORE TAFVER).** A station-climatology lookup the agent can call (normals / extremes /
    frequency-by-month or -hour) so a forecast can be anchored to what is typical, not just the last 24h of obs.
    This is the deferred `climo` table in `store.py` (or a climo source) — build it when this tool needs it.
@@ -328,6 +415,38 @@ artificial-forecaster/
    as issued → score once obs accumulate under its validity), and STRIP free-text remarks before parsing human
    TAFs (AF remarks have no delimiter). Compare vs human TAF + raw NWP (GFS/GALWEM) once those inputs exist.
 10. Later: AF metric harness (OPVER/WARNVER); SuperCloud (Podman images, pre-stage weights, vLLM serve job).
+11. **Model-facing REFERENCE schema for emit_taf (agent-quality; pull forward when convenient).** The KLSV
+    emit runs showed the tool's `TafProduct` JSON schema does NOT surface nested-model fields to the model:
+    optional nested models render as `anyOf[$ref, null]`, so the model can't see e.g. `TafTemp`'s
+    `temp_c/day/hour`. It then GUESSES the shape from validation errors (burning turns) AND anxiously
+    re-verifies fields it can't see -- a contributor to the step-1 rumination-to-token-cap loop. Build a
+    clear model-facing reference for the OUTPUT shape (a worked TafProduct example and/or a flattened field
+    guide passed in the prompt) -- NOT a replacement for the pydantic schema, which stays the validator. Goal:
+    the model can SEE the contract, cutting both the schema-guessing thrash and the verification loop. See the
+    KLSV reasoning-mechanics findings + the emit-schema findings in Status (model quotes numbers / omits optional
+    fields).
+12. **Forecasting WORKSHEET -- intermediate tasks before emit (agent-quality).** Instead of one
+    "reason-then-emit" turn, give the model a structured pre-forecast worksheet (like a human forecaster's):
+    explicit intermediate sub-tasks -- current trend, DIURNAL wind/gust cycle per valid day, TX/TN value+timing,
+    pressure/QNH trend, restriction/convective risks -- filled BEFORE calling emit_taf. The KLSV A/B showed a
+    single general "diurnal recurrence" nudge already recovered gust INCLUSION and a much better TX, and REDUCED
+    rumination (clearer direction -> fewer loops, not more). A worksheet generalizes that: decompose the task to
+    direct convergence and improve quality (gust PLACEMENT, QNH trend, TEMPO usage -- all things the human TAF
+    captured but the model missed). Pairs naturally with the climo tool (step 8) feeding the worksheet.
+
+## Point forecast data (v1 built; enrichments deferred)
+- DONE v1: `get_point_forecast` tool renders the BUFKIT surface time series as a text table (raw fields only) --
+  see the Status bullet. Derived/probability fields intentionally deferred.
+- A POINT hourly forecast TABLE (temp/dewpoint/RH/wind/sky/ceiling/vis/indices over time) -- the tabular cousin
+  of the soundings/charts, modeled on the AF TarpViewer-GenWx product (`docs/TarpViewer-GenWx.csv`, a transposed
+  hourly point forecast ~6 days out). CHOSEN SOURCE: the BUFKIT SURFACE section we ALREADY fetch in
+  `fcstsounding.py` (the `.buf` file has a surface time-series block per forecast hour), so it reuses the fetch,
+  keeps a KNOWN model run (the observed weakness of the alternatives), and pairs the point table with the sounding.
+- FUTURE alternatives to evaluate for point model data (deliberately deferred): **Open-Meteo** (any global
+  lat/lon, rich variables, trivial CSV -- but non-commercial license, PAID historical/archive API, and no clean
+  model-run stamp; `gfs_seamless` blends runs) and **GRIBStream** (arbitrary-point GRIB time-series extraction).
+  Both give ARBITRARY points, which BUFKIT's fixed ~2100-station list cannot; revisit if we need points off the
+  BUFKIT list or want to cross-check.
 
 ## Open questions to confirm with MIT SuperCloud (supercloud@mit.edu)
 - V100 variant (16 vs 32 GB) on assigned nodes.
@@ -341,10 +460,33 @@ artificial-forecaster/
   authorized DoD environment, not commercial cloud. Flag this if it comes up.
 
 ## Known problems to address
-- TAF AMEND TX/TN clipping (tafgen.py `TafProduct.amend`): `amend()` clips the validity
-  and drops expired change groups, but carries `max_temp`/`min_temp` (TX/TN) forward
-  UNCHANGED. TX/TN times are absolute and AFMAN 1.3.13.1 says they cover the FIRST 24h of
-  the (now-clipped) validity, so after an amendment a TX/TN can fall OUTSIDE the amended
-  window — an invalid TAF. Fix: on amend, drop or re-anchor any TX/TN whose time no longer
-  lands in the amended first-24h; validate() should also flag it. (Surfaced during the
-  2026-07-06 review while fixing d.5 amend()-remarks; tracked in review-findings-2026-07-06.md.)
+- **MetPy wind-direction fill in forecast soundings (FIX NEXT).** `charts.skewt` -> `mpcalc.wind_components` warns
+  `Input over 12.566 radians` (12.566 = 4pi) when a BUFKIT level carries a FILL/garbage wind DIRECTION (e.g. 9999
+  or -9999 deg -> ~174 rad, far past a real 0-360 dir), so MetPy suspects a units mistake. Root cause: our
+  `fcstsounding.parse` masks fill rows only on Td/T (`> -9000`); it does NOT validate DRCT/SKNT, so a level with a
+  good temp but a fill wind survives. Benign for the render (the bad barb/hodograph point is ignored), but a real
+  data-hygiene bug. FIX: in `fcstsounding.parse` also drop levels whose wind direction is outside [0,360] (and/or
+  speed < 0). Surfaced on KLAS, not KMSP.
+- **Qwen agentic rumination (mitigate).** On the full-agent TAF task Qwen burned ~35.5k completion tokens and
+  stalled at structural AFMAN findings without converging (issued 24h not 30h, no TX/TN). Model-specific
+  (Gemma/MiniMax converge). Try: the forecasting WORKSHEET (next-steps step 12) to direct convergence; lower
+  per-turn max_tokens with more steps; and/or a "state once, emit when ready" nudge.
+- **Kimi no-emit gather-loop (add a loop guard).** Kimi called 40+ read tools and never emitted a TAF. Add a
+  backstop (like `window_conflict`): after N tool-gathering steps with no emit_taf, inject a user nudge
+  ("you have enough data; call emit_taf now"), plus a per-tool call cap to stop the get_map x22 spam.
+- **emit quality = persistence (quality frontier, not a bug).** Even the AFMAN-clean TAFs just persist current
+  conditions for 30h (gusty wind + SKC), ignoring diurnal easing. Addressed by the worksheet/diurnal-nudge work
+  (steps 11-12), not a code fix.
+
+## Resolved
+- TAF AMEND TX/TN clipping (tafgen.py `TafProduct.amend`) — FIXED 2026-07-07. Per the
+  lead meteorologists: the AF NEVER issues a TAF (amended or not) without TX/TN, and on an
+  amendment they cover the REMAINDER of the ORIGINAL 24h temp period (not "drop", which was
+  the review's guess). `validate()` now HARD-REQUIRES both TX and TN, and the temp-time
+  window is the uniform `[valid_from, valid_to-6]` (equals original_start+24h for routine AND
+  amended, since valid_to always encodes original_start+30h — no AMD branch). `amend()`
+  carries TX/TN forward (not stale-unchanged) and gained `max_temp`/`min_temp` override params
+  to re-forecast the remainder; a carried temp whose hour has elapsed is flagged for re-emit.
+  Requirement is gated on a new `TafProduct.military` flag (default True) so civil/NWS TAFs
+  (which carry neither QNH nor TX/TN) are NOT falsely flagged. Late-amendment edge (window <24h)
+  can't occur: TAFs have an 8h shelf life, so >=16h of temp window always remains. Self-test 8/8.

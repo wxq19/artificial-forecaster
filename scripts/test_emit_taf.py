@@ -15,6 +15,7 @@ The whole exchange -- obs, every step's reasoning, the AFMAN findings, the final
 is written to a self-contained markdown log under logs/.
 """
 
+import argparse
 import base64
 import json
 from datetime import datetime, timedelta
@@ -25,12 +26,31 @@ from forecaster.config import settings
 from forecaster.llm import client
 from forecaster.tools import EMIT_TAF, run_tool
 
-STATION = "KBLV"
-VALID_FROM = datetime(2026, 6, 29, 16, 0)   # 291600Z: the TAF valid start AND the obs cutoff
-LOOKBACK = 24          # hours of obs (before the cutoff) + meteogram handed to the model
-MAX_STEPS = 5          # model turns: reason -> emit -> (re-emit on findings)
+_ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+_ap.add_argument("--station", default="KBLV", help="ICAO station (default: KBLV reference case)")
+_ap.add_argument("--valid-from", default="2026-06-29T16:00",
+                 help="TAF valid start AND obs cutoff, naive-UTC 'YYYY-MM-DDTHH:MM' (default: KBLV 291600Z)")
+_ap.add_argument("--lookback", type=int, default=24,
+                 help="hours of pre-cutoff obs + meteogram handed to the model (default: 24)")
+_ap.add_argument("--model", default=settings.llm_model,
+                 help="model id override (default: settings.llm_model from .env)")
+_ap.add_argument("--max-steps", type=int, default=8,
+                 help="max model turns: reason -> emit -> (re-emit on findings) (default: 8)")
+_ap.add_argument("--max-tokens", type=int, default=32768,
+                 help="completion token budget per turn -- ample room to reason AND emit (default: 32768)")
+_ap.add_argument("--diurnal-nudge", action="store_true",
+                 help="append a general diurnal-recurrence guidance line to the system prompt (A/B the gust-handling finding)")
+_args = _ap.parse_args()
+
+STATION = _args.station.upper()
+# Naive UTC (the store's window contract); tolerate a trailing Z so 15:00Z parses.
+VALID_FROM = datetime.fromisoformat(_args.valid_from.rstrip("Z"))   # valid start AND obs cutoff
+LOOKBACK = _args.lookback   # hours of obs (before the cutoff) + meteogram handed to the model
+MODEL = _args.model
+DIURNAL_NUDGE = _args.diurnal_nudge
+MAX_STEPS = _args.max_steps  # model turns: reason -> emit -> (re-emit on findings)
 TEMPERATURE = 0.2
-MAX_TOKENS = 16384     # ample room to reason AND emit the tool call
+MAX_TOKENS = _args.max_tokens
 
 
 # --- 1. Ingest, then read ONLY obs strictly before the cutoff ---
@@ -53,16 +73,27 @@ issue_dt = max(r["obs_time"] for r in rows)              # issue at the latest o
 
 # --- 2. Opening messages: obs text + meteogram image + reason-then-emit instruction ---
 b64 = base64.b64encode(meteogram).decode()
+system_content = (
+    "You are a USAF weather forecaster issuing terminal aerodrome forecasts under "
+    "AFMAN 15-124. Base the forecast ONLY on the observations and meteogram given -- "
+    "you have NO data at or after the valid time, so this is a genuine forecast. "
+    "Before calling emit_taf, think step by step IN YOUR REPLY: describe the current "
+    "trend (improving, deteriorating, or steady), how you expect wind, visibility, "
+    "ceiling, and weather to evolve over the 30-hour period, and any convective or "
+    "restriction risks. THEN call emit_taf with your forecast."
+)
+if DIURNAL_NUDGE:
+    # General principle only (NOT "add gusts") -- a fair A/B of the diurnal-recurrence miss.
+    system_content += (
+        " Distinguish DIURNAL features from one-off synoptic events: anything tied to the "
+        "daily heating cycle -- afternoon wind and gusts, convective cloud, the temperature "
+        "swing -- RECURS on every day the TAF is valid, even when the forecast opens during a "
+        "calm part of the cycle. Do not dismiss a recent wind or gust episode as a passed "
+        "front without ruling out a diurnal cause; if it gusted in a past afternoon, expect "
+        "gusts again in the valid afternoons unless the pattern is clearly changing."
+    )
 messages = [
-    {"role": "system", "content": (
-        "You are a USAF weather forecaster issuing terminal aerodrome forecasts under "
-        "AFMAN 15-124. Base the forecast ONLY on the observations and meteogram given -- "
-        "you have NO data at or after the valid time, so this is a genuine forecast. "
-        "Before calling emit_taf, think step by step IN YOUR REPLY: describe the current "
-        "trend (improving, deteriorating, or steady), how you expect wind, visibility, "
-        "ceiling, and weather to evolve over the 30-hour period, and any convective or "
-        "restriction risks. THEN call emit_taf with your forecast."
-    )},
+    {"role": "system", "content": system_content},
     {"role": "user", "content": [
         {"type": "text", "text": (
             f"Station {STATION}. All observations available as of {VALID_FROM:%d%H%MZ} "
@@ -84,7 +115,7 @@ prompt_tok = completion_tok = 0
 
 for n in range(1, MAX_STEPS + 1):
     r = client.chat.completions.create(
-        model=settings.llm_model, messages=messages, tools=[EMIT_TAF],
+        model=MODEL, messages=messages, tools=[EMIT_TAF],
         tool_choice="auto", temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
     )
     prompt_tok += r.usage.prompt_tokens
@@ -135,7 +166,8 @@ def build_markdown() -> str:
         f"# Agent TAF Generation (emit_taf) — {STATION}",
         f"_{datetime.now():%Y-%m-%d %H:%M:%S}_",
         "",
-        f"- **Model:** `{settings.llm_model}` @ {settings.llm_base_url}",
+        f"- **Model:** `{MODEL}` @ {settings.llm_base_url}",
+        f"- **Prompt variant:** {'diurnal-nudge' if DIURNAL_NUDGE else 'baseline'}",
         f"- **Cutoff / valid from:** {VALID_FROM:%d%H%MZ} (obs strictly before this only)",
         f"- **Obs:** {len(rows)} rows over the {LOOKBACK}h before cutoff "
         f"(latest {issue_dt:%d%H%MZ}); load: {load_summary}",
@@ -173,7 +205,9 @@ def build_markdown() -> str:
 log_dir = Path("logs")
 log_dir.mkdir(exist_ok=True)
 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-log_path = log_dir / f"emit_taf_{STATION}_{stamp}.md"
+model_slug = MODEL.split("/")[-1].replace(":", "-")   # keep Gemma vs Qwen logs distinguishable
+nudge_slug = "_nudge" if DIURNAL_NUDGE else ""        # keep A/B (baseline vs nudged) logs distinguishable
+log_path = log_dir / f"emit_taf_{STATION}_{model_slug}{nudge_slug}_{stamp}.md"
 log_path.write_text(build_markdown(), encoding="utf-8")
 
 print(f"=== emit_taf — {STATION} (valid {VALID_FROM:%d%H%MZ}, {len(rows)} pre-cutoff obs) ===")

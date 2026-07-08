@@ -9,12 +9,13 @@ Results come back as compact text the VLM can reason over.
 """
 
 import base64
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
 
-from forecaster import charts, store, tafgen
+from forecaster import charts, fcstsounding, soundings, store, tafgen, wxmaps
 from forecaster.tafgen import TafProduct
 
 
@@ -128,7 +129,127 @@ GET_TREND = {
     },
 }
 
-TOOLS = [QUERY_OBS, GET_LATEST, GET_TREND]
+GET_SOUNDING = {
+    "type": "function",
+    "function": {
+        "name": "get_sounding",
+        "description": (
+            "Fetch an observed upper-air skew-T sounding (radiosonde) as an image to "
+            "judge vertical structure: stability/CAPE, inversions, moisture layers, "
+            "freezing level, and wind shear with height. Soundings are launched only "
+            "at 00Z and 12Z from upper-air sites (NOT every airport); you get the most "
+            "recent synoptic run at or before now. `site` is an upper-air station id "
+            "(e.g. OUN, MPX), which may differ from the nearest airport's ICAO."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "site": {
+                    "type": "string",
+                    "description": "Upper-air sounding site id, e.g. OUN or MPX",
+                },
+                "source": {
+                    "type": "string",
+                    "enum": ["spc", "wyoming"],
+                    "description": "Provider: spc (default, richer analysis) or wyoming",
+                },
+            },
+            "required": ["site"],
+        },
+    },
+}
+
+# Menu string generated from the catalog so the tool contract can't drift from wxmaps.
+_MAP_MENU = "; ".join(f"{n} ({s.label})" for n, s in wxmaps.CATALOG.items())
+GET_MAP = {
+    "type": "function",
+    "function": {
+        "name": "get_map",
+        "description": (
+            "Fetch a surface or upper-air weather chart as an image for synoptic "
+            "situational awareness: fronts and pressure systems, jet stream, steering "
+            "flow, moisture, and how the pattern is forecast to evolve. Analysis charts "
+            "(surface_*, ocean_*, meso_*) show CURRENT conditions; gfs_* are GFS "
+            "FORECAST panels -- for those, pass `fhr`, the forecast hour (a multiple of "
+            "6, e.g. 0, 6, 12, 24, 36). Charts: " + _MAP_MENU + "."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chart": {
+                    "type": "string",
+                    "enum": list(wxmaps.CATALOG),
+                    "description": "Which chart to fetch (see the list in the description)",
+                },
+                "fhr": {
+                    "type": "integer",
+                    "description": "GFS forecast hour, multiple of 6 (0-384); only used "
+                    "by the gfs_* forecast charts, ignored otherwise",
+                },
+            },
+            "required": ["chart"],
+        },
+    },
+}
+
+GET_FCST_SOUNDING = {
+    "type": "function",
+    "function": {
+        "name": "get_fcst_sounding",
+        "description": (
+            "Fetch a MODEL FORECAST sounding (skew-T image) for an airport at a chosen "
+            "forecast hour -- the PREDICTED vertical structure (stability/CAPE, inversions, "
+            "moisture, wind shear) at a future valid time. Unlike get_sounding, which is an "
+            "OBSERVED sounding at 00/12Z, this projects the atmosphere forward. `station` is "
+            "a 4-letter ICAO; `model` defaults to gfs (the only model with coverage outside "
+            "North America); `fhr` is the forecast hour (0 = analysis; hourly early, then "
+            "3-hourly). Coverage is dense over North America and sparse OCONUS -- an "
+            "unavailable station is reported back so you can pick another."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
+                "model": {"type": "string", "enum": list(fcstsounding.MODELS),
+                          "description": "forecast model (default gfs)"},
+                "fhr": {"type": "integer",
+                        "description": "forecast hour (0=analysis; e.g. 6, 12, 24, 36)"},
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+GET_POINT_FORECAST = {
+    "type": "function",
+    "function": {
+        "name": "get_point_forecast",
+        "description": (
+            "Hourly MODEL point forecast TABLE for an airport: surface conditions over time "
+            "-- temperature, dewpoint, wind, MSL pressure, low/mid/high cloud, and hourly "
+            "precipitation at each forecast hour, from the model's BUFKIT output. Use it to "
+            "see how conditions EVOLVE hour by hour at a site (complements get_fcst_sounding, "
+            "which is the vertical profile at one hour). Each row is one forecast hour; read a "
+            "column downward for a variable's trend. `station` 4-letter ICAO; `model` defaults "
+            "to gfs (only gfs has OCONUS coverage); `hours` limits the horizon (default 48). "
+            "Values are raw model surface fields."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
+                "model": {"type": "string", "enum": list(fcstsounding.MODELS),
+                          "description": "forecast model (default gfs)"},
+                "hours": {"type": "integer",
+                          "description": "forecast hours to include from the run (default 48)"},
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+TOOLS = [QUERY_OBS, GET_LATEST, GET_TREND, GET_SOUNDING, GET_MAP, GET_FCST_SOUNDING,
+         GET_POINT_FORECAST]
 
 # The OUTPUT tool: the model emits its forecast as the fields of a TafProduct, and
 # our code renders + checks it. The parameter schema IS the pydantic model's JSON
@@ -274,12 +395,144 @@ def _emit_taf(args: dict) -> ToolResult:
     return ToolResult("\n".join(lines), taf=product)
 
 
+def _get_sounding(args: dict) -> ToolResult:
+    """Fetch an observed skew-T image from a public provider (network, no DB) and
+    hand it back for the model to read. Site ids live in the provider's namespace,
+    so a bad id/date surfaces as a fetch error the model can correct -- not a crash.
+    The receipt cites the exact synoptic time + source URL (provenance)."""
+    site = args.get("site")
+    if not site:
+        return ToolResult('error: get_sounding needs a "site" upper-air id, e.g. "site": "OUN"')
+    source = str(args.get("source") or "spc").lower()
+    if source not in ("spc", "wyoming"):
+        return ToolResult(f'error: unknown source {source!r}; use "spc" or "wyoming"')
+    try:
+        t = soundings.synoptic_time()
+        url = soundings.skewt_url(site, t, source=source)
+        img = soundings.fetch_skewt(site, t, source=source)
+    except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
+        return ToolResult(
+            f"error: could not fetch {source} sounding for {str(site).upper()} "
+            f"({type(e).__name__}: {e}); check the site id for this provider"
+        )
+    receipt = (
+        f"Observed skew-T for {str(site).upper()} at {t:%Y-%m-%dT%H:%MZ} "
+        f"(source: {source}, {url}); image follows."
+    )
+    return ToolResult(receipt, images=[img])
+
+
+def _get_map(args: dict) -> ToolResult:
+    """Fetch a catalogued surface/upper-air chart image (network, no DB). A forecast
+    chart gets its GFS forecast hour snapped to the 6h grid; an unknown chart name or a
+    fetch failure comes back as feedback, not a crash. Receipt cites the source URL."""
+    name = args.get("chart")
+    if not name or name not in wxmaps.CATALOG:
+        return ToolResult(
+            'error: get_map needs a valid "chart"; choose from: ' + ", ".join(wxmaps.CATALOG)
+        )
+    spec = wxmaps.CATALOG[name]
+    fhr = 0
+    if spec.source == "tt":
+        fhr = _int_arg(args.get("fhr"), 0, lo=0, hi=wxmaps.GFS_MAX_FHR)
+        fhr -= fhr % wxmaps.GFS_STEP_H          # snap down to the 6h GFS grid
+    try:
+        url = wxmaps.map_url(name, fhr=fhr)
+        img = wxmaps.fetch_map(name, fhr=fhr)
+    except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
+        return ToolResult(f"error: could not fetch chart {name} ({type(e).__name__}: {e})")
+    lead = f", GFS f{fhr:03d}" if spec.source == "tt" else ""
+    return ToolResult(
+        f"{spec.label} [{name}]{lead} (source: {spec.source}, {url}); image follows.",
+        images=[img],
+    )
+
+
+def _get_fcst_sounding(args: dict) -> ToolResult:
+    """Fetch + render a model forecast sounding (network, no DB). A missing station or
+    forecast hour comes back as feedback -- fcstsounding raises ValueError with the reason
+    (404 / available hours) rather than crashing the loop. Receipt cites the source URL."""
+    station = args.get("station")
+    if not station:
+        return ToolResult('error: get_fcst_sounding needs a "station" ICAO, e.g. "station": "KMSP"')
+    model = str(args.get("model") or "gfs").lower()
+    if model not in fcstsounding.MODELS:
+        return ToolResult(f"error: unknown model {model!r}; choose from {', '.join(fcstsounding.MODELS)}")
+    fhr = _int_arg(args.get("fhr"), 12, lo=0, hi=384)
+    try:
+        prof = fcstsounding.fetch_profile(station, model=model, fhr=fhr)
+        png = charts.skewt(prof)
+    except Exception as e:  # noqa: BLE001 -- fetch/parse failure becomes feedback, not a dead loop
+        return ToolResult(f"error: could not build forecast sounding for {str(station).upper()} "
+                          f"{model} f{fhr:03d} ({type(e).__name__}: {e})")
+    receipt = (f"{model.upper()} forecast skew-T for {prof.station}, f{fhr:03d} valid "
+               f"{prof.valid} (run {prof.run:%Y-%m-%dT%H:%MZ}, {prof.url}); image follows.")
+    return ToolResult(receipt, images=[png])
+
+
+def _uv_to_dirspd(u: float, v: float) -> tuple[int, int]:
+    """Wind (u, v in m/s) -> (direction deg to nearest 10, speed kt). A presentation of the
+    raw vector; the stored point-forecast data keeps the u/v components."""
+    spd = round(math.hypot(u, v) * 1.94384)
+    d = int(round((270.0 - math.degrees(math.atan2(v, u))) % 360.0 / 10.0) * 10) % 360
+    return d, spd
+
+
+def _fmt_point(pf, n: int) -> str:
+    """Format a PointForecast as a text table: one row per forecast hour, columns are the
+    raw surface variables (wind shown as dir/speed). Read a column down for a trend."""
+    rows = pf.rows[:n]
+    out = [
+        f"{pf.model.upper()} point forecast for {pf.station} -- run {pf.run:%Y-%m-%dT%H:%MZ}, "
+        f"{len(rows)} hourly steps (source: {pf.url}). Raw model surface fields; each row is "
+        "one forecast hour -- read a column down to see a variable's trend.",
+        (f"{'Valid (UTC)':<18}{'T C':>5}{'Td C':>6}{'Wind kt':>10}{'MSLP':>7}"
+         f"{'Cld L/M/H %':>14}{'P01 mm':>8}"),
+    ]
+    for r in rows:
+        wd, ws = _uv_to_dirspd(r["uwnd_ms"], r["vwnd_ms"])
+        vt = f"{r['valid']:%Y-%m-%dT%H:%MZ}"
+        cloud = f"{r['lcld']:.0f}/{r['mcld']:.0f}/{r['hcld']:.0f}"
+        out.append(
+            f"{vt:<18}{r['t2m_c']:>5.0f}{r['td2m_c']:>6.0f}{f'{wd:03d}/{ws}':>10}"
+            f"{r['mslp_hpa']:>7.0f}{cloud:>14}{r['p01_mm']:>8.1f}"
+        )
+    return "\n".join(out)
+
+
+def _get_point_forecast(args: dict) -> ToolResult:
+    """Fetch + format a model point forecast table (network, no DB). A missing station (404)
+    comes back as feedback via fcstsounding's ValueError, not a crash."""
+    station = args.get("station")
+    if not station:
+        return ToolResult('error: get_point_forecast needs a "station" ICAO, e.g. "station": "KMSP"')
+    model = str(args.get("model") or "gfs").lower()
+    if model not in fcstsounding.MODELS:
+        return ToolResult(f"error: unknown model {model!r}; choose from {', '.join(fcstsounding.MODELS)}")
+    hours = _int_arg(args.get("hours"), 48, lo=1, hi=384)
+    try:
+        pf = fcstsounding.fetch_point(station, model=model)
+    except Exception as e:  # noqa: BLE001 -- fetch/parse failure becomes feedback, not a dead loop
+        return ToolResult(f"error: could not fetch point forecast for {str(station).upper()} "
+                          f"{model} ({type(e).__name__}: {e})")
+    return ToolResult(_fmt_point(pf, hours))
+
+
 def run_tool(name: str, args: dict, *, db_path: str | None = None) -> ToolResult:
     """Execute a model-issued tool call. The read tools run against a READ-ONLY
-    connection; emit_taf is an output sink (no DB) handled first. Returns a
-    ToolResult: a text receipt + any rendered PNGs / captured TAF."""
+    connection; emit_taf (output sink) and the network fetches (get_sounding, get_map,
+    get_fcst_sounding, get_point_forecast) need no DB and are handled first. Returns a
+    ToolResult: text receipt + images/TAF."""
     if name == "emit_taf":
         return _emit_taf(args)
+    if name == "get_sounding":
+        return _get_sounding(args)
+    if name == "get_map":
+        return _get_map(args)
+    if name == "get_fcst_sounding":
+        return _get_fcst_sounding(args)
+    if name == "get_point_forecast":
+        return _get_point_forecast(args)
     con = (
         store.connect(db_path, read_only=True)
         if db_path
@@ -332,23 +585,34 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None) -> ToolResult
 # NOTE: tool_messages and final_answer are agent-loop plumbing, not tool
 # definitions. They live here for now only because every driver imports `tools`;
 # move them to a dedicated `agent.py` once that module exists (see CLAUDE.md).
+def _image_mime(data: bytes) -> str:
+    """Content type from magic bytes. A meteogram is PNG, but a fetched skew-T can be
+    a GIF (SPC) or PNG (Wyoming), and a vision model rejects an image whose data URL
+    lies about its type -- so label each image by what it actually is."""
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    return "image/png"
+
+
 def tool_messages(call_id: str, result: ToolResult) -> list[dict]:
     """Turn a ToolResult into the messages to append after a tool call: the
-    required text receipt (role 'tool'), plus — if the tool rendered images — a
-    follow-up 'user' message carrying each PNG as a base64 image_url, since a tool
+    required text receipt (role 'tool'), plus — if the tool returned images — a
+    follow-up 'user' message carrying each image as a base64 image_url, since a tool
     reply can't hold an image in the OpenAI format. Returns 1 or 2 messages."""
     msgs: list[dict] = [
         {"role": "tool", "tool_call_id": call_id, "content": result.text}
     ]
     if result.images:
         content: list[dict] = [
-            {"type": "text", "text": "Rendered chart(s) from get_trend:"}
+            {"type": "text", "text": "Image(s) from the tool call:"}
         ]
-        for png in result.images:
-            b64 = base64.b64encode(png).decode()
+        for img in result.images:
+            b64 = base64.b64encode(img).decode()
             content.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                "image_url": {"url": f"data:{_image_mime(img)};base64,{b64}"},
             })
         msgs.append({"role": "user", "content": content})
     return msgs
