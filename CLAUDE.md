@@ -91,6 +91,9 @@ artificial-forecaster/
 │   ├── soundings.py      # live skew-T image client (SPC/Wyoming); fetch pixels, don't draw (seam)
 │   ├── wxmaps.py         # live synoptic map client (WPC/OPC/SPC-meso/TT GFS); fetch charts (seam)
 │   ├── fcstsounding.py   # model BUFKIT forecast-sounding fetch+parse (rendered by charts.skewt) (seam)
+│   ├── climo.py          # station-climatology builder (scratch-DB ingest; NO SQL) -> store.rebuild_climo
+│   ├── imagery.py        # live satellite (NESDIS/STAR) + radar (IEM radmap.php) image client (seam)
+│   ├── radarsites.py     # WSR-88D site table (nearest-radar lookup; regen via scripts/build_radarsites.py)
 │   └── tools.py          # agent read tools + emit_taf OUTPUT tool + loop plumbing (-> agent.py later)
 ├── scripts/              # dev + end-to-end test drivers (markdown logs -> logs/)
 ├── docs/                 # references (FMH-1 wx table, AFMAN 15-124, AFH 15-101)
@@ -373,8 +376,61 @@ artificial-forecaster/
   converted the SAME MSLP to different inHg at different points (1008 hPa -> 29.77 and 29.79; 1011 -> 29.85/29.86/
   29.88), a hand-conversion slip whose final QNH happened to land right. Log: `logs/taf_agent_KLSV_20260707-174247.md`.
 
-## NEXT SESSION -- pick up here (paused 2026-07-08)
-This session landed ALL 11 fixes in `review-findings-2026-07-08.md` (every box now [x]): Tier 1
+- SATELLITE + RADAR IMAGERY SEAM (`imagery.py` + `get_imagery`, this session): observational imagery,
+  sibling to `wxmaps.py`/`soundings.py` (fetch pre-rendered, no matplotlib/SQL). SATELLITE = NESDIS/STAR
+  CDN direct sized JPEGs (`cdn.star.nesdis.noaa.gov/GOES{sat}/ABI/{CONUS|FD|SECTOR/<code>}/{GEOCOLOR|02|13|09}/
+  <WxH>.jpg`); product default `geocolor` (day/night blended); GOES-East=GOES19, West=GOES18 (operator-updatable
+  per bird; GOES16/17 URLs redirect). RADAR = IEM `radmap.php` for ALL modes (national `sector=conus`,
+  regional/station `bbox`), which returns a COMPOSITED, labeled PNG. FINDING (design-doc correction): the raw IEM
+  rasters (`4326/USCOMP`, `.../ridge/<SITE>`) are BARE reflectivity -- no basemap/legend, unusable to a VLM, same
+  failure as GeoServer WMS -- so they are NOT used; `radmap.php` is the only composited path (verified by viewing
+  images). Station-aware: `nearest_radar()` over `radarsites.py` (160 WSR-88D sites from IEM NEXRAD geojson,
+  regenerate via `scripts/build_radarsites.py`) + a 150 km guard; beyond it, degrade to regional then national and
+  SAY SO in the receipt (ETAR->national verified). Tool enums GENERATED from the catalogs (no drift, like get_map).
+  Station->lat/lon via new `awc.station_latlon()` (exact ICAO; resolves major airports AND OCONUS -- climo's
+  `station_meta` strips the K and KMSP collides with a TDWR sid). SATELLITE is station-aware too:
+  `imagery.satellite_region_for_latlon()` routes a station's lat/lon to the covering GOES sector (17 regions
+  incl. added umv/cgl/nr; tightest-sector -> CONUS-by-longitude -> full-disk; OCONUS returns None -> honest
+  "no GOES coverage, Meteosat/Himawari deferred" feedback), so `get_imagery(kind=satellite, station=...)` needs
+  no region guess -- Gemma verified using it for both sat+radar (lands KLSV on pacific_southwest first try).
+  `scripts/fetch_imagery.py` = review/cache driver; `scripts/test_imagery_tool.py` = Gemma reasons over sat+radar.
+  TOOLS now 9. Deferred: loops, OCONUS Meteosat/Himawari satellite (fast-follow), advanced products.
+
+- CLIMATOLOGY TOOL (`climo.py` + `store` climo_* tables + `get_climo`, this session): a station-climatology
+  lookup so a forecast anchors to what is TYPICAL, not just the last 24h of obs.
+  KEY DESIGN: the raw multi-year history fetched to BUILD climo is THROWN AWAY -- only
+  the `climo_*` PRODUCT rows persist -- so pouring 20 Julys of history into DuckDB can't leak into `obs` and
+  stale-anchor the "now"-relative read tools (the obs-leakage class again). `climo.py` is the orchestrator
+  (sibling to `iem.py`; NO duckdb/SQL): `station_meta` (IEM station JSON; strip the leading K for US ICAOs;
+  fixed std offset = min(Jan,Jul) via zoneinfo), `ingest_history` (per-(year,month) `iem.load` into a
+  `tempfile` SCRATCH DuckDB with a +/-1-day buffer + 429 backoff), `build` (one call: scratch ->
+  `store.rebuild_climo` -> scratch deleted). ALL SQL stays in `store.py`: `init_climo_schema` (3 grain-matched
+  wide tables climo_meta/climo_monthly/climo_hourly, SEPARATE from init_schema -- build-path only),
+  `rebuild_climo` (ATTACH scratch read-only; one txn DELETE + INSERT..SELECT, idempotent per-month),
+  `climo_meta`/`climo_month`/`climo_hours` readers. Month membership is LOCAL
+  (`obs_time + INTERVAL offset HOUR`), hour key stays UTC; temps use ALL obs, frequencies ROUTINE-only.
+  `get_climo(station, month?)` dispatched in the DB branch (read-only conn); `month` defaults to the latest
+  ob's month; missing/unbuilt month -> feedback naming `scripts/build_climo.py`; NO `ToolResult.window`
+  (climatology is not a time window). `_fmt_climo` renders a compact TYPICAL-conditions text product.
+  `config.climo_start_year`/`climo_end_year` = 2006/2025 (last COMPLETE year = leakage guard). Built + VERIFIED
+  for KLSV July (1 climo_meta + 1 climo_monthly + 24 climo_hourly rows; ruff clean); model-in-the-loop
+  `scripts/test_climo.py` PASSED -- Gemma picked get_climo (not query_obs), read TX mean 40.5C (p10/p50/p90
+  band), the N-morning -> S-evening wind flip, TS 0.7% peaking 04Z, fog 0% -- all inside the plan's external-
+  sanity tolerances. Log: `logs/climo_KLSV_20260709-151921.md`. Drivers: `scripts/build_climo.py` (CLI build +
+  `--check` recompute) and `scripts/test_climo.py`. ALL climo exit criteria now PASS (2026-07-10):
+  `--check` recompute (tx_mean/pct_ts/pct_cig cells match SQL exactly; wxcodes-vs-regex TS 195/195), idempotency
+  (two deterministic builds identical, stats within 1e-9), obs-untouched (persistent obs 265->265, zero KLSV
+  history leaked), and all guards (read-only rejects writes, quoted/out-of-range month coerces+clamps, unknown
+  station -> feedback, no ToolResult.window). ONE fix landed to reach idempotency: record dates used
+  `arg_max`/`arg_min`, which pick an ARBITRARY day when several tie at the extreme (KLSV TX 47C hit multiple
+  days) -> non-deterministic date across builds, undermining ship/hash reproducibility; replaced with an
+  ordered-list pick `(list(local_day ORDER BY temp_c DESC/ASC, local_day ASC))[1]` = earliest tied day (record
+  VALUE unchanged; dates now deterministic by construction). v1 DONE; still uncommitted (climo + imagery land
+  together in the working tree) -- build any additional months the target station needs before/after commit.
+
+## NEXT SESSION -- pick up here (paused 2026-07-09)
+An earlier session landed ALL 11 fixes from the 2026-07-08 review (that findings doc has since been
+removed now that every item shipped): Tier 1
 (soundings 2h post-lag, get_map f0 default + single run pick, fcstsounding DRCT/SKNT + surface fill
 masks -> point-table dashes, point-table valid-TIME slice, labeled batched images), Tier 2
 (`tafgen.emit_taf_guide()` model-facing OUTPUT shape + TX/TN + clear-sky contract, injected into the
@@ -393,14 +449,24 @@ Then TWO live KLSV/072300Z runs (both this repo's target) surfaced the real fron
   toolcall killed it) and did NOT fix Qwen (ruminates to any cap). Gemma RECOVERED once the leak was
   gone -- its earlier 30k rumination was the RETROSPECTIVE-obs confusion, not tokens.
 
-DO NEXT, in order:
-1. FIX break-on-`length` (the real convergence blocker): in `test_taf_agent.py`, when
-   `finish_reason == "length"` AND no tool_calls, inject a user nudge ("you were cut off; be concise
-   and call emit_taf now") and CONTINUE the loop instead of taking the final_answer/break path. Then
-   set `max_tokens` ~12-16k and re-run. Expect MiniMax + Qwen to get a recovery path.
-2. (Optional) Persist the vs-obs VERIFICATION below as a scoring note -- it is the first real TAFVER
-   signal and seeds next-steps step 9.
-3. The forecasting WORKSHEET (next-steps step 12) is the quality lever for the two systematic misses.
+DO NEXT: the two reinforcing pieces were the climatology tool + the forecasting worksheet.
+1. CLIMATOLOGY TOOL (next-steps step 8) -- DONE. `get_climo` built + verified for KLSV July; ALL
+   climo exit criteria PASS as of 2026-07-10 (--check, idempotency after a record-date
+   tie-break fix, obs-untouched, guards; see the Status bullet + `logs/climo_KLSV_20260709-151921.md`).
+   Remaining housekeeping: commit the uncommitted climo + imagery work, and build any additional months
+   the target station needs.
+2. FORECASTING WORKSHEET (next-steps step 12) -- now the PRIMARY next feature: structured pre-emit sub-tasks (current trend; diurnal
+   wind/gust cycle per valid day; TX/TN value+timing SANITY-CHECKED vs the observed temp range; QNH trend
+   with any unit conversion double-checked ONCE; restriction/convective risks) filled BEFORE emit_taf.
+   Targets the two systematic misses (Qwen read a dewpoint as TN; Gemma MSLP->inHg inconsistency) and is
+   expected to REDUCE rumination on its own (KLSV A/B: one "diurnal recurrence" nudge already cut looping
+   + improved TX), so it may moot the DEFERRED convergence fix below. Pairs with the climo tool (1).
+(Optional) Persist the vs-obs VERIFICATION below as a scoring note -- the first real TAFVER signal, seeds
+next-steps step 9.
+
+DEFERRED (was step 1, deprioritized 2026-07-09): the break-on-`length` convergence fix (nudge-and-continue
+on length+no-toolcall + max_tokens ~12-16k). Skipped for now because the worksheet may make it unnecessary;
+revisit only if convergence is still failing AFTER the worksheet lands. Details in Known problems below.
 
 VERIFICATION vs observed METARs (KLSV 072255Z..081555Z = ~first 17h of validity; scored BOTH the
 2026-07-07 leaked run and the 2026-07-08 leak-free run). Models get SKY/VIS right (SKC 9999 held the
@@ -451,9 +517,10 @@ never-emit -> clean once the loop guard/caps landed.
    sounding IMAGE exists (all render client-side; rucsoundings was down + text-only), so BUFKIT-text->our-render
    is the robust path. Any matplotlib stays in the `charts.py` seam; clients stay network-only like
    `soundings.py`/`wxmaps.py`/`fcstsounding.py` (do NOT mix the two tiers).
-8. **Climatology tool (BEFORE TAFVER).** A station-climatology lookup the agent can call (normals / extremes /
-   frequency-by-month or -hour) so a forecast can be anchored to what is typical, not just the last 24h of obs.
-   This is the deferred `climo` table in `store.py` (or a climo source) — build it when this tool needs it.
+8. **Climatology tool (DONE).** `get_climo(station, month?)` reads the `climo_*` product tables built by
+   `climo.py` (`scripts/build_climo.py`). The raw multi-year build history
+   is thrown away (leakage guard) — only the product rows persist. Built + verified for KLSV July (model
+   selected get_climo, values inside tolerance). See the Status bullet. Feeds the worksheet (step 12).
 9. **TAFVER scoring (LATER — after charts + climo).** Score a generated TAF against the observed METARs
    T→T+24/30h — we already own the truth in the DB, so self-scoring needs NO TAF source. NOTE: needs a
    TIME-ALIGNED TAF (a current TAF barely overlaps PAST obs); build the deferred `taf` table (persist each TAF
@@ -507,7 +574,7 @@ never-emit -> clean once the loop guard/caps landed.
   authorized DoD environment, not commercial cloud. Flag this if it comes up.
 
 ## Known problems to address
-- **break-on-`length` kills a truncated emit turn (FIX FIRST -- see NEXT SESSION handoff).** In
+- **break-on-`length` kills a truncated emit turn (DEFERRED 2026-07-09 -- pending the worksheet).** In
   `test_taf_agent.py`, a turn that hits the completion cap comes back `finish_reason=length` with no
   tool_calls; the loop treats that as "model answered" and BREAKS. So a model whose emit-reasoning turn
   exceeds max_tokens is killed with no TAF. Confirmed live: at max_tokens=8000, MiniMax (a reliable

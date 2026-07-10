@@ -14,5 +14,9 @@ class Settings(BaseSettings):
     llm_api_key: str = "ollama"
     llm_model: str = "qwen3-vl:4b"
     db_path: str = str(_ROOT / "data" / "forecaster.duckdb")   # the only config the DB seam needs
+    # Climatology period-of-record. end_year is the last COMPLETE year: a historical
+    # valid-time run can't absorb post-cutoff obs through the climo product (leakage guard).
+    climo_start_year: int = 2006
+    climo_end_year: int = 2025
 
 settings = Settings()

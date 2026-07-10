@@ -58,6 +58,19 @@ def _from_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
 
 
+def station_latlon(station: str) -> tuple[float, float]:
+    """(lat, lon) for an ICAO from AWC's station-info product. Keyed on the EXACT id
+    (no K-stripping), so it resolves major airports and OCONUS sites that IEM's ASOS
+    metadata lookup can miss (e.g. KMSP collides with a TDWR sid there). Raises
+    ValueError if the id is unknown."""
+    icao = station.upper()
+    for r in _get("stationinfo", {"ids": icao, "format": "json"}) or []:
+        lat, lon = r.get("lat"), r.get("lon")
+        if lat is not None and lon is not None:
+            return float(lat), float(lon)
+    raise ValueError(f"AWC has no station info for {icao}")
+
+
 def fetch_metar(
     stations: str | list[str],
     *,

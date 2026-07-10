@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
 
-from forecaster import charts, fcstsounding, soundings, store, tafgen, wxmaps
+from forecaster import awc, charts, fcstsounding, imagery, soundings, store, tafgen, wxmaps
 from forecaster.tafgen import TafProduct
 
 
@@ -249,8 +249,97 @@ GET_POINT_FORECAST = {
     },
 }
 
+GET_CLIMO = {
+    "type": "function",
+    "function": {
+        "name": "get_climo",
+        "description": (
+            "Retrieve the TYPICAL (climatological) weather for an airport in a given "
+            "month, built from ~20 years of observations -- NOT current conditions. Use "
+            "it to anchor a forecast to what is normal: sanity-check a TX/TN against the "
+            "monthly percentile band, time the diurnal wind shift, and judge fog/stratus "
+            "and thunderstorm risk by hour. For what is happening NOW or recently, use "
+            "get_latest_obs / query_obs / get_trend instead. Returns daily max/min "
+            "temperature normals and records, an hourly diurnal table (temp, wind, gust, "
+            "prevailing direction), restriction and thunder/fog frequencies, and altimeter "
+            "range. `station` is a 4-letter ICAO; `month` (1-12) defaults to the month of "
+            "the station's latest stored observation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {
+                    "type": "string",
+                    "description": "4-letter ICAO identifier, e.g. KLSV",
+                },
+                "month": {
+                    "type": "integer",
+                    "description": "Calendar month 1-12 (default: month of the latest ob)",
+                },
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+# Enums generated from the imagery catalogs so the tool contract can't drift (like get_map).
+_SAT_REGION_MENU = ", ".join(imagery.SAT_REGIONS)
+_RADAR_REGION_MENU = ", ".join(imagery.RADAR_REGIONS)
+_IMG_PRODUCTS = list(imagery.SAT_PRODUCTS) + list(imagery.RADAR_PRODUCTS)
+_IMG_REGIONS = list(imagery.SAT_REGIONS) + [
+    r for r in imagery.RADAR_REGIONS if r not in imagery.SAT_REGIONS
+]
+GET_IMAGERY = {
+    "type": "function",
+    "function": {
+        "name": "get_imagery",
+        "description": (
+            "Fetch OBSERVED satellite or radar imagery as an image for spatial awareness "
+            "-- cloud extent and erosion, stratus/fog footprint, convective/cloud-top "
+            "structure, moisture, and precipitation coverage. Set `kind`: 'satellite' "
+            "(GOES imagery; `product` defaults to geocolor, also visible, infrared, "
+            "water_vapor. For a specific airport give its `station` ICAO and the tool picks "
+            "the sector that covers it -- do NOT guess a `region`; use `region` only for a "
+            "broad or named area) or 'radar' (NEXRAD reflectivity; give a `station` ICAO for "
+            "the local view, a `region` for a mosaic, or set product national_mosaic for "
+            "broad context). Radar auto-degrades to a regional or national mosaic when "
+            "no credible radar is near the station, and says so in the receipt. Imagery is "
+            "NOT truth at the field and not a forecast -- pair it with METARs/trend/model. "
+            f"Satellite regions: {_SAT_REGION_MENU}. Radar regions: {_RADAR_REGION_MENU}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["satellite", "radar"],
+                    "description": "'satellite' or 'radar'",
+                },
+                "product": {
+                    "type": "string",
+                    "enum": _IMG_PRODUCTS,
+                    "description": "satellite: geocolor (default)/visible/infrared/"
+                    "water_vapor; radar: station_reflectivity/regional_mosaic/national_mosaic",
+                },
+                "region": {
+                    "type": "string",
+                    "enum": _IMG_REGIONS,
+                    "description": "named area; preferred for satellite (default "
+                    "conus_east) and for a radar mosaic",
+                },
+                "station": {
+                    "type": "string",
+                    "description": "4-letter ICAO, e.g. KLSV; for radar = the station-local "
+                    "view, for satellite = auto-pick the covering sector",
+                },
+            },
+            "required": ["kind"],
+        },
+    },
+}
+
 TOOLS = [QUERY_OBS, GET_LATEST, GET_TREND, GET_SOUNDING, GET_MAP, GET_FCST_SOUNDING,
-         GET_POINT_FORECAST]
+         GET_POINT_FORECAST, GET_CLIMO, GET_IMAGERY]
 
 # The OUTPUT tool: the model emits its forecast as the fields of a TafProduct, and
 # our code renders + checks it. The parameter schema IS the pydantic model's JSON
@@ -490,6 +579,168 @@ def _get_map(args: dict) -> ToolResult:
     )
 
 
+def _imagery_satellite(region: str | None, product: str | None,
+                       station: str | None) -> ToolResult:
+    """Fetch a GOES still from the STAR CDN. An explicit region wins; otherwise a
+    `station` ICAO is routed to its covering sector (like radar), so the model need not
+    guess which sector sees the field; else default conus_east. Product defaults to
+    geocolor (day/night blended -- no night-visible failure)."""
+    picked_for = ""
+    if not region and station:
+        icao = str(station).upper()
+        try:
+            lat, lon = awc.station_latlon(icao)       # live AWC lookup (network, no DB)
+        except Exception as e:  # noqa: BLE001 -- unknown id becomes feedback, not a crash
+            return ToolResult(f"error: could not resolve a location for {icao} "
+                              f"({type(e).__name__}: {e}); give a satellite `region`: "
+                              + ", ".join(imagery.SAT_REGIONS))
+        region = imagery.satellite_region_for_latlon(lat, lon)
+        if region is None:
+            return ToolResult(
+                f"no GOES satellite coverage for {icao} (outside the GOES East/West view). "
+                "OCONUS satellite (Meteosat/Himawari) is not yet available -- use radar or "
+                "another data tool for this location.")
+        picked_for = f" (nearest sector for {icao})"
+    region = region or "conus_east"
+    if region not in imagery.SAT_REGIONS:
+        return ToolResult(f"error: {region!r} is not a satellite region; choose from: "
+                          + ", ".join(imagery.SAT_REGIONS))
+    product = product if product in imagery.SAT_PRODUCTS else "geocolor"
+    try:
+        url = imagery.satellite_url(region, product)
+        img = imagery.fetch_satellite(region, product)
+    except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
+        return ToolResult(f"error: could not fetch {product} satellite for {region} "
+                          f"({type(e).__name__}: {e})")
+    receipt = (f"GOES {product} satellite -- {imagery.SAT_REGIONS[region].label}{picked_for} "
+               f"(source: NESDIS/STAR, {url}); research/informational imagery, not an "
+               "operational source. image follows.")
+    return ToolResult(receipt, images=[img])
+
+
+def _radar_national(note: str) -> ToolResult:
+    try:
+        img = imagery.fetch_radar("national")
+    except Exception as e:  # noqa: BLE001 -- feedback, not a dead loop
+        return ToolResult(f"error: could not fetch national radar ({type(e).__name__}: {e})")
+    # fetch_radar silently degrades national from IEM (PNG) to the NWS RIDGE GIF; cite the
+    # source that actually produced this image, not always IEM.
+    if _image_mime(img) == "image/gif":
+        source, url = "NWS RIDGE", imagery.NWS_RIDGE_GIF_URL
+    else:
+        source, url = "IEM NEXRAD composite", imagery.radar_url("national")
+    return ToolResult(f"{note} (source: {source}, {url}); image follows.", images=[img])
+
+
+def _radar_regional(region: str) -> ToolResult:
+    label = imagery.RADAR_REGIONS[region][1]
+    try:
+        url = imagery.radar_url("regional", region=region)
+        img = imagery.fetch_radar("regional", region=region)
+    except Exception as e:  # noqa: BLE001 -- feedback, not a dead loop
+        return ToolResult(f"error: could not fetch {region} radar ({type(e).__name__}: {e})")
+    return ToolResult(f"{label} regional radar mosaic (source: IEM NEXRAD composite, {url}); "
+                      "image follows.", images=[img])
+
+
+def _radar_degrade(icao: str, lat: float, lon: float, reason: str) -> ToolResult:
+    """Fall back from a station-local view: the containing regional mosaic, then national.
+    `reason` (guard miss or a station-fetch failure) is prepended so the receipt is honest.
+    If the regional fetch itself fails (e.g. IEM down), continue to national -- which can
+    degrade to the NWS GIF on a different host -- rather than dead-ending."""
+    reg = imagery.radar_region_for_latlon(lat, lon)
+    if reg:
+        r = _radar_regional(reg)
+        if r.images:                                  # regional succeeded
+            r.text = (f"{reason}; showing the {imagery.RADAR_REGIONS[reg][1]} regional "
+                      f"mosaic instead. {r.text}")
+            return r
+    nat = _radar_national("national radar mosaic")
+    tail = ("regional mosaic also unavailable -- " if reg else
+            f"{icao} is outside the curated radar regions -- ")
+    nat.text = f"{reason}; {tail}showing the national mosaic for broad context only. {nat.text}"
+    return nat
+
+
+def _radar_for_station(icao: str, product: str | None) -> ToolResult:
+    """Radar for a station. An explicit mosaic product is honored directly; otherwise the
+    default/station_reflectivity path tries a station-centered composite when a credible
+    WSR-88D is within the 150 km guard, and degrades (regional -> national) with an
+    ACCURATE reason on either a guard miss or a station-fetch failure."""
+    try:
+        lat, lon = awc.station_latlon(icao)           # live AWC lookup (network, no DB)
+    except Exception as e:  # noqa: BLE001 -- an unknown id becomes feedback, not a crash
+        return ToolResult(
+            f"error: could not resolve a location for {icao} ({type(e).__name__}: {e}); "
+            "give a radar `region` instead: " + ", ".join(imagery.RADAR_REGIONS))
+
+    # Honor an explicit mosaic choice directly -- do NOT route it through the guard (which
+    # would fabricate a distance reason and hand back the wrong product).
+    if product == "national_mosaic":
+        return _radar_national("national radar mosaic (broad context only)")
+    if product == "regional_mosaic":
+        reg = imagery.radar_region_for_latlon(lat, lon)
+        if reg:
+            return _radar_regional(reg)
+        nat = _radar_national("national radar mosaic")
+        nat.text = (f"{icao} is outside the curated radar regions -- showing the national "
+                    f"mosaic for broad context only. {nat.text}")
+        return nat
+
+    # Default / station_reflectivity: a station-centered local view when a radar is credible.
+    near = imagery.nearest_radar(lat, lon)
+    guard = imagery.RADAR_STATION_GUARD_KM
+    if near and near[1] <= guard:
+        site, dist = near
+        try:
+            url = imagery.radar_url("station", center=(lat, lon))
+            img = imagery.fetch_radar("station", center=(lat, lon))
+        except Exception as e:  # noqa: BLE001 -- degrade, don't dead-end (provider hiccup/outage)
+            return _radar_degrade(icao, lat, lon,
+                                  f"station radar fetch for {icao} failed ({type(e).__name__}: {e})")
+        receipt = (f"Station-scale radar around {icao} (nearest WSR-88D: {site['id']} "
+                   f"{site['name']}, {dist:.0f} km; source: IEM NEXRAD composite, {url}); "
+                   "image follows.")
+        return ToolResult(receipt, images=[img])
+    reason = (f"nearest WSR-88D to {icao} is {near[1]:.0f} km away (beyond the {guard:.0f} km "
+              f"local-radar guard)" if near else f"no radar site found near {icao}")
+    return _radar_degrade(icao, lat, lon, reason)
+
+
+def _get_imagery(args: dict) -> ToolResult:
+    """Fetch observed satellite or radar imagery (network, no DB). Dispatches on `kind`;
+    infers it from the other args if omitted. Radar runs the station-aware degrade
+    cascade. A bad region/fetch comes back as feedback, not a crash."""
+    kind = str(args.get("kind") or "").lower()
+    product = str(args["product"]).lower() if args.get("product") else None
+    region = str(args["region"]).lower() if args.get("region") else None
+    station = args.get("station")
+    if kind not in ("satellite", "radar"):
+        # Infer a missing kind so the call isn't a dead end.
+        if product in imagery.SAT_PRODUCTS or region in imagery.SAT_REGIONS:
+            kind = "satellite"
+        elif station or product in imagery.RADAR_PRODUCTS or region in imagery.RADAR_REGIONS:
+            kind = "radar"
+        else:
+            return ToolResult('error: get_imagery needs "kind": "satellite" or "radar".')
+    if kind == "satellite":
+        return _imagery_satellite(region, product, station)
+    if station:
+        return _radar_for_station(str(station).upper(), product)
+    if region:
+        if region not in imagery.RADAR_REGIONS:
+            return ToolResult(f"error: {region!r} is not a radar region; choose from: "
+                              + ", ".join(imagery.RADAR_REGIONS))
+        if region == "national":
+            return _radar_national("national radar mosaic (broad context only)")
+        return _radar_regional(region)
+    if product == "national_mosaic":
+        return _radar_national("national radar mosaic (broad context only)")
+    return ToolResult('error: radar needs a "station" (ICAO) for the local view or a '
+                      '"region" for a mosaic; for broad context set "product": '
+                      '"national_mosaic". Radar regions: ' + ", ".join(imagery.RADAR_REGIONS))
+
+
 def _get_fcst_sounding(args: dict) -> ToolResult:
     """Fetch + render a model forecast sounding (network, no DB). A missing station or
     forecast hour comes back as feedback -- fcstsounding raises ValueError with the reason
@@ -571,11 +822,142 @@ def _get_point_forecast(args: dict) -> ToolResult:
     return ToolResult(_fmt_point(pf, hours))
 
 
+_MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June", "July",
+                "August", "September", "October", "November", "December"]
+
+
+def _cd(v, fmt: str = "{:.0f}") -> str:
+    """Climo cell: '--' for a NULL (e.g. an all-NULL quantile), else formatted."""
+    return "--" if v is None else fmt.format(v)
+
+
+def _fmt_climo(meta: dict, monthly: dict, hourly: list[dict]) -> str:
+    """Render the climatology product as compact text: header (POR + denominator note),
+    temperature normals + records, a 3-hourly diurnal table (UTC key, LST label),
+    restriction frequencies by 3h block (n_obs-weighted), a phenomena line + TS/fog peak
+    hours, and the altimeter range. Climatology is not a time window -- no window line."""
+    st = monthly["station"]
+    mon = monthly["month"]
+    off = meta.get("utc_offset_hours_std")
+    lst_note = f"LST = UTC{off:+.0f}" if off is not None else "LST offset unknown"
+
+    def lst(h: int) -> int:
+        return int((h + (off or 0)) % 24)
+
+    out = [
+        f"Climatology for {st} -- {_MONTH_NAMES[mon]} (typical conditions, NOT current). "
+        f"POR {monthly['por_start_year']}-{monthly['por_end_year']} "
+        f"({monthly['n_years_used']} yr, {monthly['n_days']} days, "
+        f"{monthly['n_obs_routine']} routine obs). {lst_note}. "
+        "Frequencies use routine METARs only; temperatures use all obs.",
+        "",
+        "TEMPERATURE (daily, C):",
+        f"  max (TX): mean {_cd(monthly['tx_mean'], '{:.1f}')}  "
+        f"p10/p50/p90 {_cd(monthly['tx_p10'])}/{_cd(monthly['tx_p50'])}/{_cd(monthly['tx_p90'])}  "
+        f"record {_cd(monthly['tx_record'])} ({monthly['tx_record_date']})",
+        f"  min (TN): mean {_cd(monthly['tn_mean'], '{:.1f}')}  "
+        f"p10/p50/p90 {_cd(monthly['tn_p10'])}/{_cd(monthly['tn_p50'])}/{_cd(monthly['tn_p90'])}  "
+        f"record {_cd(monthly['tn_record'])} ({monthly['tn_record_date']})",
+        "",
+        "DIURNAL (every 3h; temp C, wind kt):",
+        f"  {'UTC':>3} {'LST':>3} {'temp':>5} {'wind':>5} {'p90':>4} {'gust%':>6} "
+        f"{'prevail':>8}",
+    ]
+    by_hour = {h["hour_utc"]: h for h in hourly}
+    for h in range(0, 24, 3):
+        r = by_hour.get(h)
+        if not r:
+            continue
+        prevail = "--" if r["dir_mode_sector"] is None else \
+            f"{r['dir_mode_sector']} {_cd(r['dir_mode_pct'])}%"
+        out.append(
+            f"  {h:>3} {lst(h):>3} {_cd(r['temp_mean_c'], '{:.0f}'):>5} "
+            f"{_cd(r['wind_mean_kt'], '{:.0f}'):>5} {_cd(r['wind_p90_kt'], '{:.0f}'):>4} "
+            f"{_cd(r['gust_pct'], '{:.0f}'):>6} {prevail:>8}"
+        )
+
+    # Restriction frequencies collapsed to 3h blocks, n_obs-weighted.
+    out += ["", "RESTRICTION FREQUENCY (% of routine obs, by 3h UTC block):",
+            f"  {'block':>7} {'cig<3k':>7} {'<1k':>5} {'<500':>5} {'vis<3':>6} {'<1':>5}"]
+    for h0 in range(0, 24, 3):
+        block = [by_hour[h] for h in range(h0, h0 + 3) if h in by_hour]
+        if not block:
+            continue
+        n = sum(b["n_obs"] or 0 for b in block) or 1
+
+        def wavg(key, block=block, n=n):
+            return sum((b[key] or 0) * (b["n_obs"] or 0) for b in block) / n
+
+        out.append(
+            f"  {h0:02d}-{h0 + 2:02d}Z  {wavg('pct_cig_lt_3000'):>6.1f} "
+            f"{wavg('pct_cig_lt_1000'):>5.1f} {wavg('pct_cig_lt_500'):>5.1f} "
+            f"{wavg('pct_vis_lt_3'):>6.1f} {wavg('pct_vis_lt_1'):>5.1f}"
+        )
+
+    # Phenomena (monthly) + peak hours (from the hourly rows).
+    out += ["", "PHENOMENA (% of routine obs, monthly): "
+            f"TS {_cd(monthly['pct_ts'], '{:.1f}')}  fog/mist {_cd(monthly['pct_fog'], '{:.1f}')}  "
+            f"rain {_cd(monthly['pct_ra'], '{:.1f}')}  snow {_cd(monthly['pct_sn'], '{:.1f}')}  "
+            f"fzra/fzdz {_cd(monthly['pct_fzprecip'], '{:.1f}')}"]
+
+    def peak(key):
+        cand = [(r[key], r["hour_utc"]) for r in hourly if r[key]]
+        return max(cand) if cand else None
+    ts_pk, fog_pk = peak("pct_ts"), peak("pct_fog")
+    peaks = []
+    if ts_pk:
+        peaks.append(f"TS peak ~{ts_pk[1]:02d}Z ({ts_pk[0]:.1f}%)")
+    if fog_pk:
+        peaks.append(f"fog peak ~{fog_pk[1]:02d}Z ({fog_pk[0]:.1f}%)")
+    if peaks:
+        out.append("  peak hours: " + "; ".join(peaks))
+
+    out.append(
+        f"\nALTIMETER (inHg): mean {_cd(monthly['alt_mean'], '{:.2f}')} "
+        f"(range {_cd(monthly['alt_min'], '{:.2f}')}-{_cd(monthly['alt_max'], '{:.2f}')})"
+    )
+    return "\n".join(out)
+
+
+def _get_climo(con, args: dict) -> ToolResult:
+    """Read the climo_* product for a station-month and render it. Reads only the
+    climo tables on the read-only conn -- no ingest, no build. A missing/empty table
+    (pre-climo DB) or an unbuilt month returns feedback naming the build script, not a
+    crash. No ToolResult.window: climatology is not a time window."""
+    station = str(args["station"]).upper()
+    try:
+        meta = store.climo_meta(con, station)
+    except Exception:  # noqa: BLE001 -- climo tables don't exist yet on this DB
+        return ToolResult(
+            "error: no climatology has been built for this database. Build it with "
+            "`uv run python scripts/build_climo.py --station <ICAO> --months <M>`."
+        )
+    month = args.get("month")
+    if month is None:
+        anchor = store.latest(con, station, 1)
+        if not anchor:
+            return ToolResult(
+                f"error: no observations stored for {station} to pick a default month; "
+                "pass an explicit `month` (1-12)."
+            )
+        month = anchor[0]["obs_time"].month
+    else:
+        month = _int_arg(month, month, lo=1, hi=12)
+    monthly = store.climo_month(con, station, month)
+    if meta is None or monthly is None:
+        return ToolResult(
+            f"error: climatology for {station} month {month} is not built. Build it with "
+            f"`uv run python scripts/build_climo.py --station {station} --months {month}`."
+        )
+    hourly = store.climo_hours(con, station, month)
+    return ToolResult(_fmt_climo(meta, monthly, hourly))
+
+
 def run_tool(name: str, args: dict, *, db_path: str | None = None) -> ToolResult:
     """Execute a model-issued tool call. The read tools run against a READ-ONLY
     connection; emit_taf (output sink) and the network fetches (get_sounding, get_map,
-    get_fcst_sounding, get_point_forecast) need no DB and are handled first. Returns a
-    ToolResult: text receipt + images/TAF."""
+    get_fcst_sounding, get_point_forecast, get_imagery) need no DB and are handled first.
+    Returns a ToolResult: text receipt + images/TAF."""
     if name == "emit_taf":
         return _emit_taf(args)
     if name == "get_sounding":
@@ -586,6 +968,8 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None) -> ToolResult
         return _get_fcst_sounding(args)
     if name == "get_point_forecast":
         return _get_point_forecast(args)
+    if name == "get_imagery":
+        return _get_imagery(args)
     con = (
         store.connect(db_path, read_only=True)
         if db_path
@@ -628,6 +1012,8 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None) -> ToolResult
                 f"Meteogram for {station}, last {hours}h ({len(rows)} obs); image follows."
             )
             return ToolResult(receipt, images=[png], window=(start, end))
+        if name == "get_climo":
+            return _get_climo(con, args)
         return ToolResult(f"error: unknown tool {name!r}")
     except Exception as e:  # noqa: BLE001 -- any read-tool failure becomes feedback, not a dead loop
         return ToolResult(f"error: {name} failed ({type(e).__name__}: {e})")
