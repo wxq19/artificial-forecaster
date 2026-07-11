@@ -15,8 +15,12 @@ from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
 
-from forecaster import awc, charts, fcstsounding, imagery, soundings, store, tafgen, wxmaps
+from forecaster import (
+    awc, charts, fcstsounding, imagery, soundings, store, tafgen, tafparse, worksheet, wxmaps,
+)
+from forecaster.config import settings
 from forecaster.tafgen import TafProduct
+from forecaster.worksheet import TafWorksheet
 
 
 @dataclass
@@ -30,6 +34,8 @@ class ToolResult:
     images: list[bytes] = field(default_factory=list)
     window: tuple | None = None   # (start, end) for time-bounded tools (Fix 3 guard)
     taf: TafProduct | None = None   # emit_taf hands back the captured forecast object
+    worksheet: TafWorksheet | None = None   # submit_taf_worksheet hands back the accepted worksheet
+    findings: list[str] = field(default_factory=list)   # validate() findings (worksheet/check_taf)
 
 QUERY_OBS = {
     "type": "function",
@@ -338,8 +344,44 @@ GET_IMAGERY = {
     },
 }
 
+GET_CURRENT_TAF = {
+    "type": "function",
+    "function": {
+        "name": "get_current_taf",
+        "description": (
+            "Fetch the CURRENT official TAF for an airport (live from aviationweather.gov) "
+            "so you can compare the issued forecast to your own reasoning -- continuity, "
+            "what the previous forecaster expected, and whether an amendment is warranted. "
+            "Returns the raw TAF text and a decoded per-period summary. This is the human "
+            "product, not truth; your job is to reason independently, not copy it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KBLV"},
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+CHECK_TAF = {
+    "type": "function",
+    "function": {
+        "name": "check_taf",
+        "description": (
+            "Run the AFMAN 15-124 rule checker on a candidate TAF WITHOUT emitting it -- an "
+            "explicit dry-run of the same validation emit_taf applies. Fill the same fields "
+            "as emit_taf (prevailing period + FM/BECMG/TEMPO groups, TX/TN, QNH). Returns "
+            "the rendered TAF text plus any rule findings, so you can iterate on structure "
+            "before the final emit. Use emit_taf when you are ready to submit."
+        ),
+        "parameters": TafProduct.model_json_schema(),
+    },
+}
+
 TOOLS = [QUERY_OBS, GET_LATEST, GET_TREND, GET_SOUNDING, GET_MAP, GET_FCST_SOUNDING,
-         GET_POINT_FORECAST, GET_CLIMO, GET_IMAGERY]
+         GET_POINT_FORECAST, GET_CLIMO, GET_IMAGERY, GET_CURRENT_TAF, CHECK_TAF]
 
 # The OUTPUT tool: the model emits its forecast as the fields of a TafProduct, and
 # our code renders + checks it. The parameter schema IS the pydantic model's JSON
@@ -364,6 +406,28 @@ EMIT_TAF = {
             "cover values. Base the forecast only on the observations and trend provided."
         ),
         "parameters": TafProduct.model_json_schema(),
+    },
+}
+
+# The WORKSHEET sink: the model submits its pre-emit reasoning as a single validated
+# TafWorksheet (schema = the pydantic model's JSON schema, like emit_taf). A SINK, not
+# data -- the receipt is the completeness check, so the loop can feed findings back for
+# a re-submit. On success the accepted worksheet rides back on ToolResult.worksheet.
+SUBMIT_WORKSHEET = {
+    "type": "function",
+    "function": {
+        "name": "submit_taf_worksheet",
+        "description": (
+            "Submit your pre-forecast reasoning WORKSHEET before emit_taf: a single "
+            "structured object capturing the data you reviewed, the current state, the "
+            "drivers, hazards, a forecast timeline, your sanity checks (cross-check each "
+            "TX/TN against the observed diurnal temperature range, and state the ONE "
+            "hPa->inHg conversion you use everywhere), the TAF strategy, uncertainty, and "
+            "a final assessment. It returns a completeness check -- correct any findings "
+            "and re-submit until clean, THEN emit the TAF from your timeline and strategy. "
+            "Fill it ONCE as a single call (reason across your earlier tool calls first)."
+        ),
+        "parameters": TafWorksheet.model_json_schema(),
     },
 }
 
@@ -468,6 +532,27 @@ def _has_clear_sky_layer(args: dict) -> bool:
     return False
 
 
+def _taf_schema_error(verb: str, e: ValidationError, args: dict) -> str:
+    """Format a TafProduct ValidationError as correctable feedback (shared by emit_taf
+    and check_taf). Names the fix for the two shapes the JSON schema hides, so the model
+    does not reverse-engineer it from a terse error (which fed the observed rumination)."""
+    errs = "\n".join(f"  - {'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+                     for err in e.errors())
+    hints = []
+    # (a) TafTemp: a None|TafTemp union failure is a terse two-branch error.
+    if any(err["loc"] and str(err["loc"][0]) in ("max_temp", "min_temp") for err in e.errors()):
+        hints.append('max_temp/min_temp each need three integers -- '
+                     '{"temp_c": <Celsius>, "day": <1-31>, "hour": <0-23>}.')
+    # (b) Clear-sky token as a cloud cover: a CloudLayer has no clear-sky value, and
+    # its required height_ft can mask the cover error -- so detect it from the args.
+    if _has_clear_sky_layer(args):
+        hints.append("for clear skies pass an EMPTY clouds list [] (renders SKC); "
+                     "SKC/CLR/NSC are not valid cloud covers.")
+    hint = "".join(f"\n  note: {h}" for h in hints)
+    return (f"{verb} rejected ({e.error_count()} schema error(s)); fix and re-{verb.split('_')[0]}:"
+            f"\n{errs}{hint}")
+
+
 def _emit_taf(args: dict) -> ToolResult:
     """Capture the model's structured forecast: build a TafProduct (guardrails fire
     here), render it, and run the AFMAN rule check + round-trip. The receipt is that
@@ -477,23 +562,7 @@ def _emit_taf(args: dict) -> ToolResult:
     try:
         product = TafProduct(**args)
     except ValidationError as e:
-        errs = "\n".join(f"  - {'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
-                         for err in e.errors())
-        # Name the fix for the two shapes the schema hides, so the model does not
-        # reverse-engineer it from a terse error (which fed the observed rumination).
-        hints = []
-        # (a) TafTemp: a None|TafTemp union failure is a terse two-branch error.
-        if any(err["loc"] and str(err["loc"][0]) in ("max_temp", "min_temp") for err in e.errors()):
-            hints.append('max_temp/min_temp each need three integers -- '
-                         '{"temp_c": <Celsius>, "day": <1-31>, "hour": <0-23>}.')
-        # (b) Clear-sky token as a cloud cover: a CloudLayer has no clear-sky value, and
-        # its required height_ft can mask the cover error -- so detect it from the args.
-        if _has_clear_sky_layer(args):
-            hints.append("for clear skies pass an EMPTY clouds list [] (renders SKC); "
-                         "SKC/CLR/NSC are not valid cloud covers.")
-        hint = "".join(f"\n  note: {h}" for h in hints)
-        return ToolResult(f"emit_taf rejected ({e.error_count()} schema error(s)); fix and "
-                          f"re-emit:\n{errs}{hint}")
+        return ToolResult(_taf_schema_error("emit_taf", e, args))
     findings = tafgen.validate(product)
     try:
         text = tafgen.render_taf(product)
@@ -517,6 +586,89 @@ def _emit_taf(args: dict) -> ToolResult:
     if diffs:
         lines.append("round-trip differences: " + "; ".join(diffs))
     return ToolResult("\n".join(lines), taf=product)
+
+
+def _check_taf(args: dict) -> ToolResult:
+    """Dry-run the AFMAN checker on a candidate TAF WITHOUT emitting it: build + render +
+    validate() and hand the findings back, but do NOT set ToolResult.taf (a driver
+    captures the final TAF only from emit_taf). Same feedback-not-crash contract as
+    _emit_taf; lets the model iterate on structure before the final emit."""
+    try:
+        product = TafProduct(**args)
+    except ValidationError as e:
+        return ToolResult(_taf_schema_error("check_taf", e, args))
+    findings = tafgen.validate(product)
+    try:
+        text = tafgen.render_taf(product)
+    except Exception as e:  # noqa: BLE001 -- a group missing timing renders visibly, doesn't crash
+        return ToolResult(
+            f"check_taf built but could not render ({type(e).__name__}: {e}); a change group "
+            "is likely missing its day/hour fields.", findings=findings)
+    lines = ["check_taf (dry run -- not emitted):", "", text, ""]
+    if findings:
+        lines.append(f"AFMAN check found {len(findings)} issue(s):")
+        lines += [f"  - {f}" for f in findings]
+    else:
+        lines.append("AFMAN check: clean. Ready to emit_taf.")
+    return ToolResult("\n".join(lines), findings=findings)
+
+
+def _get_current_taf(args: dict) -> ToolResult:
+    """Fetch the current official TAF from AWC (network, no DB) and hand back the raw text
+    plus a decoded per-period summary. A fetch/parse failure becomes feedback, not a crash."""
+    station = args.get("station")
+    if not station:
+        return ToolResult('error: get_current_taf needs a "station" ICAO, e.g. "station": "KBLV"')
+    icao = str(station).upper()
+    try:
+        tafs = awc.fetch_taf(icao)
+    except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
+        return ToolResult(f"error: could not fetch TAF for {icao} ({type(e).__name__}: {e})")
+    if not tafs:
+        return ToolResult(f"No current TAF is available for {icao} from AWC "
+                          "(not all airfields issue TAFs).")
+    issue, raw = tafs[0]                          # most recent issuance for this station
+    lines = [f"Current official TAF for {icao} (issued {issue:%Y-%m-%dT%H:%MZ}, source "
+             "aviationweather.gov). This is the human forecast, not truth -- reason "
+             "independently.", "", raw, ""]
+    try:
+        obs = tafparse.parse(raw)
+        lines += ["Decoded per-period summary:", tafparse.render(obs)]
+    except Exception as e:  # noqa: BLE001 -- the raw is always shown; a decode miss is non-fatal
+        lines += [f"(could not decode the TAF: {type(e).__name__}: {e}; the raw text above stands)"]
+    return ToolResult("\n".join(lines))
+
+
+def _submit_worksheet(args: dict, *, evidence_ids: list[str] | None = None) -> ToolResult:
+    """The worksheet SINK: build a TafWorksheet (guardrails fire), run the semantic
+    completeness check, and return findings as the receipt so the model re-submits a fix.
+    The accepted (or best-so-far) worksheet rides back on ToolResult.worksheet; findings
+    on ToolResult.findings so the driver can gate emit_taf in `required` mode. Mode +
+    evidence_mode come from config; `evidence_ids` (threaded by the loop) enables
+    evidence-ref RESOLUTION -- None means presence-only. Never raises: a schema failure
+    is correctable feedback, exactly like _emit_taf."""
+    try:
+        ws = TafWorksheet(**args)
+    except ValidationError as e:
+        errs = "\n".join(f"  - {'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+                         for err in e.errors())
+        return ToolResult(f"submit_taf_worksheet rejected ({e.error_count()} schema error(s)); "
+                          f"fix and re-submit:\n{errs}")
+    findings = worksheet.validate(
+        ws, mode=settings.worksheet_mode, evidence_mode=settings.evidence_mode,
+        known_evidence_ids=evidence_ids,
+    )
+    if findings:
+        blocking = worksheet.blocking_findings(findings)
+        advisory = len(findings) - len(blocking)
+        head = (f"Worksheet received. Completeness check found {len(findings)} issue(s) "
+                f"({len(blocking)} blocking"
+                + (f", {advisory} advisory" if advisory else "") + ") -- address and re-submit:")
+        lines = [head] + [f"  - {f}" for f in findings]
+        return ToolResult("\n".join(lines), worksheet=ws, findings=findings)
+    return ToolResult(
+        "Worksheet received. Completeness check: clean. Proceed to emit_taf, deriving the "
+        "TAF from your forecast_timeline and taf_strategy.", worksheet=ws, findings=[])
 
 
 def _get_sounding(args: dict) -> ToolResult:
@@ -953,13 +1105,22 @@ def _get_climo(con, args: dict) -> ToolResult:
     return ToolResult(_fmt_climo(meta, monthly, hourly))
 
 
-def run_tool(name: str, args: dict, *, db_path: str | None = None) -> ToolResult:
+def run_tool(name: str, args: dict, *, db_path: str | None = None,
+             evidence_ids: list[str] | None = None) -> ToolResult:
     """Execute a model-issued tool call. The read tools run against a READ-ONLY
-    connection; emit_taf (output sink) and the network fetches (get_sounding, get_map,
-    get_fcst_sounding, get_point_forecast, get_imagery) need no DB and are handled first.
-    Returns a ToolResult: text receipt + images/TAF."""
+    connection; the sinks (emit_taf, check_taf, submit_taf_worksheet) and the network
+    fetches (get_current_taf, get_sounding, get_map, get_fcst_sounding,
+    get_point_forecast, get_imagery) need no DB and are handled first. `evidence_ids`
+    (the ids the loop has threaded) lets submit_taf_worksheet RESOLVE evidence_refs.
+    Returns a ToolResult: text receipt + images/TAF/worksheet."""
     if name == "emit_taf":
         return _emit_taf(args)
+    if name == "check_taf":
+        return _check_taf(args)
+    if name == "submit_taf_worksheet":
+        return _submit_worksheet(args, evidence_ids=evidence_ids)
+    if name == "get_current_taf":
+        return _get_current_taf(args)
     if name == "get_sounding":
         return _get_sounding(args)
     if name == "get_map":

@@ -428,6 +428,45 @@ artificial-forecaster/
   VALUE unchanged; dates now deterministic by construction). v1 DONE; still uncommitted (climo + imagery land
   together in the working tree) -- build any additional months the target station needs before/after commit.
 
+- TAF WORKSHEET SEAM (`worksheet.py` + `submit_taf_worksheet`/`get_current_taf`/`check_taf` + store tables,
+  this session): the pre-emit REASONING artifact (docs/taf_worksheet_design.md Milestone 1). A typed
+  `TafWorksheet` the agent fills and submits through its own validation sink BEFORE emit_taf, to fix the two
+  systematic KLSV misses (dewpoint-read-as-TN; MSLP->inHg re-converted inconsistently) by making those cross-
+  checks first-class (`sanity_checks`) and to decompose the task so a weaker model CONVERGES instead of
+  ruminating. `worksheet.py` is a sibling of tafgen: 12 pydantic sections (task/data_review/current_state/
+  forecast_drivers/hazards/forecast_timeline/sanity_checks/taf_strategy/uncertainty/final_assessment/
+  model_run_verification + meta) with guardrails (enum/ICAO reject impossible values; `BeforeValidator`
+  lower-cases loose enums like `Moderate` per the emit-arg-quirks lesson), a semantic `validate()` returning
+  SECTION-PREFIXED findings (never raises), and a `worksheet_guide()` (worked example + flattened field guide)
+  modeled on `tafgen.emit_taf_guide()`. NO SQL/matplotlib/network. Key decisions: single validated sink call
+  (not section-by-section; two-chunk fallback deferred until a run shows the submit turn truncating); findings
+  are `blocking_findings()`-filtered so `model_run_verification:` stays ADVISORY even in required mode (it has no
+  runtime backing until `get_model_run_verification`, Milestone 2); `validate()` runs the SAME comprehensive
+  checks in advisory + required (mode only governs whether the driver GATES emit_taf). Config: `worksheet_mode`
+  (off|advisory[default]|required), `evidence_mode` (off|key_claims[default]|strict), `persist_worksheets`.
+  Three new tools in `tools.py`: `submit_taf_worksheet` (sink, schema = `TafWorksheet.model_json_schema()`,
+  attaches the accepted worksheet + findings to `ToolResult`), `get_current_taf` (wraps `awc.fetch_taf` +
+  `tafparse.render` for the official-TAF comparison), `check_taf` (wraps `tafgen.validate` as a dry-run;
+  the emit_taf schema-error+hints block was factored into shared `_taf_schema_error`). `run_tool` gained
+  `evidence_ids=` so the sink RESOLVES evidence_refs (not just presence). Persistence in `store.py`:
+  `taf_worksheets` + `taf_worksheet_evidence` (all worksheet SQL here; `init_worksheet_schema` +
+  `insert_worksheet` one-txn idempotent replace + readers). Driver `scripts/test_worksheet_agent.py` owns the
+  agent-loop plumbing (migrates to a future agent.py): EVIDENCE THREADING (each data-tool receipt tagged
+  `[evidence_id: ev_NNN]`, the id set passed to the sink), the MODE GATE (required refuses emit_taf until a
+  worksheet passes), and persistence of the final worksheet+evidence+TAF. Self-test `scripts/test_worksheet.py`
+  (no model/network): 19/19 -- guardrail rejects, enum coercion, empty-worksheet section coverage, MRV/blocking
+  split, dangling change_group->timeline ref, evidence presence+resolution, byte-stable guide, both sinks, store
+  round-trip. `tafgen` self-test still 9/9 (no regression from the shared-helper refactor); ruff clean.
+  VERIFIED LIVE (MiniMax, advisory, `logs/worksheet_agent_KLSV_20260710-103022.md`): the model corrected a
+  schema error -> 3 blocking semantic findings -> CLEAN worksheet -> emit_taf (AFMAN caught a 6h validity slip)
+  -> CLEAN 30h TAF (proper diurnal wind cycle, SKC 9999, per-group QNH, TX/TN); 12 evidence ids threaded and
+  key_claims RESOLUTION passed; worksheet persisted. CAVEATS (environmental, not worksheet bugs): the run loaded
+  0 obs (valid 072300Z is now >48h past AWC's window) and get_climo errored (throwaway DB has no climo tables),
+  so the model reasoned off live map/point-forecast/current-TAF and the sanity_checks TX/TN-vs-observed demo was
+  thin; the `required`-mode gate is coded + stub-checked but NOT yet exercised live. NOT COMMITTED yet (lands
+  with the climo+imagery working-tree changes). Two follow-ups if wanted: a live `required`-mode run, and a
+  recent-valid-time run (obs + built climo) to exercise sanity_checks with real observed data.
+
 ## NEXT SESSION -- pick up here (paused 2026-07-09)
 An earlier session landed ALL 11 fixes from the 2026-07-08 review (that findings doc has since been
 removed now that every item shipped): Tier 1
@@ -455,12 +494,13 @@ DO NEXT: the two reinforcing pieces were the climatology tool + the forecasting 
    tie-break fix, obs-untouched, guards; see the Status bullet + `logs/climo_KLSV_20260709-151921.md`).
    Remaining housekeeping: commit the uncommitted climo + imagery work, and build any additional months
    the target station needs.
-2. FORECASTING WORKSHEET (next-steps step 12) -- now the PRIMARY next feature: structured pre-emit sub-tasks (current trend; diurnal
-   wind/gust cycle per valid day; TX/TN value+timing SANITY-CHECKED vs the observed temp range; QNH trend
-   with any unit conversion double-checked ONCE; restriction/convective risks) filled BEFORE emit_taf.
-   Targets the two systematic misses (Qwen read a dewpoint as TN; Gemma MSLP->inHg inconsistency) and is
-   expected to REDUCE rumination on its own (KLSV A/B: one "diurnal recurrence" nudge already cut looping
-   + improved TX), so it may moot the DEFERRED convergence fix below. Pairs with the climo tool (1).
+2. FORECASTING WORKSHEET (next-steps step 12) -- v1 DONE (2026-07-10; see the Status bullet + design
+   doc + `logs/worksheet_agent_KLSV_20260710-103022.md`). The typed `TafWorksheet` + sink + evidence
+   threading + mode gate + persistence are built, self-tested 19/19, and verified live (MiniMax advisory:
+   schema-error -> semantic findings -> clean worksheet -> clean 30h TAF). Follow-ups if wanted: a live
+   `required`-mode run (gate coded but unexercised), a recent-valid-time run (real obs + built climo) to
+   exercise sanity_checks against observed data, and Milestone 2 (`get_model_run_verification`, which
+   promotes model_run_verification from advisory to gated).
 (Optional) Persist the vs-obs VERIFICATION below as a scoring note -- the first real TAFVER signal, seeds
 next-steps step 9.
 
@@ -537,7 +577,14 @@ never-emit -> clean once the loop guard/caps landed.
     the model can SEE the contract, cutting both the schema-guessing thrash and the verification loop. See the
     KLSV reasoning-mechanics findings + the emit-schema findings in Status (model quotes numbers / omits optional
     fields).
-12. **Forecasting WORKSHEET -- intermediate tasks before emit (agent-quality).** Instead of one
+12. **Forecasting WORKSHEET -- intermediate tasks before emit (v1 DONE 2026-07-10).** `worksheet.py`
+    (typed `TafWorksheet` + guardrails + semantic `validate()` + `worksheet_guide()`), the
+    `submit_taf_worksheet` sink + `get_current_taf`/`check_taf` wrappers, config modes
+    (`worksheet_mode`/`evidence_mode`), `store` persistence tables, and the `test_worksheet_agent.py`
+    driver (evidence-id threading + mode gate + persistence) all landed. Self-test 19/19; verified live
+    with MiniMax (advisory): schema-error -> semantic findings -> clean worksheet -> clean 30h TAF. See the
+    Status bullet. Milestone 2 (`get_model_run_verification`) + continuity tools (`get_previous_tafs`) are
+    the deferred later milestones. ORIGINAL RATIONALE (retained): instead of one
     "reason-then-emit" turn, give the model a structured pre-forecast worksheet (like a human forecaster's):
     explicit intermediate sub-tasks -- current trend, DIURNAL wind/gust cycle per valid day, TX/TN value+timing
     (SANITY-CHECK TX/TN against the diurnal range of OBSERVED temps, so a dewpoint isn't read as the min temp --

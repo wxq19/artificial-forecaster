@@ -18,5 +18,15 @@ class Settings(BaseSettings):
     # valid-time run can't absorb post-cutoff obs through the climo product (leakage guard).
     climo_start_year: int = 2006
     climo_end_year: int = 2025
+    # TAF worksheet (docs/taf_worksheet_design.md). The agent fills a structured
+    # reasoning worksheet before emit_taf; these govern whether it is requested/gated.
+    #   off      - no worksheet (experiment control arm)
+    #   advisory - worksheet validated + findings surfaced; never blocks emit_taf (default)
+    #   required - worksheet must pass semantic validation before emit_taf is accepted
+    worksheet_mode: str = "advisory"
+    #   off | key_claims (default) | strict -- how strictly evidence_refs are demanded
+    evidence_mode: str = "key_claims"
+    # Persist the final accepted worksheet + evidence + TAF + findings to the store.
+    persist_worksheets: bool = True
 
 settings = Settings()

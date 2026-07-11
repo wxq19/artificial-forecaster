@@ -476,3 +476,137 @@ def climo_hours(con: duckdb.DuckDBPyConnection, station: str, month: int) -> lis
     )
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# TAF worksheet tables (taf_worksheet*). The agent's pre-emit reasoning artifact
+# (worksheet.py) is persisted here as the human-auditable record of WHY a TAF looks
+# the way it does. The heavy JSON lives in one row; referenced evidence (tool
+# name/args/receipt) is split into a child table so the worksheet record stays small
+# and we can later analyze which tools were actually used. Same seam rule as obs/climo:
+# all worksheet SQL lives HERE.
+# ---------------------------------------------------------------------------
+
+_WORKSHEET_DDL = """
+CREATE TABLE IF NOT EXISTS taf_worksheets (
+    worksheet_id          VARCHAR   NOT NULL,
+    created_at            TIMESTAMP,
+    completed_at          TIMESTAMP,
+    station               VARCHAR,
+    forecast_type         VARCHAR,
+    valid_from_utc        VARCHAR,             -- as authored (ISO or DDHHMMZ); not a window read
+    valid_to_utc          VARCHAR,
+    mode                  VARCHAR,             -- off | advisory | required
+    evidence_mode         VARCHAR,             -- off | key_claims | strict
+    model                 VARCHAR,
+    worksheet_json        JSON      NOT NULL,  -- the full TafWorksheet
+    final_taf_text        VARCHAR,             -- the TAF emitted from this worksheet (if any)
+    taf_product_json      JSON,                -- the TafProduct behind final_taf_text
+    checker_findings_json JSON,                -- validate() findings at accept time
+    status                VARCHAR,             -- e.g. accepted | advisory | superseded
+    PRIMARY KEY (worksheet_id)
+);
+"""
+
+_WORKSHEET_EVIDENCE_DDL = """
+CREATE TABLE IF NOT EXISTS taf_worksheet_evidence (
+    worksheet_id   VARCHAR   NOT NULL,
+    evidence_id    VARCHAR   NOT NULL,         -- ev_001 ... (per-tool-call id the loop threads)
+    tool_name      VARCHAR,
+    tool_args_json JSON,
+    receipt_text   VARCHAR,                    -- short receipt line, not the full output
+    created_at     TIMESTAMP,
+    PRIMARY KEY (worksheet_id, evidence_id)
+);
+"""
+
+
+def init_worksheet_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the taf_worksheet* tables if absent. Idempotent. Like init_climo_schema
+    this is a WRITE-path side effect (the read-only tool conn never runs it); a driver
+    calls it before persisting a worksheet."""
+    con.execute(_WORKSHEET_DDL)
+    con.execute(_WORKSHEET_EVIDENCE_DDL)
+
+
+def insert_worksheet(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    worksheet_id: str,
+    worksheet_json: str,
+    station: str | None = None,
+    forecast_type: str | None = None,
+    valid_from_utc: str | None = None,
+    valid_to_utc: str | None = None,
+    mode: str | None = None,
+    evidence_mode: str | None = None,
+    model: str | None = None,
+    final_taf_text: str | None = None,
+    taf_product_json: str | None = None,
+    checker_findings_json: str | None = None,
+    status: str | None = None,
+    created_at: datetime | None = None,
+    completed_at: datetime | None = None,
+    evidence: list[dict] | None = None,
+) -> None:
+    """Persist one final worksheet (+ its evidence rows) in a single transaction.
+    Idempotent per worksheet_id: a re-run replaces the row and its evidence (the loop
+    may re-submit before acceptance). `evidence` items are dicts with keys evidence_id,
+    tool_name, tool_args_json, receipt_text. Requires init_worksheet_schema(con)."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        con.execute("BEGIN")
+        con.execute("DELETE FROM taf_worksheets WHERE worksheet_id = ?", [worksheet_id])
+        con.execute("DELETE FROM taf_worksheet_evidence WHERE worksheet_id = ?", [worksheet_id])
+        con.execute(
+            "INSERT INTO taf_worksheets VALUES ($worksheet_id, $created_at, $completed_at, "
+            "$station, $forecast_type, $valid_from_utc, $valid_to_utc, $mode, $evidence_mode, "
+            "$model, $worksheet_json, $final_taf_text, $taf_product_json, $checker_findings_json, "
+            "$status)",
+            {
+                "worksheet_id": worksheet_id,
+                "created_at": created_at or now,
+                "completed_at": completed_at or now,
+                "station": station,
+                "forecast_type": forecast_type,
+                "valid_from_utc": valid_from_utc,
+                "valid_to_utc": valid_to_utc,
+                "mode": mode,
+                "evidence_mode": evidence_mode,
+                "model": model,
+                "worksheet_json": worksheet_json,
+                "final_taf_text": final_taf_text,
+                "taf_product_json": taf_product_json,
+                "checker_findings_json": checker_findings_json,
+                "status": status,
+            },
+        )
+        for e in evidence or []:
+            con.execute(
+                "INSERT INTO taf_worksheet_evidence VALUES (?, ?, ?, ?, ?, ?)",
+                [worksheet_id, e["evidence_id"], e.get("tool_name"),
+                 e.get("tool_args_json"), e.get("receipt_text"), e.get("created_at") or now],
+            )
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
+def worksheet(con: duckdb.DuckDBPyConnection, worksheet_id: str) -> dict | None:
+    """One persisted worksheet row (JSON columns come back as strings; json.loads at the
+    boundary), or None. Evidence rows are read separately via worksheet_evidence()."""
+    cur = con.execute("SELECT * FROM taf_worksheets WHERE worksheet_id = ?", [worksheet_id])
+    cols = [d[0] for d in cur.description]
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
+def worksheet_evidence(con: duckdb.DuckDBPyConnection, worksheet_id: str) -> list[dict]:
+    """The evidence rows for one worksheet, in evidence_id order (empty if none)."""
+    cur = con.execute(
+        "SELECT * FROM taf_worksheet_evidence WHERE worksheet_id = ? ORDER BY evidence_id",
+        [worksheet_id],
+    )
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
