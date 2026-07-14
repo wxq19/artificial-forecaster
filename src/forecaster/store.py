@@ -610,3 +610,153 @@ def worksheet_evidence(con: duckdb.DuckDBPyConnection, worksheet_id: str) -> lis
     )
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# TAF scoring: the immutable TAF archive (`tafs`) + the shared `evaluations` spine
+# (scoring-design sec 5.1 / 11). Scoring requires a TIME-ALIGNED forecast captured
+# BEFORE truth is evaluated, so a scored TAF is frozen here byte-for-byte and never
+# mutated. Same seam rule: all scoring SQL lives HERE; init is a WRITE-path side
+# effect (the read-only tool conn never creates these). The scorers read these tables
+# plus the half-open truth reader below; scoring MATH stays in the scorer modules.
+# ---------------------------------------------------------------------------
+
+_TAFS_DDL = """
+CREATE TABLE IF NOT EXISTS tafs (
+    taf_id                    VARCHAR   NOT NULL,   -- stable id (content-derived or UUID)
+    station                   VARCHAR   NOT NULL,
+    issue_time_utc            TIMESTAMP,            -- authoritative; never reconstructed later
+    valid_from_utc            TIMESTAMP,            -- absolute UTC, normalized at insert
+    valid_to_utc              TIMESTAMP,
+    original_cycle_start_utc  TIMESTAMP,            -- anchors the TX/TN 24h temp window
+    bulletin_type             VARCHAR,              -- routine|amendment|correction|cancellation
+    producer_kind             VARCHAR,              -- artificial|official|human|model|baseline
+    producer_name             VARCHAR,              -- model+run, unit, source, or baseline name
+    source                    VARCHAR,              -- worksheet|awc_snapshot|import|baseline_synth
+    canonical                 BOOLEAN,              -- False for unprovable post-hoc imports
+    raw_taf                   VARCHAR   NOT NULL,    -- exact received bulletin, byte-for-byte
+    parse_body                VARCHAR,              -- remark-stripped text fed to tafparse (audit)
+    taf_product_json          JSON,                 -- TafProduct JSON for artificial TAFs (lossless)
+    construction_json         JSON,                 -- synthetic-baseline construction inputs
+    worksheet_id              VARCHAR,
+    experiment_id             VARCHAR,
+    run_id                    VARCHAR,
+    parent_taf_id             VARCHAR,              -- amendment/correction lineage
+    supersedes_taf_id         VARCHAR,
+    content_sha256            VARCHAR,              -- dedup / tamper evidence
+    archived_at               TIMESTAMP,            -- ingest time (distinct from issue time)
+    PRIMARY KEY (taf_id)
+);
+"""
+
+_EVALUATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS evaluations (
+    evaluation_id         VARCHAR   NOT NULL,
+    station               VARCHAR,
+    valid_from            TIMESTAMP,
+    valid_to              TIMESTAMP,
+    status                VARCHAR,                  -- pending | scored | partial
+    obs_hash              VARCHAR,                  -- SHA-256 over the canonical truth rows
+    truth_policy_json     JSON,
+    truth_policy_hash     VARCHAR,
+    profile_snapshot_json JSON,                     -- the FULL profile, not only its hash
+    profile_hash          VARCHAR,
+    coverage_manifest_json JSON,
+    created_at            TIMESTAMP,
+    PRIMARY KEY (evaluation_id)
+);
+"""
+
+
+def init_scoring_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the tafs archive + evaluations spine if absent. Idempotent. SEPARATE
+    from init_schema (a build/scoring-path side effect only), like init_climo_schema
+    and init_worksheet_schema; the read-only tool conn never runs this."""
+    con.execute(_TAFS_DDL)
+    con.execute(_EVALUATIONS_DDL)
+
+
+def insert_taf(con: duckdb.DuckDBPyConnection, taf: dict) -> bool:
+    """Archive one TAF immutably. Idempotent by taf_id (ON CONFLICT DO NOTHING) --
+    never mutates an existing row, so a re-archive of identical content is a no-op.
+    `taf` keys are the tafs columns (missing keys default to NULL). Returns True if a
+    new row was inserted."""
+    cols = [
+        "taf_id", "station", "issue_time_utc", "valid_from_utc", "valid_to_utc",
+        "original_cycle_start_utc", "bulletin_type", "producer_kind", "producer_name",
+        "source", "canonical", "raw_taf", "parse_body", "taf_product_json",
+        "construction_json", "worksheet_id", "experiment_id", "run_id",
+        "parent_taf_id", "supersedes_taf_id", "content_sha256", "archived_at",
+    ]
+    before = con.execute("SELECT count(*) FROM tafs").fetchone()[0]
+    con.execute(
+        f"INSERT INTO tafs ({', '.join(cols)}) VALUES ({', '.join('$' + c for c in cols)}) "
+        f"ON CONFLICT (taf_id) DO NOTHING",
+        {c: taf.get(c, None) for c in cols},
+    )
+    return con.execute("SELECT count(*) FROM tafs").fetchone()[0] > before
+
+
+def taf(con: duckdb.DuckDBPyConnection, taf_id: str) -> dict | None:
+    """One archived TAF row (JSON columns come back as strings; json.loads at the
+    boundary if needed), or None."""
+    cur = con.execute("SELECT * FROM tafs WHERE taf_id = ?", [taf_id])
+    cols = [d[0] for d in cur.description]
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
+def insert_evaluation(con: duckdb.DuckDBPyConnection, ev: dict) -> None:
+    """Upsert one evaluation-spine row (idempotent replace by evaluation_id). `ev`
+    keys are the evaluations columns; missing keys default to NULL."""
+    cols = [
+        "evaluation_id", "station", "valid_from", "valid_to", "status", "obs_hash",
+        "truth_policy_json", "truth_policy_hash", "profile_snapshot_json",
+        "profile_hash", "coverage_manifest_json", "created_at",
+    ]
+    con.execute("DELETE FROM evaluations WHERE evaluation_id = ?", [ev["evaluation_id"]])
+    con.execute(
+        f"INSERT INTO evaluations ({', '.join(cols)}) VALUES ({', '.join('$' + c for c in cols)})",
+        {c: ev.get(c, None) for c in cols},
+    )
+
+
+def evaluation(con: duckdb.DuckDBPyConnection, evaluation_id: str) -> dict | None:
+    """One evaluation row, or None."""
+    cur = con.execute("SELECT * FROM evaluations WHERE evaluation_id = ?", [evaluation_id])
+    cols = [d[0] for d in cur.description]
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
+def _deserialize_obs(rows: list[dict]) -> list[dict]:
+    for row in rows:
+        row["weather"] = json.loads(row["weather"]) if row["weather"] else []
+        row["clouds"] = json.loads(row["clouds"]) if row["clouds"] else []
+    return rows
+
+
+def scoring_window(
+    con: duckdb.DuckDBPyConnection,
+    station: str,
+    valid_from: datetime,
+    valid_to: datetime,
+) -> list[dict]:
+    """Truth obs for scoring (sec 5.4): the HALF-OPEN in-window obs [valid_from,
+    valid_to) -- so an ob exactly at valid_to is excluded, unlike window()'s inclusive
+    BETWEEN -- PLUS the last ob at/before valid_from (carry-in) and the first ob
+    at/after valid_to (interval terminator; never scored). Chronological, JSON
+    deserialized at the boundary."""
+    start, end = _to_naive_utc(valid_from), _to_naive_utc(valid_to)
+    cur = con.execute(
+        "SELECT * FROM ("
+        "  (SELECT * FROM obs WHERE station = ? AND obs_time >= ? AND obs_time < ?)"
+        "  UNION"
+        "  (SELECT * FROM obs WHERE station = ? AND obs_time < ? ORDER BY obs_time DESC LIMIT 1)"
+        "  UNION"
+        "  (SELECT * FROM obs WHERE station = ? AND obs_time >= ? ORDER BY obs_time LIMIT 1)"
+        ") ORDER BY obs_time",
+        [station, start, end, station, start, station, end],
+    )
+    cols = [d[0] for d in cur.description]
+    return _deserialize_obs([dict(zip(cols, r)) for r in cur.fetchall()])

@@ -467,7 +467,84 @@ artificial-forecaster/
   with the climo+imagery working-tree changes). Two follow-ups if wanted: a live `required`-mode run, and a
   recent-valid-time run (obs + built climo) to exercise sanity_checks with real observed data.
 
-## NEXT SESSION -- pick up here (paused 2026-07-09)
+## NEXT SESSION -- pick up here (paused 2026-07-13)
+
+### TAF SCORING SUBSYSTEM built (M0-M3 of docs/taf_score.md) -- 2026-07-13
+Implemented the whole scoring ENGINE from `docs/taf_score.md` (three orthogonal scorers on shared
+primitives). All PURE modules (no duckdb/SQL/network/matplotlib/LLM); naive-UTC throughout; ruff clean.
+- **M0 shared foundation** -- `src/forecaster/tafstate.py`: absolutizer + forecast-state resolver +
+  `opportunities()` + two-view (conservative/union + per-field predominant) hourly truth builder +
+  category classifiers (TAFVER ladders AND DAF A4.1 lower-of) + present-weather normalizer +
+  `predominant_state`/`conservative_state` view reconstructions. Plus `tafparse.explicit_fields` (which
+  fields a group RESTATED vs inherited), the half-open `store.scoring_window` reader, the `tafs` archive +
+  `evaluations` spine (`store.init_scoring_schema`), and `scripts/archive_taf.py`. `test_tafstate.py` 37/37.
+- **M1 amendment busts** -- `src/forecaster/tafamend.py`: 6 build-now doctrine rules (category lower-of,
+  Rule 1 wind, Rule 5 altimeter, Rule 7 TS, Rule 8 TEMPO, Rule 9 BECMG/FM timing) + 3-layer aggregation
+  (hourly -> rule episodes -> deduped amendment triggers) + amd-service remark exclusion + persistence
+  baseline (`tafstate.persistence_taf`). `test_tafamend.py` 20/20.
+- **M2 skill** -- `src/forecaster/tafskill.py`: axis 1 continuous element errors (predominant view,
+  prevailing only; wind/cig/vis + per-group QNH + per-TAF TX/TN), axis 2 event contingency
+  (`EVENT_CATALOG_V1`, POD/FAR/CSI/HSS via `contingency_scores`, min-cost episode timing), axis 3 ordinal
+  MACE; `skill_deltas` benchmark deltas on MATCHED hours only. `test_tafskill.py` 21/21.
+- **M3 TAFVER** -- `src/forecaster/tafver.py`: 7 Table A7.1 MOPs (0/1 + fractional PW CSI), anti-averaging
+  combined = sum(earned)/sum(available), INITIAL/BECMG diagnostic buckets, A7.2 category accuracy+bias,
+  provenance hashes (policy/profile/obs), `fitl_value_added` (refused on any hash mismatch). Provisional-
+  policy labeled. `test_tafver.py` 22/22.
+- **Driver** `scripts/score_taf.py` (`--scorers tafver,amend,skill` + persistence baseline; markdown report)
+  and **`scripts/grade_taf.py`** (NEW): exhaustive HOUR-BY-HOUR audit log -- per-element/per-rule tables that
+  sum explicitly to each headline; handles epoch-prefixed METAR lists + a malformed-TX/TN repair. Non-LLM.
+
+### First real grading (KLSV 112300Z TAF vs supplied 33-ob METAR sequence) + 3 bugs it surfaced
+Ran `grade_taf.py` on a user-supplied military 30h TAF (3 BECMGs, per-group QNH, turbulence group) + its
+METARs. Log: `logs/grade_KLSV_112300Z.md`. Headline: **TAFVER 83.0% (146/176), 5 amend triggers, in-spec
+0.57, MACE 0.0** (dry desert -> cig/vis all cat E). The real TAF exposed 3 genuine bugs (all FIXED + each has
+a regression test):
+1. **TAFVER didn't evolve through BECMGs** -- the baseline opportunity scored the ORIGINAL prevailing for all
+   30h. Fixed: baseline resolves to the EVOLVED prevailing (BECMG folded in once complete).
+2. **Visibility scored `unresolved`** -- the truth-view reconstructions kept vis in METERS but dropped
+   `vis_sm`, and the TAFVER vis classifier keys off statute miles. Fixed `_vis_from_m` in
+   `predominant_state`/`conservative_state` (9999 m -> unlimited; else convert via the Table 8.1 seam).
+3. **BECMG attribution + double-count** (owner-DECIDED policy change): (a) post-BECMG hours are now
+   ATTRIBUTED to the BECMG group, not INITIAL -- `_baseline_segments` splits the timeline at each BECMG's
+   END and labels segments by the governing group (AFMAN: post-valid-time the BECMG prevails); (b) the BECMG
+   transition window is now **BEST-OF** (the hour is correct if obs matches the OLD prevailing OR the
+   "becoming" state -- one row, no double-count) instead of the old DECIDED double-count. `Opportunity` gained
+   `role` + `alternate_indices`; TAFVER folds best-of via `_best_of`/`_score_all`. TEMPO/PROB still emit their
+   own overlay rows (unchanged; align to best-of later if wanted).
+
+### STORE STATUS (important): results are NOT persisted yet
+`tafs` + `evaluations` schema exist, but the per-scorer RESULT tables (`tafver_*`/`tafamend_*`/`tafskill_*`)
+and the batch aggregator readers are DEFERRED to M4 -- a scoring run today produces Python objects + a
+markdown log only (`insert_evaluation` is defined but uncalled; `score_taf.py` scores straight from a
+`--taf-id`/`--taf-text`). Building these + the two-phase pending-evaluation write-path IS M4 step 3.
+
+### M4 PLAN -- paired live collection (decisions locked with owner 2026-07-13)
+Goal: schedule the TAF AGENT to run in parallel with each HUMAN TAF so both are archived FROZEN together
+(leakage-proof: at issue time truth doesn't exist yet). Locked decisions:
+- **(a) run the agent LIVE** at issue time now; snapshot-and-replay of inputs -> (b) later for Batch API/
+  multi-model/reproducibility.
+- **MANUAL fires first** (build the collector as a hand-run command); revisit the trigger (poll AWC for a
+  new official TAF vs fixed clock) after a couple days of watching.
+- **Stations** (all issue live 30h MILITARY TAFs; BUFKIT only exists for civil-co-located ICAOs):
+  `KWRI` (McGuire NJ), `KMIB` (Minot ND), `KSSC` (Shaw SC) are self-covered (GFS+NAM+HRRR); `KBAB` (Beale CA)
+  has NO BUFKIT -> proxy the model-data tools to **`KSMF`** (Sacramento, ~30nm, same valley) while still
+  archiving KBAB's own human TAF + obs. (Coverage probes in this session; KLSV/KLAS pattern.)
+- **Storage:** DuckDB single-writer enforced with a `flock` lockfile (archive-write at issue time vs
+  `--pending` scoring-write later never overlap).
+- **Pi:** unattended collection on an always-on Raspberry Pi (64-bit Pi OS Lite, `uv sync`, `.env`); two
+  cron jobs under `flock`; pull data off via nightly `rsync` (one `.duckdb` file + archived raw + logs).
+  Owner asked for a full Pi runbook when we automate.
+- **Build order:** (1) human-TAF archive path (`awc.fetch_taf` -> `tafs`, canonical=true, producer_kind=human);
+  (2) `scripts/collect.py` -- archive human + run agent + write a PENDING evaluation, NO scoring; (3)
+  `score_taf.py --pending` -- score elapsed windows, flip to scored, BUILD the deferred result tables; (4)
+  Pi/cron + retrieval runbook.
+
+### UNCOMMITTED: everything is still in the working tree
+The entire scoring subsystem (this session) PLUS the earlier climo + imagery + worksheet work are all
+uncommitted. Commit before/at the start of M4. `docs/taf_score.md` is the authoritative scoring blueprint
+(gitignored -- the tracked CODE + persisted policy hashes are the versioned record).
+
+### EARLIER CONTEXT (2026-07-09, predates + is superseded by the scoring subsystem above)
 An earlier session landed ALL 11 fixes from the 2026-07-08 review (that findings doc has since been
 removed now that every item shipped): Tier 1
 (soundings 2h post-lag, get_map f0 default + single run pick, fcstsounding DRCT/SKNT + surface fill
@@ -613,6 +690,19 @@ never-emit -> clean once the loop guard/caps landed.
 - V100 variant (16 vs 32 GB) on assigned nodes.
 - Max GPU job wall-time (persistent-server vs batch eval pattern).
 - Recommended vLLM / container workflow, if any.
+
+## Open questions to confirm with the lead meteorologists (SME)
+TAF scoring design lives in `docs/taf_score.md` (sec 15 has the full SME list). Standing
+follow-ups:
+- HAND-SCORED GOLDEN FIXTURE (gates "official" TAFVER): get a lead meteorologist to score
+  ONE TAF by hand (initial + FM + BECMG + TEMPO groups) against a real METAR/SPECI sequence,
+  so `tafver.py` can be matched BYTE-FOR-BYTE against a human expert's per-element + combined
+  numbers. This proves our DOCTRINE INTERPRETATION is correct; the synthetic self-tests only
+  prove internal consistency. Until it passes, TAFVER output is labeled provisional/benchmark,
+  NOT official. Deliverable is the SME's; we supply the TAF + ob sequence.
+- Installation cig/vis category tables + official published landing minima for the target
+  station(s). v1 uses a FIXED default (200 ft ceiling, 1/2 SM vis) for all stations.
+- Confirm the A7.2 "Table A2.1" = "Table A7.1" typo reading via observed BIFROST behavior.
 
 ## Important caveats
 - Model names and provider prices shift week to week — verify model strings against

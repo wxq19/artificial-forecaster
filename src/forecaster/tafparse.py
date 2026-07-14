@@ -40,6 +40,22 @@ _VA_GRP = re.compile(r"\bVA(\d{3})(\d{3})\b")               # volcanic-ash plume
 _ICING = re.compile(r"\b6(\d)(\d{3})(\d)\b")                # icing 6IchihihitL (1.3.10)
 _TURB = re.compile(r"\b5([\dX])(\d{3})(\d)\b")              # turbulence 5BhBhBhBtL (1.3.11)
 
+# Explicit-vs-omitted field detection (scoring-design sec 5.1). A change group omits
+# a field to CARRY IT FORWARD; the parser otherwise returns empty collections, which
+# are ambiguous with an explicit SKC/NSW. We record which fields each group's raw
+# chunk actually STATED so the scoring resolver can tell "inherit" from an explicit
+# restatement (omitted sky vs SKC, omitted wx vs NSW, calm vs omitted wind, QNH absent
+# on TEMPO). Per-token full-match on the whitespace-split chunk.
+_TOK_WIND = re.compile(r"(?:VRB|\d{3})\d{2,3}(?:G\d{2,3})?(?:KT|MPS)")   # incl 00000KT (calm)
+_TOK_METERS = re.compile(r"[MP]?\d{4}")                     # meters vis 0000-9999
+_TOK_SKY = re.compile(r"(?:FEW|SCT|BKN|OVC)\d{3}(?:CB|TCU)?")
+_TOK_QNH = re.compile(r"QNH\d{4}INS")
+_WX_DESC = "MI|PR|BC|DR|BL|SH|TS|FZ"                        # WMO present-weather grammar
+_WX_PHEN = "DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PY|PO|SQ|FC|SS|DS"
+_TOK_WX = re.compile(rf"(?:[+-]|VC)?(?:(?:{_WX_DESC})(?:{_WX_PHEN})*|(?:{_WX_PHEN})+)")
+# The field keys explicit_fields can hold (the resolver's overlay vocabulary).
+EXPLICIT_FIELD_KEYS = frozenset({"wind", "gust", "visibility", "weather", "sky", "qnh"})
+
 
 class TafTemp(BaseModel):
     temp_c: int                # forecast max (TX) or min (TN) temperature
@@ -124,6 +140,11 @@ class TafGroup(BaseModel):
     volcanic_ash: "VolcanicAsh | None" = None
     icing: list[IcingLayer] = []
     turbulence: list[TurbulenceLayer] = []
+    # Fields this group's raw chunk EXPLICITLY stated (scoring-design sec 5.1); a
+    # subset of EXPLICIT_FIELD_KEYS. Empty on a change group means "everything
+    # inherited"; empty when chunk alignment failed means "unknown" (parse() only
+    # populates it where _split_periods aligns 1:1). Not part of round-trip/render.
+    explicit_fields: set[str] = set()
 
 
 class TafObs(BaseModel):
@@ -275,6 +296,31 @@ def _recover_showers(chunk: str, weather: list[str]) -> None:
             weather.append(tok)
 
 
+def _explicit_fields(chunk: str) -> set[str]:
+    """Which forecast fields the raw chunk EXPLICITLY states (sec 5.1). Whitespace-
+    tokenize + classify each token; the change keyword, validity (has a slash) and
+    header tokens match nothing. KNOWN limitation: meters-vis detection can false-
+    positive on a 4-digit REMARK numeral (AF remarks have no delimiter), so the
+    scoring path strips remarks into parse_body before parsing human TAFs."""
+    fields: set[str] = set()
+    for tok in chunk.split():
+        if _TOK_WIND.fullmatch(tok):
+            fields.add("wind")
+            if "G" in tok:
+                fields.add("gust")
+        elif tok == "CAVOK":                        # implies clear vis + sky + weather
+            fields |= {"visibility", "sky", "weather"}
+        elif tok.endswith("SM") or _TOK_METERS.fullmatch(tok):
+            fields.add("visibility")
+        elif _TOK_SKY.fullmatch(tok) or tok in _SKY_CLEAR or _VV.fullmatch(tok):
+            fields.add("sky")
+        elif _TOK_QNH.fullmatch(tok):
+            fields.add("qnh")
+        elif tok == "NSW" or _TOK_WX.fullmatch(tok):
+            fields.add("weather")
+    return fields
+
+
 def _recover_hazards(chunk: str, g: TafGroup) -> None:
     """Re-attach the AF total-obscuration + hazard groups the library drops/ignores
     (VV, WS, VA, icing, turbulence). Mutates `g` in place. Heights are hundreds of feet."""
@@ -326,6 +372,9 @@ def parse(line: str) -> TafObs:
             if cq := _QNH.search(chunk):     # military TAFs carry a QNH per group
                 period.qnh_inhg = int(cq.group(1)) / 100
             _recover_hazards(chunk, period)
+            # Record which fields this chunk explicitly stated (sec 5.1). Only here,
+            # inside the 1:1 alignment guard -- unaligned parses leave it empty/unknown.
+            period.explicit_fields = _explicit_fields(chunk)
 
     return TafObs(
         station=t.station,
