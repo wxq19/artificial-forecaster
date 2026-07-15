@@ -17,7 +17,8 @@ from pathlib import Path
 from forecaster import soundings
 from forecaster.config import settings
 from forecaster.llm import client
-from forecaster.tools import _image_mime, final_answer
+from forecaster.agent import final_answer
+from forecaster.tools import _image_mime
 
 _ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 _ap.add_argument("--model", default=settings.llm_model, help="model id override (default: .env)")

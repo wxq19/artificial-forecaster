@@ -8,7 +8,6 @@ Only read tools are registered here — that's the menu the model is limited to.
 Results come back as compact text the VLM can reason over.
 """
 
-import base64
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -27,7 +26,7 @@ from forecaster.worksheet import TafWorksheet
 class ToolResult:
     """What a tool hands back to the loop: a REQUIRED text receipt (a tool reply
     must be text in the OpenAI format) plus any rendered PNGs. Charts reach the
-    model as images via tool_messages(), which wraps each PNG in a follow-up user
+    model as images by the agent loop, which wraps each PNG in a follow-up user
     message. `images` is a list so one call can return several charts (v2)."""
 
     text: str
@@ -1182,9 +1181,9 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
         con.close()
 
 
-# NOTE: tool_messages and final_answer are agent-loop plumbing, not tool
-# definitions. They live here for now only because every driver imports `tools`;
-# move them to a dedicated `agent.py` once that module exists (see CLAUDE.md).
+# _image_mime stays here: it is a tool-output format helper (tools.py sniffs image
+# bytes for get_imagery AND for the ToolResult images the agent loop renders). The
+# agent-loop plumbing (final_answer, tool_messages, window_conflict) lives in agent.py.
 def _image_mime(data: bytes) -> str:
     """Content type from magic bytes. A meteogram is PNG, but a fetched skew-T can be
     a GIF (SPC) or PNG (Wyoming), and a vision model rejects an image whose data URL
@@ -1194,70 +1193,3 @@ def _image_mime(data: bytes) -> str:
     if data[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
     return "image/png"
-
-
-def tool_messages(call_id: str, result: ToolResult) -> list[dict]:
-    """Turn a ToolResult into the messages to append after a tool call: the
-    required text receipt (role 'tool'), plus — if the tool returned images — a
-    follow-up 'user' message carrying each image as a base64 image_url, since a tool
-    reply can't hold an image in the OpenAI format. Returns 1 or 2 messages."""
-    msgs: list[dict] = [
-        {"role": "tool", "tool_call_id": call_id, "content": result.text}
-    ]
-    if result.images:
-        content: list[dict] = [
-            {"type": "text", "text": "Image(s) from the tool call:"}
-        ]
-        for img in result.images:
-            b64 = base64.b64encode(img).decode()
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{_image_mime(img)};base64,{b64}"},
-            })
-        msgs.append({"role": "user", "content": content})
-    return msgs
-
-
-def final_answer(msg, finish_reason: str | None) -> tuple[str, str | None]:
-    """Pull the model's answer out of a completed (no-tool-call) message.
-
-    A reasoning model can leave `content` EMPTY while spilling the whole answer
-    into `reasoning`, and still stop cleanly (finish_reason 'stop', NOT 'length').
-    Reading content alone then logs a CORRECT answer as blank — a silent scoring
-    bug. Guard it: on empty content + clean stop, fall back to reasoning and
-    return a flag so the caller can mark the run instead of recording a miss.
-    Returns (answer_text, flag); flag is None when content was present as normal.
-    """
-    content = (msg.content or "").strip()
-    reasoning = (getattr(msg, "reasoning", None) or "").strip()
-    if content:
-        return content, None
-    if reasoning and finish_reason == "stop":
-        return reasoning, "recovered from reasoning field (content empty, clean stop)"
-    if finish_reason == "length":
-        return (
-            "_(empty — ran out of tokens; raise MAX_TOKENS)_",
-            "content empty: finish_reason=length",
-        )
-    return "_(empty — no content and no reasoning)_", "content empty: no reasoning either"
-
-
-def window_conflict(windows: list) -> str | None:
-    """windows: list of (tool_label, (start, end)) gathered across the WHOLE
-    conversation. If more than one DISTINCT window is present, return an advisory
-    note listing each — non-blocking; the model decides if it's intentional. Pure;
-    the caller dedupes before injecting. (Loop plumbing -> agent.py later.)"""
-    distinct: dict = {}
-    for label, win in windows:
-        distinct.setdefault(win, []).append(label)
-    if len(distinct) <= 1:
-        return None
-    lines = [
-        "Heads up: your tool calls are not all looking at the same time period. "
-        "If that is intentional, carry on; otherwise re-query so the windows align:"
-    ]
-    for (start, end), labels in distinct.items():
-        lines.append(
-            f"  {', '.join(labels)}: {start:%Y-%m-%dT%H:%MZ} .. {end:%Y-%m-%dT%H:%MZ}"
-        )
-    return "\n".join(lines)

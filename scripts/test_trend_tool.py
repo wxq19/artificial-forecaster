@@ -1,6 +1,6 @@
 """End-to-end test of the IMAGE-returning tool path: ask a trend question, the
 model calls get_trend, our code renders a meteogram (PNG) and feeds it BACK into
-the conversation as a base64 image (via tools.tool_messages), and the model
+the conversation as a base64 image (via agent.tool_messages), and the model
 reasons over the chart it can now see. This is the plumbing every future chart
 tool needs. Writes a markdown log under logs/ that embeds the rendered PNG (saved
 to data/charts/temp/) so you can see exactly what the model saw.
@@ -17,7 +17,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from forecaster import iem, store, tools
+from forecaster import agent, iem, store, tools
 from forecaster.config import settings
 from forecaster.llm import client
 
@@ -91,7 +91,7 @@ for _turn in range(MAX_TURNS):
         transcript.append(("model reasoning", reasoning))
 
     if not msg.tool_calls:
-        answer, flag = tools.final_answer(msg, finish_reason)
+        answer, flag = agent.final_answer(msg, finish_reason)
         if flag:
             transcript.append(("harness note", flag))
         transcript.append(("model answer", answer))
@@ -105,7 +105,7 @@ for _turn in range(MAX_TURNS):
         transcript.append(("tool call", f"{tc.function.name}({json.dumps(args)})"))
         result = tools.run_tool(tc.function.name, args)
         transcript.append(("tool result", result.text))
-        out = tools.tool_messages(tc.id, result)
+        out = agent.tool_messages(tc.id, result)
         messages.append(out[0])              # tool receipt first
         image_msgs.extend(out[1:])           # image-bearing user message deferred
         for png in result.images:            # persist + log what the model saw

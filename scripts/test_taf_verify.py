@@ -18,7 +18,7 @@ from pathlib import Path
 from forecaster import awc, metar, store, tafparse as taf
 from forecaster.config import settings
 from forecaster.llm import client
-from forecaster.tools import final_answer
+from forecaster.agent import final_answer
 
 STATION = "KIND"
 HOURS = 24

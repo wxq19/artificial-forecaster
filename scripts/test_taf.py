@@ -14,7 +14,7 @@ from pathlib import Path
 from forecaster import awc, tafparse as taf
 from forecaster.config import settings
 from forecaster.llm import client
-from forecaster.tools import final_answer
+from forecaster.agent import final_answer
 
 STATIONS = ["KADW", "KORD", "EGLL"]  # military (QNH/m) | US civilian (SM/FM) | intl (CAVOK/PROB)
 FOCUS = "KADW"                        # the TAF fed to the model

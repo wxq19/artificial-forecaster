@@ -18,10 +18,11 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from forecaster import soundings, tools
+from forecaster import agent, soundings, tools
 from forecaster.config import settings
 from forecaster.llm import client
-from forecaster.tools import GET_SOUNDING, final_answer, run_tool
+from forecaster.agent import final_answer
+from forecaster.tools import GET_SOUNDING, run_tool
 
 _ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 _ap.add_argument("--site", default="MPX", help="upper-air site id in the provider's namespace (default: MPX)")
@@ -110,7 +111,7 @@ for n in range(1, MAX_STEPS + 1):
             res = run_tool(tc.function.name, args)
         rec["calls"].append({"name": tc.function.name, "args": tc.function.arguments,
                              "receipt": res.text, "n_images": len(res.images)})
-        messages += tools.tool_messages(tc.id, res)
+        messages += agent.tool_messages(tc.id, res)
     steps.append(rec)
 
 

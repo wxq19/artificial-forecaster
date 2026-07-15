@@ -11,7 +11,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from forecaster import iem, store, tools
+from forecaster import agent, iem, store, tools
 from forecaster.config import settings
 from forecaster.llm import client
 
@@ -73,7 +73,7 @@ for _turn in range(MAX_TURNS):
     if reasoning := getattr(msg, "reasoning", None):
         transcript.append(("model reasoning", reasoning))
     if not msg.tool_calls:
-        answer, flag = tools.final_answer(msg, finish_reason)
+        answer, flag = agent.final_answer(msg, finish_reason)
         if flag:
             transcript.append(("harness note", flag))
         transcript.append(("model answer", answer))
@@ -88,7 +88,7 @@ for _turn in range(MAX_TURNS):
         transcript.append(("tool result", result.text))
         if result.window:
             seen_windows.append((tc.function.name, result.window))
-        out = tools.tool_messages(tc.id, result)
+        out = agent.tool_messages(tc.id, result)
         messages.append(out[0])
         image_msgs.extend(out[1:])
         for png in result.images:
@@ -97,7 +97,7 @@ for _turn in range(MAX_TURNS):
             saved_images.append(p)
             transcript.append(("tool image", f"![chart](../{p})"))
     messages.extend(image_msgs)
-    note = tools.window_conflict(seen_windows)
+    note = agent.window_conflict(seen_windows)
     if note and note != last_note:
         note_fired = True
         messages.append({"role": "user", "content": note})

@@ -12,7 +12,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from forecaster import iem, store, tools
+from forecaster import agent, iem, store, tools
 from forecaster.config import settings
 from forecaster.llm import client
 
@@ -77,7 +77,7 @@ def run_scenario(tag: str, system: str, toolset: list) -> dict:
         if reasoning := getattr(msg, "reasoning", None):
             transcript.append(("model reasoning", reasoning))
         if not msg.tool_calls:
-            answer, flag = tools.final_answer(msg, finish)
+            answer, flag = agent.final_answer(msg, finish)
             if flag:
                 transcript.append(("harness note", flag))
             transcript.append(("model answer", answer))
@@ -90,7 +90,7 @@ def run_scenario(tag: str, system: str, toolset: list) -> dict:
             transcript.append(("tool call", f"{tc.function.name}({json.dumps(args)})"))
             result = tools.run_tool(tc.function.name, args)
             transcript.append(("tool result", result.text))
-            out = tools.tool_messages(tc.id, result)
+            out = agent.tool_messages(tc.id, result)
             messages.append(out[0])
             image_msgs.extend(out[1:])
             for png in result.images:

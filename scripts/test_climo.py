@@ -13,7 +13,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from forecaster import store, tools
+from forecaster import agent, store, tools
 from forecaster.config import settings
 from forecaster.llm import client
 
@@ -78,7 +78,7 @@ for _turn in range(MAX_TURNS):
     if reasoning := getattr(msg, "reasoning", None):
         transcript.append(("model reasoning", reasoning))
     if not msg.tool_calls:
-        answer, flag = tools.final_answer(msg, finish_reason)
+        answer, flag = agent.final_answer(msg, finish_reason)
         if flag:
             transcript.append(("note", flag))
         transcript.append(("model answer", answer))

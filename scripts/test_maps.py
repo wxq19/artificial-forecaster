@@ -18,7 +18,8 @@ from pathlib import Path
 from forecaster import wxmaps
 from forecaster.config import settings
 from forecaster.llm import client
-from forecaster.tools import _image_mime, final_answer
+from forecaster.agent import final_answer
+from forecaster.tools import _image_mime
 
 TEMPERATURE = 0.2
 MAX_TOKENS = 12288          # reasoning models spend tokens thinking; leave room for the answer

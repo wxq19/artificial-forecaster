@@ -21,7 +21,8 @@ from pathlib import Path
 from forecaster import tools
 from forecaster.config import settings
 from forecaster.llm import client
-from forecaster.tools import GET_IMAGERY, final_answer, run_tool
+from forecaster.agent import final_answer
+from forecaster.tools import GET_IMAGERY, run_tool
 
 _ap = argparse.ArgumentParser(description=__doc__,
                               formatter_class=argparse.RawDescriptionHelpFormatter)

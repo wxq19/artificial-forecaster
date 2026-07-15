@@ -5,27 +5,24 @@ queries (query_obs/get_latest_obs), the meteogram (get_trend), observed + model-
 soundings (get_sounding/get_fcst_sounding), synoptic charts (get_map), an hourly point
 forecast (get_point_forecast), and the emit_taf OUTPUT tool -- and asks each to produce a
 30-hour AF TAF for KLSV valid 2300Z. The model drives: it decides which tools to call,
-reasons over text + image results, then emits a TAF and corrects AFMAN findings. This is
-the first end-to-end exercise of the whole agent loop, so we can see how each model
-orchestrates the tools. The full transcript (per model: reasoning, every tool call, the
-emitted TAFs + findings, the final TAF, tools-used tally, tokens) -> a markdown log.
+reasons over text + image results, then emits a TAF and corrects AFMAN findings. The loop
+itself now lives in forecaster.agent (run_agent); this driver just builds the prompt +
+config, runs it per model, and renders the transcript (per model: reasoning, every tool
+call, the emitted TAFs + findings, the final TAF, tools-used tally, tokens) to a markdown log.
 
 KLSV (Nellis AFB) has surface obs but NO BUFKIT model output, so the prompt points the
 model at nearby KLAS for the model-forecast tools (a realistic proxy).
 """
 
 import argparse
-import base64
-import json
 import tempfile
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from forecaster import awc, store, tafgen, tools
+from forecaster import awc, store, tafgen
+from forecaster.agent import AgentConfig, RunResult, run_agent
 from forecaster.config import settings
-from forecaster.llm import client
-from forecaster.tools import EMIT_TAF, TOOLS, final_answer, run_tool
+from forecaster.tools import EMIT_TAF, TOOLS
 
 _ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 _ap.add_argument("--station", default="KLSV")
@@ -94,107 +91,28 @@ TASK = (
 )
 
 
-def run_model(label: str, model: str) -> dict:
-    """Drive the full tool loop for one model. Returns a record for the log."""
-    messages = [{"role": "system", "content": SYSTEM},
-                {"role": "user", "content": TASK}]
-    steps: list[dict] = []
-    used: Counter = Counter()
-    final_taf = last_taf = None
-    ptok = ctok = 0
-    first_emit_n = nudge_n = None      # convergence tracking (#9)
-    for n in range(1, MAX_STEPS + 1):
-        try:
-            r = client.chat.completions.create(
-                model=model, messages=messages, tools=TOOLSET, tool_choice="auto",
-                temperature=TEMPERATURE, max_tokens=MAX_TOKENS,
-            )
-        except Exception as e:  # noqa: BLE001 -- a model that rejects the toolset is a finding
-            steps.append({"n": n, "error": f"{type(e).__name__}: {e}"})
-            return {"label": label, "model": model, "steps": steps, "used": used,
-                    "final_taf": final_taf, "last_taf": last_taf, "ptok": ptok, "ctok": ctok,
-                    "convergence": "fatal", "nudge_n": nudge_n, "fatal": f"{type(e).__name__}: {e}"}
-        ptok += r.usage.prompt_tokens
-        ctok += r.usage.completion_tokens
-        msg = r.choices[0].message
-        tcs = msg.tool_calls or []
-        rec = {"n": n, "finish": r.choices[0].finish_reason,
-               "ptok": r.usage.prompt_tokens, "ctok": r.usage.completion_tokens,
-               "content": (msg.content or "").strip(),
-               "reasoning": (getattr(msg, "reasoning", None) or "").strip(), "calls": []}
-
-        if not tcs:
-            answer, recovery = final_answer(msg, r.choices[0].finish_reason)
-            rec["answer"] = answer
-            rec["recovery"] = recovery
-            steps.append(rec)
-            break
-
-        messages.append({"role": "assistant", "content": msg.content, "tool_calls": [
-            {"id": tc.id, "type": "function",
-             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in tcs]})
-        images: list[tuple[str, bytes]] = []   # (receipt first line, png) -> label each image
-        for tc in tcs:
-            name = tc.function.name
-            used[name] += 1
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError as e:
-                messages.append({"role": "tool", "tool_call_id": tc.id,
-                                 "content": f"error: unparseable arguments: {e}"})
-                rec["calls"].append({"name": name, "args": tc.function.arguments[:120],
-                                     "result": f"unparseable args: {e}"})
-                continue
-            cap = TOOL_CAPS.get(name)
-            if cap is not None and used[name] > cap:      # capped: feed back, don't execute (#9c)
-                capped = (f"cap reached: {name} may be called at most {cap} times per run; "
-                          "you have enough data -- reason and call emit_taf.")
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": capped})
-                rec["calls"].append({"name": name, "args": "(capped)", "result": capped[:160]})
-                continue
-            if name == "emit_taf" and first_emit_n is None:
-                first_emit_n = n                          # first convergence attempt (#9)
-            res = run_tool(name, args, db_path=DB_PATH)
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": res.text})
-            label_line = res.text.splitlines()[0] if res.text else name
-            images += [(label_line, im) for im in res.images]
-            if name == "emit_taf" and res.taf is not None:
-                last_taf = res.taf
-                if not tafgen.validate(res.taf):
-                    final_taf = res.taf
-            rec["calls"].append({"name": name, "args": json.dumps(args)[:160],
-                                 "result": res.text.splitlines()[0][:160],
-                                 "n_images": len(res.images)})
-        if images:
-            # Interleave a label before each image so a multi-image turn (e.g. several
-            # forecast soundings) can't lose which image goes with which tool call.
-            content = [{"type": "text", "text": "Images from the tool calls above, each "
-                        "preceded by its tool's receipt line:"}]
-            for label_line, im in images:
-                content.append({"type": "text", "text": f"[image for: {label_line}]"})
-                b64 = base64.b64encode(im).decode()
-                content.append({"type": "image_url",
-                                "image_url": {"url": f"data:{tools._image_mime(im)};base64,{b64}"}})
-            messages.append({"role": "user", "content": content})
-        # One-time convergence nudge (#9b): budget nearly spent and no emit attempt yet.
-        # User role, not system (Together 400s on mid-conversation system messages).
-        if n == MAX_STEPS - 2 and first_emit_n is None and nudge_n is None:
-            messages.append({"role": "user", "content":
-                "You have used most of your turns and have not emitted a TAF yet. You have "
-                "enough data -- stop gathering, reason briefly, and call emit_taf now."})
-            nudge_n = n
-        steps.append(rec)
-        if final_taf is not None:
-            break
-    convergence = ("never" if first_emit_n is None else
-                   "nudged" if nudge_n is not None else "unprompted")
-    return {"label": label, "model": model, "steps": steps, "used": used,
-            "final_taf": final_taf, "last_taf": last_taf, "ptok": ptok, "ctok": ctok,
-            "convergence": convergence, "nudge_n": nudge_n, "fatal": None}
+def run_model(label: str, model: str) -> tuple[str, RunResult]:
+    """Drive the full tool loop for one model via the shared agent loop."""
+    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": TASK}]
+    cfg = AgentConfig(
+        model=model, toolset=TOOLSET, max_steps=MAX_STEPS, max_tokens=MAX_TOKENS,
+        temperature=TEMPERATURE, tool_caps=TOOL_CAPS, evidence=False,
+        step_budget_nudge=True, db_path=DB_PATH,
+    )
+    return label, run_agent(messages, cfg)
 
 
 results = [run_model(label, model) for label, model in MODELS]
+
+
+def _outcome(res: RunResult) -> str:
+    if res.fatal:
+        return f"FATAL: {res.fatal[:60]}"
+    if res.final_taf is not None:
+        return "clean TAF"
+    if res.last_taf is not None:
+        return f"TAF w/ {len(tafgen.validate(res.last_taf))} findings"
+    return "no TAF emitted"
 
 
 def build_markdown() -> str:
@@ -215,19 +133,12 @@ def build_markdown() -> str:
         "| Model | Steps | Converge | Tools used | Outcome | End ctx (ptok) | Tokens (p+c) |",
         "|---|---|---|---|---|---|---|",
     ]
-    for res in results:
-        used = ", ".join(f"{k}x{v}" for k, v in res["used"].items()) or "(none)"
-        if res["fatal"]:
-            outcome = f"FATAL: {res['fatal'][:60]}"
-        elif res["final_taf"] is not None:
-            outcome = "clean TAF"
-        elif res["last_taf"] is not None:
-            outcome = f"TAF w/ {len(tafgen.validate(res['last_taf']))} findings"
-        else:
-            outcome = "no TAF emitted"
-        end_ctx = res["steps"][-1].get("ptok", "-") if res["steps"] else "-"
-        md.append(f"| {res['label']} | {len(res['steps'])} | {res.get('convergence', '-')} | "
-                  f"{used} | {outcome} | {end_ctx} | {res['ptok']}+{res['ctok']} |")
+    for label, res in results:
+        used = ", ".join(f"{k}x{v}" for k, v in res.used.items()) or "(none)"
+        conv = "fatal" if res.fatal else res.convergence
+        end_ctx = res.steps[-1].prompt_tokens if res.steps else "-"
+        md.append(f"| {label} | {len(res.steps)} | {conv} | {used} | {_outcome(res)} | "
+                  f"{end_ctx} | {res.prompt_tokens}+{res.completion_tokens} |")
     md += ["",
            "> Cost note: every turn re-sends the ENTIRE conversation -- including every image "
            "returned so far -- as fresh PROMPT tokens, so prompt tokens dominate and grow each "
@@ -236,30 +147,27 @@ def build_markdown() -> str:
            "(huge completion); read both columns. Convergence: unprompted (emitted before the "
            "nudge) / nudged (only after the step-{n-2} nudge) / never."]
 
-    for res in results:
-        md += ["", "---", "", f"## {res['label']} (`{res['model']}`)"]
-        if res["fatal"]:
-            md += ["", f"**FATAL:** `{res['fatal']}`"]
-        for s in res["steps"]:
-            tok = f" -- {s['ptok']} ptok / {s['ctok']} ctok" if "ptok" in s else ""
-            md += ["", f"### Step {s['n']} (finish: `{s.get('finish', '?')}`){tok}"]
-            if res.get("nudge_n") == s["n"]:
+    for label, res in results:
+        md += ["", "---", "", f"## {label} (`{res.model}`)"]
+        if res.fatal:
+            md += ["", f"**FATAL:** `{res.fatal}`"]
+        for s in res.steps:
+            md += ["", f"### Step {s.n} (finish: `{s.finish_reason}`) -- "
+                   f"{s.prompt_tokens} ptok / {s.completion_tokens} ctok"]
+            if res.nudge_step == s.n:
                 md += ["", "> harness: convergence nudge injected (budget nearly spent, no emit)."]
-            if s.get("error"):
-                md += [f"- error: `{s['error']}`"]
-                continue
-            if s["reasoning"]:
-                md += ["", "**Reasoning:**", "", "```text", s["reasoning"], "```"]
-            if s["content"]:
-                md += ["", "**Reply:**", "", "```text", s["content"], "```"]
-            for c in s["calls"]:
+            if s.reasoning:
+                md += ["", "**Reasoning:**", "", "```text", s.reasoning, "```"]
+            if s.content:
+                md += ["", "**Reply:**", "", "```text", s.content, "```"]
+            for c in s.calls:
                 img = f" [{c['n_images']} img]" if c.get("n_images") else ""
                 md += [f"- `{c['name']}({c['args']})`{img} -> {c['result']}"]
-            if s.get("answer"):
-                md += ["", "**Final answer:**", "", s["answer"]]
-                if s.get("recovery"):
-                    md += ["", f"> harness note: {s['recovery']}"]
-        taf = res["final_taf"] or res["last_taf"]
+            if s.answer:
+                md += ["", "**Final answer:**", "", s.answer]
+                if s.recovery:
+                    md += ["", f"> harness note: {s.recovery}"]
+        taf = res.final_taf or res.last_taf
         if taf is not None:
             md += ["", "**Emitted TAF:**", "", "```text"]
             try:
@@ -267,8 +175,7 @@ def build_markdown() -> str:
             except Exception as e:  # noqa: BLE001
                 md += [f"(render failed: {e})"]
             md += ["```"]
-            findings = tafgen.validate(taf)
-            md += [f"- AFMAN findings: {findings or 'clean'}"]
+            md += [f"- AFMAN findings: {tafgen.validate(taf) or 'clean'}"]
     return "\n".join(md)
 
 
@@ -279,11 +186,9 @@ log_path = log_dir / f"taf_agent_{STATION}_{stamp}.md"
 log_path.write_text(build_markdown(), encoding="utf-8")
 
 print(f"=== Full-agent TAF test -- {STATION} valid {VALID:%d%H%M}Z ({n_obs} obs) ===")
-for res in results:
-    used = ", ".join(f"{k}x{v}" for k, v in res["used"].items()) or "(none)"
-    outcome = ("FATAL" if res["fatal"] else "clean TAF" if res["final_taf"]
-               else f"{len(tafgen.validate(res['last_taf']))} findings" if res["last_taf"]
-               else "no TAF")
-    print(f"  {res['label']:<8} {len(res['steps'])} steps | {res.get('convergence', '-'):<10} | "
-          f"{outcome:<12} | {res['ptok']}p+{res['ctok']}c | tools: {used}")
+for label, res in results:
+    used = ", ".join(f"{k}x{v}" for k, v in res.used.items()) or "(none)"
+    conv = "fatal" if res.fatal else res.convergence
+    print(f"  {label:<8} {len(res.steps)} steps | {conv:<10} | {_outcome(res):<20} | "
+          f"{res.prompt_tokens}p+{res.completion_tokens}c | tools: {used}")
 print(f"\nFull transcript -> {log_path}")
