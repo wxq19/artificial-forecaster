@@ -729,6 +729,81 @@ def evaluation(con: duckdb.DuckDBPyConnection, evaluation_id: str) -> dict | Non
     return dict(zip(cols, row)) if row else None
 
 
+# ---------------------------------------------------------------------------
+# Run provenance: one row per AGENT run (M4 persistence layer). The queryable
+# summary of a run -- model, config, tokens, convergence, and REFERENCES to the
+# emitted TAF (tafs), the worksheet (taf_worksheets), and the frozen transcript
+# blob on disk. The transcript itself (the full messages array + images) is a FILE,
+# not a column, per the DB rule. Written by runlog.persist_run; failures are rows
+# too (taf_id NULL, fatal set) -- a model that never converged is benchmark data.
+# ---------------------------------------------------------------------------
+
+_RUNS_DDL = """
+CREATE TABLE IF NOT EXISTS runs (
+    run_id            VARCHAR   NOT NULL,
+    experiment_id     VARCHAR,              -- grouping key: one station x issue-time collection event
+    station           VARCHAR,
+    issue_time_utc    TIMESTAMP,            -- when the run was collected (~ human TAF issue time)
+    valid_from_utc    TIMESTAMP,            -- the TAF window the model was asked to forecast
+    valid_to_utc      TIMESTAMP,
+    producer_kind     VARCHAR,              -- 'artificial' (the agent); a human TAF lives in tafs
+    model             VARCHAR,
+    worksheet_mode    VARCHAR,              -- off | advisory | required
+    config_id         VARCHAR,              -- the (model x worksheet_mode) matrix cell
+    harness_git_sha   VARCHAR,              -- code version that produced the run
+    prompt_tokens     INTEGER,
+    completion_tokens INTEGER,
+    n_steps           INTEGER,
+    n_tool_calls      INTEGER,
+    tools_used_json   JSON,                 -- {tool_name: call_count}
+    stop_reason       VARCHAR,              -- emitted_clean | no_tool_call | max_steps | fatal
+    convergence       VARCHAR,              -- unprompted | nudged | never
+    first_emit_step   INTEGER,
+    nudge_step        INTEGER,
+    taf_id            VARCHAR,              -- the emitted TAF in tafs; NULL on a no-emit/fatal run
+    taf_clean         BOOLEAN,              -- emitted a validate()-clean TAF?
+    worksheet_id      VARCHAR,              -- the worksheet in taf_worksheets, if any
+    transcript_path   VARCHAR,              -- path to messages.json (the frozen transcript blob)
+    fatal             VARCHAR,              -- error string if the run crashed
+    created_at        TIMESTAMP,
+    PRIMARY KEY (run_id)
+);
+"""
+
+
+def init_runs_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the runs table if absent. Idempotent WRITE-path side effect (the
+    read-only tool conn never runs it), like init_scoring_schema/init_worksheet_schema."""
+    con.execute(_RUNS_DDL)
+
+
+def insert_run(con: duckdb.DuckDBPyConnection, run: dict) -> None:
+    """Upsert one run-provenance row (idempotent replace by run_id, so re-persisting a
+    run overwrites rather than duplicates). `run` keys are the runs columns; missing keys
+    default to NULL. Requires init_runs_schema(con)."""
+    cols = [
+        "run_id", "experiment_id", "station", "issue_time_utc", "valid_from_utc",
+        "valid_to_utc", "producer_kind", "model", "worksheet_mode", "config_id",
+        "harness_git_sha", "prompt_tokens", "completion_tokens", "n_steps",
+        "n_tool_calls", "tools_used_json", "stop_reason", "convergence",
+        "first_emit_step", "nudge_step", "taf_id", "taf_clean", "worksheet_id",
+        "transcript_path", "fatal", "created_at",
+    ]
+    con.execute("DELETE FROM runs WHERE run_id = ?", [run["run_id"]])
+    con.execute(
+        f"INSERT INTO runs ({', '.join(cols)}) VALUES ({', '.join('$' + c for c in cols)})",
+        {c: run.get(c, None) for c in cols},
+    )
+
+
+def run(con: duckdb.DuckDBPyConnection, run_id: str) -> dict | None:
+    """One run-provenance row (JSON columns come back as strings), or None."""
+    cur = con.execute("SELECT * FROM runs WHERE run_id = ?", [run_id])
+    cols = [d[0] for d in cur.description]
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
 def _deserialize_obs(rows: list[dict]) -> list[dict]:
     for row in rows:
         row["weather"] = json.loads(row["weather"]) if row["weather"] else []
