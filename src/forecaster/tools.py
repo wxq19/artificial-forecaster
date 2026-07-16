@@ -343,6 +343,28 @@ GET_IMAGERY = {
     },
 }
 
+GET_PREVIOUS_TAF = {
+    "type": "function",
+    "function": {
+        "name": "get_previous_taf",
+        "description": (
+            "Return the PREVIOUS official TAF for this airport -- the human forecast that "
+            "was in effect just before your issue time -- for continuity: what the last "
+            "forecaster expected and whether conditions have since diverged. Read from the "
+            "archive (NOT live) and pre-filtered to before your cutoff, so it is never the "
+            "forecast you are being compared against. Returns raw text plus a decoded "
+            "per-period summary. Reason independently; do not copy it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KWRI"},
+            },
+            "required": ["station"],
+        },
+    },
+}
+
 GET_CURRENT_TAF = {
     "type": "function",
     "function": {
@@ -629,6 +651,26 @@ def _get_current_taf(args: dict) -> ToolResult:
     issue, raw = tafs[0]                          # most recent issuance for this station
     lines = [f"Current official TAF for {icao} (issued {issue:%Y-%m-%dT%H:%MZ}, source "
              "aviationweather.gov). This is the human forecast, not truth -- reason "
+             "independently.", "", raw, ""]
+    try:
+        obs = tafparse.parse(raw)
+        lines += ["Decoded per-period summary:", tafparse.render(obs)]
+    except Exception as e:  # noqa: BLE001 -- the raw is always shown; a decode miss is non-fatal
+        lines += [f"(could not decode the TAF: {type(e).__name__}: {e}; the raw text above stands)"]
+    return ToolResult("\n".join(lines))
+
+
+def _get_previous_taf(con, station: str) -> ToolResult:
+    """Return the most recent PRIOR official TAF for continuity -- read from the per-run
+    archive (NOT live), which the collector pre-loaded with ONLY the pre-cutoff bulletin,
+    so it can never be the forecast being scored. Raw + decoded, mirroring get_current_taf."""
+    row = store.previous_human_taf(con, station)
+    if not row:
+        return ToolResult(f"No previous TAF is on file for {station} before your issue time "
+                          "(e.g. this is the first cycle collected here). Reason from the data.")
+    issue, raw = row["issue_time_utc"], row["raw_taf"]
+    lines = [f"Previous official TAF for {station} (issued {issue:%Y-%m-%dT%H:%MZ}; the forecast "
+             "in effect before your issue time). Continuity reference, not truth -- reason "
              "independently.", "", raw, ""]
     try:
         obs = tafparse.parse(raw)
@@ -1153,6 +1195,8 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
         if not station:
             return ToolResult('error: this tool needs a "station" ICAO id, e.g. "station": "KBLV"')
         station = str(station).upper()
+        if name == "get_previous_taf":
+            return _get_previous_taf(con, station)
         if name == "query_obs":
             start, end, err = _resolve_window(con, station, args)
             if err:

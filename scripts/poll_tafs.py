@@ -40,9 +40,11 @@ def main() -> int:
                 continue
             total_seen += summ["archived"]
             total_new += len(summ["new"])
-            tag = f"NEW x{len(summ['new'])}" if summ["new"] else "no change"
-            detail = f" {summ['new']}" if summ["new"] else ""
-            print(f"  {icao}: {tag} ({summ['archived']} current){detail}")
+            if summ["new"]:
+                detail = ", ".join(f"{bt} {tid.split('-')[1]}Z" for tid, bt in summ["new_bulletins"])
+                print(f"  {icao}: NEW x{len(summ['new'])} ({detail})")
+            else:
+                print(f"  {icao}: no change ({summ['archived']} current)")
             for raw, err in summ["errors"]:
                 print(f"    ! parse error: {err} :: {raw[:60]}")
 

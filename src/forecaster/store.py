@@ -471,6 +471,30 @@ def rebuild_climo(
     return {"station": station, "months": [dict(zip(cols, r)) for r in written]}
 
 
+def copy_climo(con: duckdb.DuckDBPyConnection, src_db_path: str, station: str) -> int:
+    """Copy a station's climo_* PRODUCT rows from another benchmark DB into `con` (e.g. a
+    per-run collection DB) so get_climo works there without a rebuild. Leakage-safe: climo
+    is a historical product (end_year = last complete year). Creates the climo schema on
+    `con`, ATTACHes the source read-only, and copies meta/monthly/hourly for the station.
+    Returns the monthly rows copied (0 if the source has no climo for the station yet).
+    Hold write_lock on src if the poller may be writing it."""
+    init_climo_schema(con)
+    try:
+        con.execute(f"ATTACH '{src_db_path}' AS climosrc (READ_ONLY)")
+    except duckdb.Error:
+        return 0
+    try:
+        for tbl in ("climo_meta", "climo_monthly", "climo_hourly"):
+            con.execute(f"INSERT INTO {tbl} SELECT * FROM climosrc.{tbl} WHERE station = ?",
+                        [station])
+        return con.execute(
+            "SELECT count(*) FROM climo_monthly WHERE station = ?", [station]).fetchone()[0]
+    except duckdb.Error:
+        return 0
+    finally:
+        con.execute("DETACH climosrc")
+
+
 def climo_meta(con: duckdb.DuckDBPyConnection, station: str) -> dict | None:
     """The station's climo metadata row, or None if not built."""
     cur = con.execute("SELECT * FROM climo_meta WHERE station = ?", [station])
@@ -723,6 +747,25 @@ def taf(con: duckdb.DuckDBPyConnection, taf_id: str) -> dict | None:
     """One archived TAF row (JSON columns come back as strings; json.loads at the
     boundary if needed), or None."""
     cur = con.execute("SELECT * FROM tafs WHERE taf_id = ?", [taf_id])
+    cols = [d[0] for d in cur.description]
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
+def previous_human_taf(con: duckdb.DuckDBPyConnection, station: str,
+                       before: datetime | None = None) -> dict | None:
+    """The most recent HUMAN/official TAF for a station, optionally issued STRICTLY before
+    `before` (naive UTC). Feeds the leakage-safe get_previous_taf: the collector reads this
+    from the benchmark archive and loads exactly that one bulletin into the per-run DB, so
+    the model sees the forecast a human had in hand, never the one it is scored against.
+    Returns the tafs row dict (JSON columns as strings) or None."""
+    sql = "SELECT * FROM tafs WHERE station = ? AND producer_kind IN ('human', 'official')"
+    params: list = [station]
+    if before is not None:
+        sql += " AND issue_time_utc < ?"
+        params.append(before)
+    sql += " ORDER BY issue_time_utc DESC LIMIT 1"
+    cur = con.execute(sql, params)
     cols = [d[0] for d in cur.description]
     row = cur.fetchone()
     return dict(zip(cols, row)) if row else None

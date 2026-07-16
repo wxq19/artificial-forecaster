@@ -194,6 +194,7 @@ def load_taf(
             continue
         rows.append(row)
 
+    new_bulletins: list[tuple[str, str]] = []       # (taf_id, bulletin_type) for the new rows
     con = store.connect(db_path) if db_path else store.connect()
     try:
         store.init_scoring_schema(con)
@@ -201,6 +202,7 @@ def load_taf(
             seen_ids.append(row["taf_id"])
             if store.insert_taf(con, row):
                 new_ids.append(row["taf_id"])
+                new_bulletins.append((row["taf_id"], row["bulletin_type"]))
     finally:
         con.close()
 
@@ -208,6 +210,7 @@ def load_taf(
         "station": station,
         "archived": len(seen_ids),
         "new": new_ids,
+        "new_bulletins": new_bulletins,     # amendments/corrections/routine, for visibility
         "existing": [i for i in seen_ids if i not in new_ids],
         "errors": parse_errors,
     }

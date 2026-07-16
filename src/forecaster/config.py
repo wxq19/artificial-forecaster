@@ -32,5 +32,9 @@ class Settings(BaseSettings):
     evidence_mode: str = "key_claims"
     # Persist the final accepted worksheet + evidence + TAF + findings to the store.
     persist_worksheets: bool = True
+    # get_previous_taf leakage guard: the "last available TAF" fed to the model must have
+    # been issued at least this many minutes BEFORE the collection cutoff, so an early-posted
+    # current-cycle TAF can never leak into the model's context.
+    previous_taf_buffer_min: int = 15
 
 settings = Settings()

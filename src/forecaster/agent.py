@@ -39,6 +39,13 @@ _BUDGET_NUDGE = (
     "data -- stop gathering, reason briefly, and call emit_taf now."
 )
 
+# Recovery nudge when a turn hits the token cap BEFORE calling any tool: the turn was
+# truncated mid-thought, not finished, so we re-prompt to continue instead of ending.
+_LENGTH_NUDGE = (
+    "Your previous turn was cut off at the token limit before you finished. Be concise: "
+    "state your conclusion briefly and call the next tool (or emit_taf) now."
+)
+
 
 @dataclass
 class StepRecord:
@@ -165,8 +172,19 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
             system_fingerprint=getattr(r, "system_fingerprint", None),
         )
 
-        if not tcs:                     # model answered -- no more tool calls
-            rec.answer, rec.recovery = final_answer(msg, r.choices[0].finish_reason)
+        if not tcs:                     # no tool calls this turn
+            fr = r.choices[0].finish_reason
+            # Truncated at the token cap before any tool call = cut off mid-thought, NOT a
+            # final answer. Keep any partial content, nudge to wrap up, and continue (still
+            # bounded by max_steps) so a long reasoning turn isn't mistaken for "done".
+            if fr == "length" and n < cfg.max_steps:
+                if (msg.content or "").strip():
+                    messages.append({"role": "assistant", "content": msg.content})
+                messages.append({"role": "user", "content": _LENGTH_NUDGE})
+                rec.recovery = "truncated (finish_reason=length); nudged to continue"
+                res.steps.append(rec)
+                continue
+            rec.answer, rec.recovery = final_answer(msg, fr)
             res.steps.append(rec)
             res.stop_reason = "no_tool_call"
             break

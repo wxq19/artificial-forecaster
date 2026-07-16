@@ -30,7 +30,7 @@ from forecaster import worksheet as wksht
 from forecaster.agent import AgentConfig, run_agent
 from forecaster.config import settings
 from forecaster.runlog import persist_run
-from forecaster.tools import EMIT_TAF, SUBMIT_WORKSHEET, TOOLS
+from forecaster.tools import EMIT_TAF, GET_PREVIOUS_TAF, SUBMIT_WORKSHEET, TOOLS
 
 TOOL_CAPS = {"get_map": 8, "get_sounding": 8, "get_fcst_sounding": 8, "get_point_forecast": 8}
 
@@ -50,9 +50,10 @@ def _git_sha() -> str | None:
         return None
 
 
-def _system_prompt(max_steps: int, mode: str) -> str:
-    """The USAF-forecaster system prompt for a COLLECTION run -- note the tool list omits
-    get_current_taf on purpose (leakage guard)."""
+def _system_prompt(max_steps: int, mode: str, taf_access: bool) -> str:
+    """The USAF-forecaster system prompt for a COLLECTION run -- the tool list omits
+    get_current_taf on purpose (leakage guard); get_previous_taf appears only when this
+    cell grants prior-TAF access."""
     gate = {
         "off": "Reason, then call emit_taf.",
         "advisory": "Fill and submit a worksheet (submit_taf_worksheet) BEFORE emit_taf. Its "
@@ -61,15 +62,16 @@ def _system_prompt(max_steps: int, mode: str) -> str:
                     "check BEFORE emit_taf is accepted. If emit_taf is refused, fix the worksheet and "
                     "re-submit, then emit.",
     }[mode]
+    prev = (" get_previous_taf (the prior official TAF, for continuity)," if taf_access else "")
     s = (
         "You are a USAF weather forecaster issuing terminal aerodrome forecasts under AFMAN "
         "15-124. Tools: query_obs/get_latest_obs (stored METARs), get_trend (meteogram), "
         "get_sounding/get_fcst_sounding (skew-Ts), get_map (synoptic charts), get_point_forecast "
-        "(hourly model point forecast), get_climo (typical conditions), get_imagery (sat/radar), "
-        "check_taf (AFMAN dry-run), and emit_taf (submit the forecast). Each data-tool receipt "
-        "begins with an [evidence_id: ev_NNN] you can cite. " + gate + " Think step by step, gather "
-        "what you need, and base the forecast only on tool data. "
-        f"You have at most {max_steps} tool-calling turns."
+        "(hourly model point forecast), get_climo (typical conditions), get_imagery (sat/radar),"
+        + prev + " check_taf (AFMAN dry-run), and emit_taf (submit the forecast). Each data-tool "
+        "receipt begins with an [evidence_id: ev_NNN] you can cite. " + gate + " Think step by step, "
+        "gather what you need, and base the forecast only on tool data. "
+        f"You have up to {max_steps} tool-calling turns -- take the time to reason thoroughly."
     )
     if mode != "off":
         s += "\n\n" + wksht.worksheet_guide(settings.evidence_mode)
@@ -93,10 +95,12 @@ def main() -> int:
     ap.add_argument("--model", default=settings.llm_model, help="model id (default: settings.llm_model)")
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--mode", default=settings.worksheet_mode, choices=["off", "advisory", "required"])
+    ap.add_argument("--taf-access", action=argparse.BooleanOptionalAction, default=True,
+                    help="give the model the leakage-safe previous TAF via get_previous_taf")
     ap.add_argument("--issue-time", help="UTC issue time (e.g. 2026-07-16T2300Z); default: now")
     ap.add_argument("--ingest-hours", type=float, default=12.0, help="pre-cutoff obs back-window")
-    ap.add_argument("--max-steps", type=int, default=14)
-    ap.add_argument("--max-tokens", type=int, default=12000)
+    ap.add_argument("--max-steps", type=int, default=24, help="tool-calling turns (ample by default)")
+    ap.add_argument("--max-tokens", type=int, default=16000, help="per-turn completion budget")
     ap.add_argument("--db", default=None, help="benchmark DB path (default: settings.db_path)")
     args = ap.parse_args()
 
@@ -113,7 +117,8 @@ def main() -> int:
     model_icao = stations.model_station(icao)
 
     # THROWAWAY per-run obs DB, cut off at issue time (leakage-proof). init_climo_schema so
-    # get_climo returns clean "not built" feedback rather than a SQL error on the temp DB.
+    # get_climo returns clean "not built" feedback rather than a SQL error on the temp DB;
+    # init_scoring_schema so get_previous_taf reads a real (possibly empty) tafs table.
     run_db = str(Path(tempfile.mkdtemp(prefix="collect_")) / "obs.duckdb")
     load = awc.load_metar(model_icao, hours=args.ingest_hours, db_path=run_db, before=issue)
     if model_icao != icao:                      # also feed the base's OWN obs for the DB tools
@@ -122,13 +127,41 @@ def main() -> int:
     con = store.connect(run_db)
     try:
         store.init_climo_schema(con)
+        store.init_scoring_schema(con)
     finally:
         con.close()
 
+    # Read the leakage-safe context out of the benchmark archive (under one lock, serialized
+    # against the poller): the station's CLIMO product, and -- if this cell grants it -- the
+    # latest HUMAN TAF issued >= previous_taf_buffer_min before the cutoff. Both are copied
+    # into the per-run DB so get_climo / get_previous_taf serve them without a rebuild and
+    # can never reach past the cutoff.
+    bench_db = args.db or settings.db_path
+    cutoff = issue - timedelta(minutes=settings.previous_taf_buffer_min)
+    prev_taf = None
+    with store.write_lock(args.db):
+        bcon = store.connect(bench_db)          # RW so a fresh benchmark DB gets its schema
+        try:
+            store.init_scoring_schema(bcon)
+            store.init_climo_schema(bcon)
+            if args.taf_access:
+                prev_taf = store.previous_human_taf(bcon, icao, before=cutoff)
+        finally:
+            bcon.close()
+        rcon = store.connect(run_db)
+        try:
+            n_climo = store.copy_climo(rcon, bench_db, icao)
+            if prev_taf:
+                store.insert_taf(rcon, prev_taf)
+        finally:
+            rcon.close()
+
     toolset = [t for t in TOOLS if t["function"]["name"] != "get_current_taf"]
+    if args.taf_access:
+        toolset.append(GET_PREVIOUS_TAF)
     toolset += ([SUBMIT_WORKSHEET] if args.mode != "off" else []) + [EMIT_TAF]
 
-    messages = [{"role": "system", "content": _system_prompt(args.max_steps, args.mode)},
+    messages = [{"role": "system", "content": _system_prompt(args.max_steps, args.mode, args.taf_access)},
                 {"role": "user", "content": _task_prompt(st, valid_from)}]
     cfg = AgentConfig(
         model=args.model, toolset=toolset, max_steps=args.max_steps, max_tokens=args.max_tokens,
@@ -137,7 +170,10 @@ def main() -> int:
     )
 
     print(f"[{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}] collect {icao} valid {valid_from:%d%H%M}Z "
-          f"| model={args.model} temp={args.temperature} mode={args.mode} seed={cfg.seed}")
+          f"| model={args.model} temp={args.temperature} mode={args.mode} seed={cfg.seed} "
+          f"taf_access={args.taf_access} climo_months={n_climo}"
+          + (f" (prev {prev_taf['bulletin_type']} {prev_taf['issue_time_utc']:%d%H%MZ})"
+             if prev_taf else (" (no prior TAF on file)" if args.taf_access else "")))
     res = run_agent(messages, cfg)
     print(f"  agent: stop={res.stop_reason} convergence={res.convergence} steps={len(res.steps)} "
           f"tokens={res.prompt_tokens}/{res.completion_tokens} clean_taf={res.final_taf is not None}"
@@ -147,7 +183,8 @@ def main() -> int:
 
     short = args.model.split("/")[-1]
     experiment_id = f"{icao}_{issue:%Y%m%dT%H%M}"           # the collection event (all cells share it)
-    run_id = f"{experiment_id}_{short}_{args.mode}_t{args.temperature}"
+    taf_tag = "taf" if args.taf_access else "notaf"
+    run_id = f"{experiment_id}_{short}_{args.mode}_t{args.temperature}_{taf_tag}"
 
     # Single-writer: archive the paired human TAF + persist the run to the benchmark DB.
     with store.write_lock(args.db):
