@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://localhost:11434/v1"
     llm_api_key: str = "ollama"
     llm_model: str = "qwen3-vl:4b"
+    # One fixed seed across the whole benchmark matrix, so temperature (0 vs 0.2) is the
+    # only varied sampling knob and any config cell is reproducible in principle. Sent to
+    # the API only when set (best-effort determinism on Together; None = omit the param).
+    llm_seed: int | None = 1337
     db_path: str = str(_ROOT / "data" / "forecaster.duckdb")   # the only config the DB seam needs
     # Climatology period-of-record. end_year is the last COMPLETE year: a historical
     # valid-time run can't absorb post-cutoff obs through the climo product (leakage guard).

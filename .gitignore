@@ -12,3 +12,4 @@ logs/
 *.egg-info/
 *:Zone.Identifier
 CLAUDE.md
+notebooks/

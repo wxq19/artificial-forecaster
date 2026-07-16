@@ -17,7 +17,8 @@ from pathlib import Path
 from forecaster import store
 from forecaster.tafparse import parse
 from forecaster.tafstate import (
-    TruthPolicy, absolute_validity, build_truth, daf_flight_category, default_profile,
+    STATUS_UNKNOWN, VIS_KNOWN_NUMERIC, VIS_KNOWN_UNLIMITED, TruthPolicy,
+    absolute_validity, build_truth, daf_flight_category, default_profile,
     forecast_state, normalize_weather, opportunities, resolve_group_state,
     tafver_ceiling_category, tafver_visibility_category, validate_profile,
 )
@@ -278,6 +279,29 @@ def run_truth() -> list[tuple[str, bool, str]]:
     # conservative view is pessimistic: lowest ceiling in the hour = 500
     r.append(check("truth: conservative ceiling = lowest instant (500)",
                    hp[0].cons["ceiling"].value == 500, f"cons={hp[0].cons['ceiling'].value}"))
+
+    # Finding 4: a MISSING field must not read as good weather. An ob that never reported
+    # visibility -> conservative vis is UNKNOWN (routes the scorer to unavailable), NOT
+    # "unlimited" -- so a P6SM forecast can't earn a point against an ob with no vis.
+    obs_novis = [_ob(datetime(2026, 7, 9, 12, 0), ceiling_ft=3000, wind_speed=5, wind_dir_deg=240)]
+    hnv, _ = build_truth(obs_novis, vf, datetime(2026, 7, 9, 13), policy=pol)
+    r.append(check("truth: missing vis -> conservative vis unknown (not unlimited)",
+                   hnv[0].cons["vis"].status == STATUS_UNKNOWN,
+                   f"cons vis status={hnv[0].cons['vis'].status}"))
+    # a genuinely clear ob (CAVOK) -> conservative vis IS unlimited (the honest positive)
+    obs_clear = [_ob(datetime(2026, 7, 9, 12, 0), cavok=True, wind_speed=5, wind_dir_deg=240)]
+    hcl, _ = build_truth(obs_clear, vf, datetime(2026, 7, 9, 13), policy=pol)
+    r.append(check("truth: CAVOK ob -> conservative vis unlimited",
+                   hcl[0].cons["vis"].status == VIS_KNOWN_UNLIMITED,
+                   f"cons vis status={hcl[0].cons['vis'].status}"))
+    # mixed: one numeric vis + one missing -> STILL scored at the lowest numeric, because a
+    # real restriction WAS observed in the hour (the union stays conservative, not unknown)
+    obs_mix = [_ob(datetime(2026, 7, 9, 12, 0), vis_sm=1.0, vis_m=1600, wind_speed=5, wind_dir_deg=240),
+               _ob(datetime(2026, 7, 9, 12, 30), wind_speed=5, wind_dir_deg=240)]
+    hmx, _ = build_truth(obs_mix, vf, datetime(2026, 7, 9, 13), policy=pol)
+    r.append(check("truth: numeric+missing vis -> lowest numeric wins (scored)",
+                   hmx[0].cons["vis"].status == VIS_KNOWN_NUMERIC and hmx[0].cons["vis"].value == 1600,
+                   f"cons vis={hmx[0].cons['vis'].value}/{hmx[0].cons['vis'].status}"))
 
     # conservative tie on max sustained wind -> direction from the EARLIEST ob
     obs_tie = [

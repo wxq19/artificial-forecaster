@@ -11,7 +11,6 @@ DuckDB + temp artifacts dir, then asserts the whole provenance write path:
   - a NO-EMIT run still writes a runs row (taf_id NULL) + transcript, and NO evaluation.
 """
 
-import json
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +21,7 @@ from populate_runs_demo import (
 
 from forecaster import store
 from forecaster.agent import RunResult
-from forecaster.runlog import persist_run
+from forecaster.runlog import persist_run, read_transcript
 
 
 @dataclass
@@ -53,11 +52,11 @@ DB = str(tmp / "demo.duckdb")
 res = example_result()
 summary = _persist(res, "RUN_A", tmp)
 
-# transcript blob on disk + round-trips.
+# transcript blob on disk (gzipped) + round-trips.
 tp = Path(summary["transcript_path"])
-check("transcript file written", tp.exists() and tp.name == "messages.json", str(tp))
+check("transcript file written (gzipped)", tp.exists() and tp.name == "messages.json.gz", str(tp))
 if tp.exists():
-    loaded = json.loads(tp.read_text())
+    loaded = read_transcript(tp)
     has_img = any(isinstance(m.get("content"), list)
                   and any(p.get("type") == "image_url" for p in m["content"]) for m in loaded)
     check("transcript round-trips the messages (image included)",

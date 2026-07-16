@@ -650,7 +650,9 @@ def daf_flight_category(ceiling_ft: int | None, ceiling_status: str, vis_m: int 
 class TruthPolicy(BaseModel):
     """Versioned truth-policy constants (sec 5.5 / 6). Persisted with a hash per run."""
     name: str = "truth-v1"
-    version: str = "1"
+    # v2: conservative view no longer reads a missing vis/ceiling as "unlimited" -- an
+    # unknown field routes to unavailable (unscored). Changes scored output -> new hash.
+    version: str = "2"
     max_hold_min: int = 90          # an ob's state holds this long past its time before a gap
     predominant_min_min: int = 30   # >= this many aggregate minutes to be predominant (3.4.2.8)
 
@@ -738,25 +740,32 @@ def _conservative(pieces: list[tuple[_Interval, float]]) -> dict[str, FieldVal]:
     max gust, union of weather. `pieces` = (interval, minutes) for obs intervals."""
     cons: dict[str, FieldVal] = {}
 
-    # ceiling: lowest numeric; unlimited only if EVERY covering ob is unlimited
+    # ceiling: lowest numeric; unlimited ONLY if EVERY covering ob is unlimited; if any
+    # covering ob's ceiling is unknown (and none numeric), the field is unknown -- never a
+    # default. Absence-of-a-ceiling from a partial ob must not read as clear skies.
     numeric = [(iv.state.ceiling_ft, iv) for iv, _ in pieces if iv.state.ceiling_status == CEIL_KNOWN_NUMERIC]
     if numeric:
         low = min(numeric, key=lambda x: x[0])
         cons["ceiling"] = FieldVal(value=low[0], status=CEIL_KNOWN_NUMERIC,
                                    sources=[low[1].report_time])
-    else:
+    elif all(iv.state.ceiling_status == CEIL_KNOWN_UNLIMITED for iv, _ in pieces):
         cons["ceiling"] = FieldVal(value=None, status=CEIL_KNOWN_UNLIMITED,
                                    sources=[iv.report_time for iv, _ in pieces])
+    else:
+        cons["ceiling"] = FieldVal(status=STATUS_UNKNOWN)
 
-    # visibility: lowest numeric meters; else unlimited
+    # visibility: lowest numeric meters; unlimited ONLY if every covering ob is unlimited;
+    # else (some covering ob never reported vis) the field is unknown, not "unrestricted".
     vnum = [(iv.state.vis_m, iv) for iv, _ in pieces
             if iv.state.vis_status == VIS_KNOWN_NUMERIC and iv.state.vis_m is not None]
     if vnum:
         low = min(vnum, key=lambda x: x[0])
         cons["vis"] = FieldVal(value=low[0], status=VIS_KNOWN_NUMERIC, sources=[low[1].report_time])
-    else:
+    elif all(iv.state.vis_status == VIS_KNOWN_UNLIMITED for iv, _ in pieces):
         cons["vis"] = FieldVal(value=None, status=VIS_KNOWN_UNLIMITED,
                                sources=[iv.report_time for iv, _ in pieces])
+    else:
+        cons["vis"] = FieldVal(status=STATUS_UNKNOWN)
 
     # altimeter: lowest observed
     alt = [(iv.state.qnh_inhg, iv) for iv, _ in pieces if iv.state.qnh_status == QNH_KNOWN]

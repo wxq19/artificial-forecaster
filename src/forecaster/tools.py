@@ -1104,6 +1104,16 @@ def _get_climo(con, args: dict) -> ToolResult:
     return ToolResult(_fmt_climo(meta, monthly, hourly))
 
 
+def _stamp_fetched(result: ToolResult) -> ToolResult:
+    """Append the UTC fetch time to a network receipt, unless the fetch errored. The
+    cycle/valid time of model-run products is already on the receipt; this pins the
+    live/analysis products to when the model actually saw them, so the archived context
+    is unambiguous after the fact."""
+    if result.text and not result.text.startswith("error:"):
+        result.text = f"{result.text}\n(fetched {datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ})"
+    return result
+
+
 def run_tool(name: str, args: dict, *, db_path: str | None = None,
              evidence_ids: list[str] | None = None) -> ToolResult:
     """Execute a model-issued tool call. The read tools run against a READ-ONLY
@@ -1118,18 +1128,21 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
         return _check_taf(args)
     if name == "submit_taf_worksheet":
         return _submit_worksheet(args, evidence_ids=evidence_ids)
+    # Network fetches: no DB, handled before the read-only connect. Each is stamped with
+    # its fetch time so a 'now' product (analysis map, satellite, radar, the live TAF) is
+    # pinned to the instant the model saw it -- model-run products also cite their cycle.
     if name == "get_current_taf":
-        return _get_current_taf(args)
+        return _stamp_fetched(_get_current_taf(args))
     if name == "get_sounding":
-        return _get_sounding(args)
+        return _stamp_fetched(_get_sounding(args))
     if name == "get_map":
-        return _get_map(args)
+        return _stamp_fetched(_get_map(args))
     if name == "get_fcst_sounding":
-        return _get_fcst_sounding(args)
+        return _stamp_fetched(_get_fcst_sounding(args))
     if name == "get_point_forecast":
-        return _get_point_forecast(args)
+        return _stamp_fetched(_get_point_forecast(args))
     if name == "get_imagery":
-        return _get_imagery(args)
+        return _stamp_fetched(_get_imagery(args))
     con = (
         store.connect(db_path, read_only=True)
         if db_path

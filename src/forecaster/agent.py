@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 
 from forecaster import tafgen
 from forecaster import worksheet as wksht
+from forecaster.config import settings
 from forecaster.llm import client as _default_client
 from forecaster.tafgen import TafProduct
 from forecaster.tools import ToolResult, _image_mime, run_tool
@@ -52,6 +53,8 @@ class StepRecord:
     calls: list[dict] = field(default_factory=list)   # per call: name, args, result-line, n_images
     answer: str | None = None       # set only on the terminal no-tool-call turn
     recovery: str | None = None     # final_answer's reasoning-field recovery flag, if any
+    served_model: str | None = None         # the model id the API RETURNED for this turn
+    system_fingerprint: str | None = None   # provider build id; often None on Together
 
 
 @dataclass
@@ -63,6 +66,9 @@ class AgentConfig:
     max_steps: int = 14
     max_tokens: int = 12000
     temperature: float = 0.2
+    # One fixed seed for the whole matrix (config.llm_seed); a driver may still override.
+    # Sent to the API only when non-None.
+    seed: int | None = field(default_factory=lambda: settings.llm_seed)
     tool_caps: dict[str, int] | None = None
     worksheet_mode: str = "advisory"    # off|advisory|required -- governs the emit_taf GATE only
     evidence: bool = True               # thread [evidence_id: ev_NNN] onto data-tool receipts
@@ -90,6 +96,13 @@ class RunResult:
     fatal: str | None = None
     first_emit_step: int | None = None  # first turn emit_taf was attempted (convergence)
     nudge_step: int | None = None       # turn the step-budget nudge fired, if any
+    # Generation-side provenance, stamped by run_agent from cfg + the API responses. None
+    # of it is reconstructable later, so it is captured at run time and persisted per run.
+    base_url: str | None = None         # which endpoint served the run (local/Together/vLLM)
+    temperature: float | None = None
+    max_tokens: int | None = None
+    seed: int | None = None
+    toolset_names: list[str] = field(default_factory=list)   # tools OFFERED this run (order kept)
 
     @property
     def convergence(self) -> str:
@@ -97,6 +110,17 @@ class RunResult:
         if self.first_emit_step is None:
             return "never"
         return "nudged" if self.nudge_step is not None else "unprompted"
+
+    @property
+    def served_models(self) -> list[str]:
+        """Distinct model ids the API RETURNED across turns. More than one = a provider
+        reroute/requantize mid-run: a data-quality flag, not a value to average over."""
+        return sorted({s.served_model for s in self.steps if s.served_model})
+
+    @property
+    def system_fingerprints(self) -> list[str]:
+        """Distinct provider build ids seen across turns (often empty on Together)."""
+        return sorted({s.system_fingerprint for s in self.steps if s.system_fingerprint})
 
 
 def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResult:
@@ -108,15 +132,21 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
     client = client or _default_client
     caps = cfg.tool_caps or {}
     res = RunResult(model=cfg.model, messages=messages)
+    res.base_url = str(getattr(client, "base_url", "") or "") or None
+    res.temperature, res.max_tokens, res.seed = cfg.temperature, cfg.max_tokens, cfg.seed
+    res.toolset_names = [t["function"]["name"] for t in cfg.toolset]
     ev_ids: list[str] = []
     worksheet_ok = False
 
     for n in range(1, cfg.max_steps + 1):
+        # seed is sent only when set: the OpenAI client serializes an explicit None as
+        # JSON null, which some OpenAI-compatible servers reject.
+        kwargs = dict(model=cfg.model, messages=messages, tools=cfg.toolset,
+                      tool_choice="auto", temperature=cfg.temperature, max_tokens=cfg.max_tokens)
+        if cfg.seed is not None:
+            kwargs["seed"] = cfg.seed
         try:
-            r = client.chat.completions.create(
-                model=cfg.model, messages=messages, tools=cfg.toolset,
-                tool_choice="auto", temperature=cfg.temperature, max_tokens=cfg.max_tokens,
-            )
+            r = client.chat.completions.create(**kwargs)
         except Exception as e:  # noqa: BLE001 -- a model that rejects the toolset is a finding, not a crash
             res.fatal = f"{type(e).__name__}: {e}"
             res.stop_reason = "fatal"
@@ -131,6 +161,8 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
             prompt_tokens=r.usage.prompt_tokens, completion_tokens=r.usage.completion_tokens,
             content=(msg.content or "").strip(),
             reasoning=(getattr(msg, "reasoning", None) or "").strip(),
+            served_model=getattr(r, "model", None),
+            system_fingerprint=getattr(r, "system_fingerprint", None),
         )
 
         if not tcs:                     # model answered -- no more tool calls

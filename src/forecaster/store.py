@@ -6,14 +6,36 @@ METAR line carries only day+time, so the real year/month is attached at persist
 time (see insert_obs). All times are UTC.
 """
 
+import contextlib
+import fcntl
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 
 import duckdb
 
 from forecaster.config import settings
 from forecaster.metar import MetarObs
+
+
+@contextlib.contextmanager
+def write_lock(db_path: str | None = None):
+    """Exclusive advisory file lock guarding SINGLE-WRITER access to the benchmark DB.
+    The TAF poller (archive), the collector (persist_run), and score_taf --pending all
+    take it, so their writes to the one .duckdb never overlap on the Pi. Blocks until
+    acquired (DuckDB itself allows only one writer; this serializes the processes cleanly
+    instead of letting one fail to open). Lock file sits beside the DB. Read-only tool
+    connections do NOT need it."""
+    path = Path(db_path or settings.db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.parent / (path.name + ".lock")
+    with open(lock_path, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 # A COR modifier marks a corrected report (re-issued with fixed values for the same
 # station+time). Detected from the raw so a correction can win the ON CONFLICT race.
@@ -747,9 +769,16 @@ CREATE TABLE IF NOT EXISTS runs (
     valid_from_utc    TIMESTAMP,            -- the TAF window the model was asked to forecast
     valid_to_utc      TIMESTAMP,
     producer_kind     VARCHAR,              -- 'artificial' (the agent); a human TAF lives in tafs
-    model             VARCHAR,
+    model             VARCHAR,              -- the model id we REQUESTED
+    served_model      VARCHAR,              -- the model id the API RETURNED (may differ / drift)
+    system_fingerprint VARCHAR,             -- provider build id; often NULL on Together
+    base_url          VARCHAR,              -- endpoint that served the run (local/Together/vLLM)
+    temperature       DOUBLE,
+    max_tokens        INTEGER,
+    seed              INTEGER,              -- determinism knob, if set
+    toolset_hash      VARCHAR,              -- sha of the sorted tool names offered this run
     worksheet_mode    VARCHAR,              -- off | advisory | required
-    config_id         VARCHAR,              -- the (model x worksheet_mode) matrix cell
+    config_id         VARCHAR,              -- hash of the full matrix cell (see runlog.config_id_for)
     harness_git_sha   VARCHAR,              -- code version that produced the run
     prompt_tokens     INTEGER,
     completion_tokens INTEGER,
@@ -771,10 +800,22 @@ CREATE TABLE IF NOT EXISTS runs (
 """
 
 
+# Provenance columns added after the runs table first shipped. CREATE TABLE IF NOT
+# EXISTS never adds columns to an existing table, so bring older DBs forward explicitly.
+_RUNS_MIGRATIONS = (
+    ("served_model", "VARCHAR"), ("system_fingerprint", "VARCHAR"), ("base_url", "VARCHAR"),
+    ("temperature", "DOUBLE"), ("max_tokens", "INTEGER"), ("seed", "INTEGER"),
+    ("toolset_hash", "VARCHAR"),
+)
+
+
 def init_runs_schema(con: duckdb.DuckDBPyConnection) -> None:
-    """Create the runs table if absent. Idempotent WRITE-path side effect (the
-    read-only tool conn never runs it), like init_scoring_schema/init_worksheet_schema."""
+    """Create the runs table if absent, then add any provenance columns missing from an
+    older DB. Idempotent WRITE-path side effect (the read-only tool conn never runs it),
+    like init_scoring_schema/init_worksheet_schema."""
     con.execute(_RUNS_DDL)
+    for col, typ in _RUNS_MIGRATIONS:
+        con.execute(f"ALTER TABLE runs ADD COLUMN IF NOT EXISTS {col} {typ}")
 
 
 def insert_run(con: duckdb.DuckDBPyConnection, run: dict) -> None:
@@ -783,11 +824,12 @@ def insert_run(con: duckdb.DuckDBPyConnection, run: dict) -> None:
     default to NULL. Requires init_runs_schema(con)."""
     cols = [
         "run_id", "experiment_id", "station", "issue_time_utc", "valid_from_utc",
-        "valid_to_utc", "producer_kind", "model", "worksheet_mode", "config_id",
-        "harness_git_sha", "prompt_tokens", "completion_tokens", "n_steps",
-        "n_tool_calls", "tools_used_json", "stop_reason", "convergence",
-        "first_emit_step", "nudge_step", "taf_id", "taf_clean", "worksheet_id",
-        "transcript_path", "fatal", "created_at",
+        "valid_to_utc", "producer_kind", "model", "served_model", "system_fingerprint",
+        "base_url", "temperature", "max_tokens", "seed", "toolset_hash",
+        "worksheet_mode", "config_id", "harness_git_sha", "prompt_tokens",
+        "completion_tokens", "n_steps", "n_tool_calls", "tools_used_json", "stop_reason",
+        "convergence", "first_emit_step", "nudge_step", "taf_id", "taf_clean",
+        "worksheet_id", "transcript_path", "fatal", "created_at",
     ]
     con.execute("DELETE FROM runs WHERE run_id = ?", [run["run_id"]])
     con.execute(

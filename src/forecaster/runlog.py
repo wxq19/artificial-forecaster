@@ -13,6 +13,8 @@ collection time the truth does not exist yet -- that ordering is what makes the
 benchmark leakage-proof. No LLM, no network; testable with a synthetic RunResult.
 """
 
+import gzip
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,17 +30,49 @@ def _artifacts_root(db_path: str | None = None) -> Path:
     return Path(db_path or settings.db_path).parent / "runs"
 
 
+def toolset_hash(names: list[str]) -> str:
+    """Stable sha12 over the SORTED tool names offered in a run (order-independent), so a
+    run's toolset is a comparable fingerprint on the run row."""
+    return hashlib.sha256(",".join(sorted(names)).encode()).hexdigest()[:12]
+
+
+def config_id_for(*, model: str, temperature: float | None, max_tokens: int | None,
+                  seed: int | None, worksheet_mode: str, evidence_mode: str | None,
+                  toolset_hash: str) -> str:
+    """Hash the full benchmark matrix cell into a stable config id. Two runs collide on
+    config_id ONLY if every knob matches -- so temp-0 vs temp-0.2, or a different toolset,
+    are distinct cells. The old f'{model}:{worksheet_mode}' scheme silently merged them."""
+    payload = json.dumps({
+        "model": model, "temperature": temperature, "max_tokens": max_tokens,
+        "seed": seed, "worksheet_mode": worksheet_mode, "evidence_mode": evidence_mode,
+        "toolset_hash": toolset_hash,
+    }, sort_keys=True)
+    return "cfg_" + hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
 def write_transcript(run_id: str, res: RunResult, *, artifacts_dir: str | None = None,
                      db_path: str | None = None) -> Path:
-    """Dump the full frozen messages array to <root>/<run_id>/messages.json and return
+    """Dump the full frozen messages array to <root>/<run_id>/messages.json.gz and return
     the path. Images already ride inside messages as base64 data URLs, so the file is a
-    self-contained, replayable snapshot of exactly what the model saw."""
+    self-contained, replayable snapshot of exactly what the model saw -- gzipped because
+    those base64 blobs dominate the size and compress well."""
     root = Path(artifacts_dir) if artifacts_dir else _artifacts_root(db_path)
     d = root / run_id
     d.mkdir(parents=True, exist_ok=True)
-    path = d / "messages.json"
-    path.write_text(json.dumps(res.messages, indent=2), encoding="utf-8")
+    path = d / "messages.json.gz"
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump(res.messages, f, indent=2)
     return path
+
+
+def read_transcript(path: str | Path) -> list[dict]:
+    """Load a transcript blob back into the messages array, transparently handling a
+    gzipped (.gz) or a plain .json file -- so a replay reader need not care which it is."""
+    p = Path(path)
+    if p.suffix == ".gz":
+        with gzip.open(p, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def persist_run(
@@ -62,7 +96,11 @@ def persist_run(
     a PENDING evaluation. Idempotent by run_id (re-persisting replaces, never duplicates).
     Returns a summary of the ids written. `issue_time` anchors the emitted TAF's calendar."""
     model = model or res.model
-    config_id = config_id or f"{model}:{worksheet_mode}"
+    th = toolset_hash(res.toolset_names)
+    config_id = config_id or config_id_for(
+        model=model, temperature=res.temperature, max_tokens=res.max_tokens,
+        seed=res.seed, worksheet_mode=worksheet_mode, evidence_mode=evidence_mode,
+        toolset_hash=th)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     transcript_path = write_transcript(run_id, res, artifacts_dir=artifacts_dir, db_path=db_path)
 
@@ -120,7 +158,12 @@ def persist_run(
         store.insert_run(con, {
             "run_id": run_id, "experiment_id": experiment_id, "station": station,
             "issue_time_utc": issue_time, "valid_from_utc": valid_from, "valid_to_utc": valid_to,
-            "producer_kind": "artificial", "model": model, "worksheet_mode": worksheet_mode,
+            "producer_kind": "artificial", "model": model,
+            "served_model": " | ".join(res.served_models) or None,
+            "system_fingerprint": " | ".join(res.system_fingerprints) or None,
+            "base_url": res.base_url, "temperature": res.temperature,
+            "max_tokens": res.max_tokens, "seed": res.seed, "toolset_hash": th,
+            "worksheet_mode": worksheet_mode,
             "config_id": config_id, "harness_git_sha": harness_git_sha,
             "prompt_tokens": res.prompt_tokens, "completion_tokens": res.completion_tokens,
             "n_steps": len(res.steps), "n_tool_calls": sum(res.used.values()),

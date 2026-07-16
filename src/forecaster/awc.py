@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 
 from forecaster import store
 from forecaster.metar import MetarObs, parse
+from forecaster.tafarchive import build_taf_row
 
 _AWC_URL = "https://aviationweather.gov/api/data/{product}"
 
@@ -160,4 +161,53 @@ def load_metar(
         "parsed": parsed,
         "inserted": inserted,
         "errors": errors,
+    }
+
+
+def load_taf(
+    station: str,
+    *,
+    db_path: str | None = None,
+    producer_kind: str = "human",
+    producer_name: str | None = None,
+    source: str = "awc_poll",
+    canonical: bool = True,
+) -> dict:
+    """Fetch the current TAF(s) for one station and archive each into the `tafs` table
+    (the human-forecast half of paired collection). The orchestrator half fetch_taf
+    lacks -- symmetric to load_metar, owning no SQL of its own (build_taf_row + the store
+    seam do the work). Idempotent: a content-hashed taf_id means re-polling the same
+    bulletin adds 0 rows. `canonical=True` marks a TAF frozen at issue time, before its
+    truth exists. Returns a summary listing which taf_ids were newly archived.
+
+    The CALLER holds store.write_lock around this on the shared benchmark DB."""
+    parse_errors: list[tuple[str, str]] = []
+    new_ids: list[str] = []
+    seen_ids: list[str] = []
+    rows: list[dict] = []
+    for issue, raw in fetch_taf(station):
+        try:
+            row = build_taf_row(raw, issue_ref=issue, producer_kind=producer_kind,
+                                producer_name=producer_name, source=source, canonical=canonical)
+        except Exception as e:  # noqa: BLE001 -- a bad bulletin is logged & skipped, not fatal
+            parse_errors.append((raw, str(e)))
+            continue
+        rows.append(row)
+
+    con = store.connect(db_path) if db_path else store.connect()
+    try:
+        store.init_scoring_schema(con)
+        for row in rows:
+            seen_ids.append(row["taf_id"])
+            if store.insert_taf(con, row):
+                new_ids.append(row["taf_id"])
+    finally:
+        con.close()
+
+    return {
+        "station": station,
+        "archived": len(seen_ids),
+        "new": new_ids,
+        "existing": [i for i in seen_ids if i not in new_ids],
+        "errors": parse_errors,
     }
