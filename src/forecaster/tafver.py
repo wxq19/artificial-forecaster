@@ -19,8 +19,6 @@ TAFVER" until the SME items + golden fixture (sec 15) clear.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import datetime
 
 from pydantic import BaseModel
@@ -29,9 +27,13 @@ from forecaster.tafparse import TafObs
 from forecaster.tafstate import (
     DIR_NUMERIC, GUST_PRESENT, QNH_KNOWN, SPD_NUMERIC,
     State, StationProfile, TruthPolicy, build_truth, conservative_state, default_profile,
-    forecast_state, normalize_weather, opportunities, resolve_group_state,
+    forecast_state, normalize_weather, opportunities, resolve_group_state, stable_hash,
     tafver_ceiling_category, tafver_visibility_category,
 )
+
+# Bump on any scored-output-changing code fix, even with unchanged policy JSON
+# (sec 11): a rerun with a new scorer_version is a NEW run, never a replace.
+SCORER_VERSION = "1"
 
 _ELEMENTS = ["ceiling", "visibility", "wind_speed", "wind_dir", "wind_gust",
              "present_weather", "altimeter"]
@@ -112,8 +114,7 @@ class TafverScore(BaseModel):
 # Provenance hashing (sec 6/11) -- stable, reproducible
 # ---------------------------------------------------------------------------
 
-def _hash(payload) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+_hash = stable_hash            # one shared implementation (tafstate.stable_hash)
 
 
 def obs_hash(obs: list[dict]) -> str:

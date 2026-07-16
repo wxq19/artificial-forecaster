@@ -22,12 +22,21 @@ Naive UTC throughout (the repo seam contract). No new dependencies.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, time, timedelta
 
 from pydantic import BaseModel
 
 from forecaster.metar import CloudLayer, _parse_vis
 from forecaster.tafparse import TafGroup, TafObs
+
+
+def stable_hash(payload) -> str:
+    """Stable provenance hash (sec 6/11): sha256 over sorted-keys JSON. ONE
+    implementation shared by every scorer and the persistence layer, so a policy or
+    profile hashed anywhere yields the same digest."""
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 # ---------------------------------------------------------------------------
 # State + availability statuses (5.2.4)

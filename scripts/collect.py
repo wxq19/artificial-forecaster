@@ -2,11 +2,14 @@
 TAF (the model-forecast collection cron; M4 step 2).
 
 Leakage discipline (the whole point of collecting LIVE):
-  - the cutoff is the scheduled ISSUE time; obs are ingested with awc.load_metar(before=
-    cutoff) into a THROWAWAY per-run DB, so the model's DB tools can never see an ob at or
-    after issue time -- even if a forecaster posted a few minutes early;
+  - obs are fetched ONCE into the BENCHMARK DB (truth banking: successive cycles tile the
+    timeline, so verification obs accumulate as a side effect of collection), then the
+    pre-cutoff back-window is COPIED into a THROWAWAY per-run DB with the cutoff enforced
+    in SQL (store.copy_obs), so the model's DB tools can never see an ob at or after the
+    scheduled ISSUE time -- even if a forecaster posted a few minutes early;
   - get_current_taf is DROPPED from the toolset, so the model cannot fetch the official
-    TAF it is being scored against;
+    TAF it is being scored against; get_previous_taf serves only a PRIOR-cycle bulletin
+    (issue-time buffer AND valid_from strictly before this run's valid_from);
   - the human TAF for this station is archived here too (frozen at issue time), so the
     pair is captured together; scoring happens LATER (score_taf.py --pending), once the
     window elapses and obs accumulate.
@@ -20,6 +23,7 @@ fans out the matrix. All persistence runs under the single-writer lock.
 
 import argparse
 import json
+import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -98,7 +102,8 @@ def main() -> int:
     ap.add_argument("--taf-access", action=argparse.BooleanOptionalAction, default=True,
                     help="give the model the leakage-safe previous TAF via get_previous_taf")
     ap.add_argument("--issue-time", help="UTC issue time (e.g. 2026-07-16T2300Z); default: now")
-    ap.add_argument("--ingest-hours", type=float, default=12.0, help="pre-cutoff obs back-window")
+    ap.add_argument("--ingest-hours", type=float, default=24.0,
+                    help="pre-cutoff obs back-window (24 matches get_trend's default look-back)")
     ap.add_argument("--max-steps", type=int, default=24, help="tool-calling turns (ample by default)")
     ap.add_argument("--max-tokens", type=int, default=16000, help="per-turn completion budget")
     ap.add_argument("--db", default=None, help="benchmark DB path (default: settings.db_path)")
@@ -116,46 +121,83 @@ def main() -> int:
     valid_to = valid_from + timedelta(hours=st.taf_hours)
     model_icao = stations.model_station(icao)
 
-    # THROWAWAY per-run obs DB, cut off at issue time (leakage-proof). init_climo_schema so
-    # get_climo returns clean "not built" feedback rather than a SQL error on the temp DB;
-    # init_scoring_schema so get_previous_taf reads a real (possibly empty) tafs table.
-    run_db = str(Path(tempfile.mkdtemp(prefix="collect_")) / "obs.duckdb")
-    load = awc.load_metar(model_icao, hours=args.ingest_hours, db_path=run_db, before=issue)
-    if model_icao != icao:                      # also feed the base's OWN obs for the DB tools
-        load_base = awc.load_metar(icao, hours=args.ingest_hours, db_path=run_db, before=issue)
-        load = {"proxy": load, "base": load_base}
-    con = store.connect(run_db)
-    try:
-        store.init_climo_schema(con)
-        store.init_scoring_schema(con)
-    finally:
-        con.close()
+    short = args.model.split("/")[-1]
+    experiment_id = f"{icao}_{issue:%Y%m%dT%H%M}"           # the collection event (all cells share it)
+    taf_tag = "taf" if args.taf_access else "notaf"
+    run_id = f"{experiment_id}_{short}_{args.mode}_t{args.temperature}_{taf_tag}"
 
-    # Read the leakage-safe context out of the benchmark archive (under one lock, serialized
-    # against the poller): the station's CLIMO product, and -- if this cell grants it -- the
-    # latest HUMAN TAF issued >= previous_taf_buffer_min before the cutoff. Both are copied
-    # into the per-run DB so get_climo / get_previous_taf serve them without a rebuild and
-    # can never reach past the cutoff.
+    # THROWAWAY per-run obs DB (removed in the finally: on Debian 13 /tmp is tmpfs, so a
+    # leaked dir per cron cell would accumulate in RAM). Everything below happens inside
+    # the try so the temp dir is cleaned even when a step raises.
+    run_dir = tempfile.mkdtemp(prefix="collect_")
+    run_db = str(Path(run_dir) / "obs.duckdb")
     bench_db = args.db or settings.db_path
     cutoff = issue - timedelta(minutes=settings.previous_taf_buffer_min)
     prev_taf = None
-    with store.write_lock(args.db):
-        bcon = store.connect(bench_db)          # RW so a fresh benchmark DB gets its schema
-        try:
-            store.init_scoring_schema(bcon)
-            store.init_climo_schema(bcon)
-            if args.taf_access:
-                prev_taf = store.previous_human_taf(bcon, icao, before=cutoff)
-        finally:
-            bcon.close()
-        rcon = store.connect(run_db)
-        try:
-            n_climo = store.copy_climo(rcon, bench_db, icao)
-            if prev_taf:
-                store.insert_taf(rcon, prev_taf)
-        finally:
-            rcon.close()
+    try:
+        # ONE ingest under the lock, serialized against the poller/scorer:
+        #   1. bank the obs into the BENCHMARK DB with NO cutoff -- truth banking (the
+        #      model never reads this DB, so leakage does not apply to it);
+        #   2. copy the pre-cutoff back-window into the per-run DB (cutoff enforced in
+        #      SQL by store.copy_obs) for the model's read tools;
+        #   3. read the leakage-safe context: the CLIMO product and -- if this cell
+        #      grants it -- the latest PRIOR-CYCLE human TAF (issue-time buffer AND
+        #      valid_from strictly before this run's valid_from, so the current cycle's
+        #      bulletin can never qualify however early it posted);
+        #   4. stub the runs row, so a cell killed by the scheduler's timeout still
+        #      leaves a record (persist_run replaces it by run_id on success).
+        with store.write_lock(args.db):
+            load = awc.load_metar(icao, hours=args.ingest_hours, db_path=bench_db)
+            if model_icao != icao:              # also bank the proxy's obs for the model tools
+                load = {"base": load,
+                        "proxy": awc.load_metar(model_icao, hours=args.ingest_hours,
+                                                db_path=bench_db)}
+            bcon = store.connect(bench_db)      # RW so a fresh benchmark DB gets its schema
+            try:
+                store.init_scoring_schema(bcon)
+                store.init_climo_schema(bcon)
+                store.init_runs_schema(bcon)
+                if args.taf_access:
+                    prev_taf = store.previous_human_taf(bcon, icao, before=cutoff,
+                                                        valid_before=valid_from)
+                store.insert_run(bcon, {
+                    "run_id": run_id, "experiment_id": experiment_id, "station": icao,
+                    "issue_time_utc": issue, "valid_from_utc": valid_from,
+                    "valid_to_utc": valid_to, "producer_kind": "artificial",
+                    "model": args.model, "temperature": args.temperature,
+                    "max_tokens": args.max_tokens, "worksheet_mode": args.mode,
+                    "stop_reason": "incomplete",
+                    "fatal": "collection started; killed or timed out before final persist",
+                    "created_at": datetime.now(timezone.utc).replace(tzinfo=None)})
+            finally:
+                bcon.close()
+            rcon = store.connect(run_db)
+            try:
+                n_obs = store.copy_obs(rcon, bench_db, icao,
+                                       before=issue, hours=args.ingest_hours)
+                if model_icao != icao:
+                    n_obs += store.copy_obs(rcon, bench_db, model_icao,
+                                            before=issue, hours=args.ingest_hours)
+                # init_scoring_schema so get_previous_taf reads a real (possibly empty)
+                # tafs table; copy_climo creates the climo schema itself, so get_climo
+                # returns clean "not built" feedback rather than a SQL error.
+                store.init_scoring_schema(rcon)
+                n_climo = store.copy_climo(rcon, bench_db, icao)
+                if prev_taf:
+                    store.insert_taf(rcon, prev_taf)
+            finally:
+                rcon.close()
+        return _run_and_persist(args, st, icao, issue, valid_from, valid_to,
+                                run_db, prev_taf, n_climo, n_obs, load,
+                                run_id, experiment_id)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
 
+
+def _run_and_persist(args, st, icao, issue, valid_from, valid_to,
+                     run_db, prev_taf, n_climo, n_obs, load,
+                     run_id, experiment_id) -> int:
+    """The agent run + final persist (split from main so the temp-dir finally wraps it)."""
     toolset = [t for t in TOOLS if t["function"]["name"] != "get_current_taf"]
     if args.taf_access:
         toolset.append(GET_PREVIOUS_TAF)
@@ -171,7 +213,7 @@ def main() -> int:
 
     print(f"[{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}] collect {icao} valid {valid_from:%d%H%M}Z "
           f"| model={args.model} temp={args.temperature} mode={args.mode} seed={cfg.seed} "
-          f"taf_access={args.taf_access} climo_months={n_climo}"
+          f"taf_access={args.taf_access} climo_months={n_climo} run_obs={n_obs}"
           + (f" (prev {prev_taf['bulletin_type']} {prev_taf['issue_time_utc']:%d%H%MZ})"
              if prev_taf else (" (no prior TAF on file)" if args.taf_access else "")))
     res = run_agent(messages, cfg)
@@ -181,12 +223,8 @@ def main() -> int:
     if res.fatal:
         print(f"  FATAL: {res.fatal}")
 
-    short = args.model.split("/")[-1]
-    experiment_id = f"{icao}_{issue:%Y%m%dT%H%M}"           # the collection event (all cells share it)
-    taf_tag = "taf" if args.taf_access else "notaf"
-    run_id = f"{experiment_id}_{short}_{args.mode}_t{args.temperature}_{taf_tag}"
-
-    # Single-writer: archive the paired human TAF + persist the run to the benchmark DB.
+    # Single-writer: archive the paired human TAF + persist the run to the benchmark DB
+    # (persist_run replaces the stub row inserted before the agent ran).
     with store.write_lock(args.db):
         human = awc.load_taf(icao, db_path=args.db)
         summary = persist_run(

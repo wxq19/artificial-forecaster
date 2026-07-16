@@ -1,27 +1,40 @@
 """Scoring driver (scoring-design sec 12). Loads truth once, runs the requested
 scorers over a subject TAF plus baselines, writes one combined markdown report.
 
-M1 wires up `--scorers amend` + the persistence baseline; tafver/skill land in later
-milestones (a requested-but-unbuilt scorer errors, never silently passes). This is
-application-side evaluation code: no LLM, never in the agent's messages array.
+Two modes:
+  - ad-hoc (report only): --taf-id / --taf-text / --taf-file scores one TAF and
+    writes the markdown report; nothing is persisted.
+  - --pending (M4 step 3, the post-validity pass): selects pending evaluations whose
+    windows have elapsed, checks truth coverage (optionally backfilling the missing
+    obs from IEM with --backfill iem), scores subject + baselines (persistence and the
+    paired HUMAN routine TAF), persists the per-scorer result tables, and flips the
+    evaluation to scored (or partial with --allow-partial). All writes run under the
+    single-writer lock. An evaluation that fails required coverage stays PENDING --
+    partial success and failed-required-coverage are distinct outcomes.
+
+This is application-side evaluation code: no LLM, never in the agent's messages array.
 
 Usage:
   uv run python scripts/score_taf.py --taf-id <archived-id> --scorers amend
   uv run python scripts/score_taf.py --taf-text 'TAF KBLV ...' --issue-date 2026-07-09 \\
       --scorers amend --baselines persistence
+  uv run python scripts/score_taf.py --pending --backfill iem
 """
 
 import argparse
-from datetime import datetime, timedelta
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from forecaster import store
+from forecaster import iem, store, tafamend, tafskill, tafver
 from forecaster.config import settings
 from forecaster.tafparse import parse
-from forecaster.tafamend import TafAmendScore, score_amend
-from forecaster.tafskill import TafSkillScore, score_skill, skill_deltas
-from forecaster.tafver import TafverScore, score_tafver
-from forecaster.tafstate import absolute_validity, default_profile, persistence_taf
+from forecaster.tafamend import AmendPolicy, TafAmendScore, score_amend
+from forecaster.tafskill import SkillPolicy, TafSkillScore, score_skill, skill_deltas
+from forecaster.tafver import TafverPolicy, TafverScore, obs_hash, score_tafver
+from forecaster.tafstate import (
+    TruthPolicy, absolute_validity, default_profile, persistence_taf, stable_hash,
+)
 
 PERSISTENCE_MAX_AGE_MIN = 90            # baseline lookback (sec 10 versioned default)
 _UNBUILT = {}
@@ -57,42 +70,64 @@ def run(
         if s in _UNBUILT:
             raise ValueError(f"scorer '{s}' is not built yet (arrives in {_UNBUILT[s]})")
 
+    subject_row = None
     if taf_id:
-        row = store.taf(con, taf_id)
-        if not row:
+        subject_row = store.taf(con, taf_id)
+        if not subject_row:
             raise ValueError(f"taf_id not found: {taf_id}")
-        taf = parse(row["raw_taf"])
-        station, vf, vt = row["station"], row["valid_from_utc"], row["valid_to_utc"]
-        canonical = row.get("canonical")
+        taf = parse(subject_row.get("parse_body") or subject_row["raw_taf"])
+        station = subject_row["station"]
+        vf, vt = subject_row["valid_from_utc"], subject_row["valid_to_utc"]
+        canonical = subject_row.get("canonical")
     else:
         taf = parse(raw)
         _, vf, vt = absolute_validity(taf, issue_ref)
         station, canonical = taf.station, False
 
     profile = profile or default_profile(station)
+    # ONE policy object per scorer + the shared truth policy, constructed HERE so the
+    # provenance hashes persisted later are the hashes of what actually scored.
+    policies = {"truth": TruthPolicy(), "tafver": TafverPolicy(),
+                "amend": AmendPolicy(), "skill": SkillPolicy()}
     obs = store.scoring_window(con, station, vf, vt)
     want_amend, want_skill = "amend" in scorers, "skill" in scorers
     want_tafver = "tafver" in scorers
 
-    def score_one(name, ftaf, anchor=None):
-        return {"name": name, "anchor": anchor,
-                "amend": score_amend(ftaf, obs, vf, vt, profile=profile) if want_amend else None,
-                "skill": score_skill(ftaf, obs, vf, vt, profile=profile) if want_skill else None,
-                "tafver": score_tafver(ftaf, obs, vf, vt, profile=profile) if want_tafver else None}
+    def score_one(name, ftaf, anchor=None, tid=None):
+        kw = dict(profile=profile, truth_policy=policies["truth"])
+        return {"name": name, "anchor": anchor, "taf_id": tid,
+                "amend": (score_amend(ftaf, obs, vf, vt, policy=policies["amend"], **kw)
+                          if want_amend else None),
+                "skill": (score_skill(ftaf, obs, vf, vt, policy=policies["skill"], **kw)
+                          if want_skill else None),
+                "tafver": (score_tafver(ftaf, obs, vf, vt, policy=policies["tafver"], **kw)
+                           if want_tafver else None)}
 
-    results = [score_one("subject", taf)]
+    unavailable = {"anchor": None, "taf_id": None, "amend": None, "skill": None, "tafver": None}
+    results = [score_one("subject", taf, tid=taf_id)]
+    if "human" in baselines:
+        hrow = store.human_taf_for_window(con, station, vf)
+        if hrow is not None and hrow["taf_id"] != taf_id:
+            try:
+                htaf = parse(hrow.get("parse_body") or hrow["raw_taf"])
+                results.append(score_one("human", htaf, tid=hrow["taf_id"]))
+            except Exception as e:  # noqa: BLE001 -- an unparseable human TAF is reported, not fatal
+                results.append({"name": "human", **unavailable,
+                                "error": f"{type(e).__name__}: {e}"})
+        else:
+            results.append({"name": "human", **unavailable})
     if "persistence" in baselines:
         anchor = _persistence_anchor(obs, vf)
         if anchor is not None:
             results.append(score_one("persistence", persistence_taf(anchor, vf, vt),
                                      anchor=anchor["obs_time"]))
         else:
-            results.append({"name": "persistence", "anchor": None,
-                            "amend": None, "skill": None, "tafver": None})
+            results.append({"name": "persistence", **unavailable})
 
     report = _markdown(station, vf, vt, canonical, obs, results)
-    return {"station": station, "valid_from": vf, "valid_to": vt,
-            "results": results, "report": report}
+    return {"station": station, "valid_from": vf, "valid_to": vt, "canonical": canonical,
+            "subject_row": subject_row, "results": results, "report": report,
+            "obs": obs, "profile": profile, "policies": policies}
 
 
 def _amend_line(name: str, s: TafAmendScore | None) -> str:
@@ -245,17 +280,211 @@ def _skill_detail(results) -> list[str]:
     return md
 
 
+# ---------------------------------------------------------------------------
+# Persistence + the --pending post-validity pass (M4 step 3)
+# ---------------------------------------------------------------------------
+
+def _coverage(obs: list[dict], vf: datetime, vt: datetime) -> dict:
+    """Truth-coverage manifest over the half-open window: which whole hours have at
+    least one in-window ob. Drives the required-coverage gate and is persisted on the
+    evaluation row (sec 11)."""
+    hours_total = max(int((vt - vf).total_seconds() // 3600), 0)
+    have = {int((o["obs_time"] - vf).total_seconds() // 3600)
+            for o in obs if vf <= o["obs_time"] < vt}
+    missing = [h for h in range(hours_total) if h not in have]
+    return {"hours_total": hours_total, "hours_with_obs": hours_total - len(missing),
+            "fraction": round((hours_total - len(missing)) / hours_total, 4) if hours_total else 0.0,
+            "missing_hours": [(vf + timedelta(hours=h)).strftime("%Y-%m-%dT%H:%MZ")
+                              for h in missing]}
+
+
+def _producer_meta(con, r: dict) -> dict:
+    """producer_kind/name for one result entry: read from the archived TAF row when the
+    entry has one; the synthetic persistence baseline has neither."""
+    if r["name"] == "persistence":
+        return {"producer_kind": "baseline",
+                "producer_name": f"persistence-{PERSISTENCE_MAX_AGE_MIN}min"}
+    if r.get("taf_id"):
+        row = store.taf(con, r["taf_id"])
+        if row:
+            return {"producer_kind": row.get("producer_kind"),
+                    "producer_name": row.get("producer_name")}
+    return {"producer_kind": None, "producer_name": None}
+
+
+def persist_scores(con, evaluation_id: str, out: dict) -> dict:
+    """Write the per-scorer result rows (sec 11) for every scored producer in `out`
+    (a run() result). Idempotent: identical inputs find the existing scorer run and
+    skip -- append-only history. Returns {scorer: rows_created} counts."""
+    pol = out["policies"]
+    created = {"tafver": 0, "amend": 0, "skill": 0}
+    subj_skill = out["results"][0].get("skill")
+    pers_skill = next((r["skill"] for r in out["results"]
+                       if r["name"] == "persistence" and r.get("skill") is not None), None)
+
+    def meta_for(r, policy, scorer_version):
+        pd = policy.model_dump()
+        return {"evaluation_id": evaluation_id, "taf_id": r.get("taf_id"),
+                "subject": r["name"], **_producer_meta(con, r),
+                "policy_name": policy.name, "policy_version": policy.version,
+                "policy": pd, "policy_hash": stable_hash(pd),
+                "scorer_version": scorer_version}
+
+    for r in out["results"]:
+        if r.get("tafver") is not None:
+            _, new = store.insert_tafver_result(
+                con, meta_for(r, pol["tafver"], tafver.SCORER_VERSION),
+                r["tafver"].model_dump())
+            created["tafver"] += new
+        if r.get("amend") is not None:
+            _, new = store.insert_tafamend_result(
+                con, meta_for(r, pol["amend"], tafamend.SCORER_VERSION),
+                r["amend"].model_dump())
+            created["amend"] += new
+        if r.get("skill") is not None:
+            deltas = (skill_deltas(subj_skill, pers_skill)
+                      if r["name"] == "subject" and pers_skill is not None
+                      and subj_skill is not None else None)
+            _, new = store.insert_tafskill_result(
+                con, meta_for(r, pol["skill"], tafskill.SCORER_VERSION),
+                r["skill"].model_dump(), deltas=deltas)
+            created["skill"] += new
+    return created
+
+
+def _score_pending_one(ev: dict, args) -> str:
+    """Score one elapsed pending evaluation end-to-end. Returns the outcome:
+    'scored' | 'partial' | 'skipped (<why>)'. Raises on unexpected errors (the
+    caller records them and moves on).
+
+    Runs entirely under ONE write_lock hold: DuckDB is single-writer across
+    processes, and mixing read-only and RW opens mid-pass would race the poller /
+    collector on the Pi. Scoring one evaluation is seconds of work (the IEM
+    backfill is the slow path -- run --pending at a quiet time), so briefly
+    queueing the other crons is the simple, correct trade."""
+    ev_id, station = ev["evaluation_id"], ev["station"]
+    vf, vt = ev["valid_from"], ev["valid_to"]
+
+    with store.write_lock(args.db):
+        con = store.connect(args.db)
+        try:
+            taf_id = ev.get("taf_id")
+            if not taf_id:                  # older rows predate the taf_id column
+                run_row = store.run(con, ev_id)
+                taf_id = run_row.get("taf_id") if run_row else None
+            if not taf_id:
+                return "skipped (no taf_id resolvable; evaluation has no scorable TAF)"
+
+            obs = store.scoring_window(con, station, vf, vt)
+            cov = _coverage(obs, vf, vt)
+            if cov["fraction"] < args.min_coverage and args.backfill == "iem":
+                # Backfill truth gaps from the IEM archive (military fields ARE served
+                # for METARs; TAFs are what IEM lacks). Widened by the carry-in /
+                # terminator margins. iem.load opens its own conn to the same DB --
+                # same process, same RW mode, so the instance is shared cleanly.
+                iem.load(station, vf - timedelta(hours=2), vt + timedelta(hours=1),
+                         db_path=args.db)
+                obs = store.scoring_window(con, station, vf, vt)
+                cov = _coverage(obs, vf, vt)
+
+            complete = cov["fraction"] >= args.min_coverage
+            if not complete and not args.allow_partial:
+                return (f"skipped (coverage {cov['fraction']:.0%} < "
+                        f"{args.min_coverage:.0%}; {len(cov['missing_hours'])} hour(s) "
+                        "missing -- backfill or --allow-partial)")
+
+            out = run(con, taf_id=taf_id, scorers=args.scorers_list,
+                      baselines=args.baselines_list)
+            status = "scored" if complete else "partial"
+            store.init_results_schema(con)
+            counts = persist_scores(con, ev_id, out)
+            store.finalize_evaluation(
+                con, ev_id, status=status, obs_hash=obs_hash(out["obs"]),
+                truth_policy_json=out["policies"]["truth"].model_dump_json(),
+                truth_policy_hash=stable_hash(out["policies"]["truth"].model_dump()),
+                profile_snapshot_json=out["profile"].model_dump_json(),
+                profile_hash=stable_hash(out["profile"].model_dump()),
+                coverage_manifest_json=json.dumps(cov))
+        finally:
+            con.close()
+
+    Path("logs").mkdir(exist_ok=True)
+    path = Path("logs") / f"tafscore_{station}_{ev_id}.md"
+    path.write_text(out["report"], encoding="utf-8")
+
+    r0 = out["results"][0]
+    head = []
+    if r0["tafver"] is not None:
+        head.append(f"TAFVER={r0['tafver'].combined_percent}")
+    if r0["amend"] is not None:
+        head.append(f"triggers={r0['amend'].trigger_count}")
+    if r0["skill"] is not None:
+        head.append(f"MACE={r0['skill'].mace}")
+    print(f"  {ev_id}: {status} coverage={cov['fraction']:.0%} {' '.join(head)} "
+          f"(new rows {counts}) -> {path}")
+    return status
+
+
+def cmd_pending(args) -> int:
+    """The post-validity pass: score every pending evaluation whose window has been
+    fully elapsed for at least --grace-hours (lets the trailing obs settle)."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with store.write_lock(args.db):
+        con = store.connect(args.db)
+        try:
+            store.init_scoring_schema(con)
+            store.init_results_schema(con)
+            pend = store.pending_evaluations(con, before=now - timedelta(hours=args.grace_hours))
+        finally:
+            con.close()
+    print(f"[{now:%Y-%m-%dT%H:%MZ}] {len(pend)} pending evaluation(s) with elapsed windows")
+    outcomes: dict[str, int] = {}
+    failed = 0
+    for ev in pend:
+        try:
+            outcome = _score_pending_one(ev, args)
+        except Exception as e:  # noqa: BLE001 -- one bad evaluation must not kill the pass
+            print(f"  {ev['evaluation_id']}: ERROR {type(e).__name__}: {e}")
+            failed += 1
+            continue
+        key = outcome.split(" ")[0]
+        outcomes[key] = outcomes.get(key, 0) + 1
+        if key == "skipped":
+            print(f"  {ev['evaluation_id']}: {outcome}")
+    print(f"done: {outcomes or '{}'}" + (f", {failed} ERROR(s)" if failed else ""))
+    return 1 if failed else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Score a TAF against observed truth.")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--taf-id")
     src.add_argument("--taf-text")
     src.add_argument("--taf-file")
+    src.add_argument("--pending", action="store_true",
+                     help="score all pending evaluations with elapsed windows (persists)")
     ap.add_argument("--issue-date", help="issue DATE (YYYY-MM-DD) for --taf-text/--taf-file")
-    ap.add_argument("--scorers", default="amend")
-    ap.add_argument("--baselines", default="persistence")
+    ap.add_argument("--scorers", default=None,
+                    help="default: amend (ad-hoc) / tafver,amend,skill (--pending)")
+    ap.add_argument("--baselines", default=None,
+                    help="default: persistence (ad-hoc) / persistence,human (--pending)")
+    ap.add_argument("--backfill", choices=["iem"],
+                    help="--pending: backfill missing truth obs from this source")
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="--pending: score below --min-coverage as status=partial")
+    ap.add_argument("--grace-hours", type=float, default=1.0,
+                    help="--pending: wait this long past valid_to before scoring")
+    ap.add_argument("--min-coverage", type=float, default=0.9,
+                    help="--pending: required fraction of window hours with an ob")
     ap.add_argument("--db", default=settings.db_path)
     args = ap.parse_args()
+
+    args.scorers_list = (args.scorers or ("tafver,amend,skill" if args.pending
+                                          else "amend")).split(",")
+    args.baselines_list = (args.baselines or ("persistence,human" if args.pending
+                                              else "persistence")).split(",")
+    if args.pending:
+        return cmd_pending(args)
 
     raw = None
     if args.taf_text:
@@ -268,7 +497,7 @@ def main() -> int:
 
     con = store.connect(args.db, read_only=True)
     out = run(con, taf_id=args.taf_id, raw=raw, issue_ref=issue_ref,
-              scorers=args.scorers.split(","), baselines=args.baselines.split(","))
+              scorers=args.scorers_list, baselines=args.baselines_list)
     con.close()
 
     Path("logs").mkdir(exist_ok=True)

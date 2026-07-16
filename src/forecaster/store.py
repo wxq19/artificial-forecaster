@@ -8,9 +8,10 @@ time (see insert_obs). All times are UTC.
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -479,20 +480,45 @@ def copy_climo(con: duckdb.DuckDBPyConnection, src_db_path: str, station: str) -
     Returns the monthly rows copied (0 if the source has no climo for the station yet).
     Hold write_lock on src if the poller may be writing it."""
     init_climo_schema(con)
-    try:
-        con.execute(f"ATTACH '{src_db_path}' AS climosrc (READ_ONLY)")
-    except duckdb.Error:
-        return 0
+    con.execute(f"ATTACH '{src_db_path}' AS climosrc (READ_ONLY)")
     try:
         for tbl in ("climo_meta", "climo_monthly", "climo_hourly"):
             con.execute(f"INSERT INTO {tbl} SELECT * FROM climosrc.{tbl} WHERE station = ?",
                         [station])
         return con.execute(
             "SELECT count(*) FROM climo_monthly WHERE station = ?", [station]).fetchone()[0]
-    except duckdb.Error:
+    except duckdb.CatalogException:
+        # ONLY "source has no climo tables yet" reads as not-built -> 0. Anything else
+        # (missing/locked/corrupt source) must raise: swallowing it made a real failure
+        # indistinguishable from an unbuilt climo.
         return 0
     finally:
         con.execute("DETACH climosrc")
+
+
+def copy_obs(con: duckdb.DuckDBPyConnection, src_db_path: str, station: str, *,
+             before: datetime, hours: float) -> int:
+    """Copy a station's obs rows from the benchmark DB into `con` (a per-run collection
+    DB), STRICTLY before the `before` cutoff and no older than `hours` back from it --
+    the leakage guard enforced in SQL, so the per-run DB can never hold an ob at or
+    after issue time. One fetch feeds both DBs: the collector banks truth obs into the
+    benchmark DB (no cutoff -- truth wants everything), then copies the pre-cutoff
+    back-window here for the model's read tools. Returns rows copied. The caller holds
+    write_lock on the source."""
+    init_schema(con)
+    cutoff = _to_naive_utc(before)
+    start = cutoff - timedelta(hours=hours)
+    con.execute(f"ATTACH '{src_db_path}' AS obssrc (READ_ONLY)")
+    try:
+        before_n = con.execute("SELECT count(*) FROM obs").fetchone()[0]
+        con.execute(
+            "INSERT INTO obs SELECT * FROM obssrc.obs "
+            "WHERE station = ? AND obs_time < ? AND obs_time >= ? "
+            "ON CONFLICT (station, obs_time) DO NOTHING",
+            [station, cutoff, start])
+        return con.execute("SELECT count(*) FROM obs").fetchone()[0] - before_n
+    finally:
+        con.execute("DETACH obssrc")
 
 
 def climo_meta(con: duckdb.DuckDBPyConnection, station: str) -> dict | None:
@@ -699,6 +725,7 @@ _EVALUATIONS_DDL = """
 CREATE TABLE IF NOT EXISTS evaluations (
     evaluation_id         VARCHAR   NOT NULL,
     station               VARCHAR,
+    taf_id                VARCHAR,                  -- the subject TAF in `tafs`
     valid_from            TIMESTAMP,
     valid_to              TIMESTAMP,
     status                VARCHAR,                  -- pending | scored | partial
@@ -709,9 +736,14 @@ CREATE TABLE IF NOT EXISTS evaluations (
     profile_hash          VARCHAR,
     coverage_manifest_json JSON,
     created_at            TIMESTAMP,
+    scored_at             TIMESTAMP,                -- set when status flips off pending
     PRIMARY KEY (evaluation_id)
 );
 """
+
+# Columns added after the evaluations table first shipped (CREATE TABLE IF NOT
+# EXISTS never adds columns to an existing table; bring older DBs forward).
+_EVALUATIONS_MIGRATIONS = (("taf_id", "VARCHAR"), ("scored_at", "TIMESTAMP"))
 
 
 def init_scoring_schema(con: duckdb.DuckDBPyConnection) -> None:
@@ -720,6 +752,8 @@ def init_scoring_schema(con: duckdb.DuckDBPyConnection) -> None:
     and init_worksheet_schema; the read-only tool conn never runs this."""
     con.execute(_TAFS_DDL)
     con.execute(_EVALUATIONS_DDL)
+    for col, typ in _EVALUATIONS_MIGRATIONS:
+        con.execute(f"ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS {col} {typ}")
 
 
 def insert_taf(con: duckdb.DuckDBPyConnection, taf: dict) -> bool:
@@ -753,19 +787,46 @@ def taf(con: duckdb.DuckDBPyConnection, taf_id: str) -> dict | None:
 
 
 def previous_human_taf(con: duckdb.DuckDBPyConnection, station: str,
-                       before: datetime | None = None) -> dict | None:
+                       before: datetime | None = None,
+                       valid_before: datetime | None = None) -> dict | None:
     """The most recent HUMAN/official TAF for a station, optionally issued STRICTLY before
     `before` (naive UTC). Feeds the leakage-safe get_previous_taf: the collector reads this
     from the benchmark archive and loads exactly that one bulletin into the per-run DB, so
     the model sees the forecast a human had in hand, never the one it is scored against.
-    Returns the tafs row dict (JSON columns as strings) or None."""
+
+    `valid_before` additionally requires valid_from_utc STRICTLY before it -- pass the
+    agent's own valid_from so the current cycle's bulletin can NEVER qualify, no matter
+    how early the human posted it. The issue-time buffer alone breaks silently if a
+    station starts posting more than the buffer ahead of the hour (KBLV was observed
+    posting 30 min early); a previous CYCLE is exact. Returns the tafs row dict (JSON
+    columns as strings) or None."""
     sql = "SELECT * FROM tafs WHERE station = ? AND producer_kind IN ('human', 'official')"
     params: list = [station]
     if before is not None:
         sql += " AND issue_time_utc < ?"
         params.append(before)
+    if valid_before is not None:
+        sql += " AND valid_from_utc < ?"
+        params.append(valid_before)
     sql += " ORDER BY issue_time_utc DESC LIMIT 1"
     cur = con.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
+def human_taf_for_window(con: duckdb.DuckDBPyConnection, station: str,
+                         valid_from: datetime) -> dict | None:
+    """The paired human ROUTINE TAF for a scoring window: same station, same
+    valid_from (the agent's valid_from is pinned to the cycle hour, and roster
+    routine TAFs are valid from that same hour). Latest issue wins if a correction
+    re-posted the cycle. None if the poller never archived one -- the scorer then
+    reports the human baseline unavailable, never guesses."""
+    cur = con.execute(
+        "SELECT * FROM tafs WHERE station = ? AND producer_kind IN ('human', 'official') "
+        "AND bulletin_type = 'routine' AND valid_from_utc = ? "
+        "ORDER BY issue_time_utc DESC LIMIT 1",
+        [station, _to_naive_utc(valid_from)])
     cols = [d[0] for d in cur.description]
     row = cur.fetchone()
     return dict(zip(cols, row)) if row else None
@@ -775,15 +836,47 @@ def insert_evaluation(con: duckdb.DuckDBPyConnection, ev: dict) -> None:
     """Upsert one evaluation-spine row (idempotent replace by evaluation_id). `ev`
     keys are the evaluations columns; missing keys default to NULL."""
     cols = [
-        "evaluation_id", "station", "valid_from", "valid_to", "status", "obs_hash",
-        "truth_policy_json", "truth_policy_hash", "profile_snapshot_json",
-        "profile_hash", "coverage_manifest_json", "created_at",
+        "evaluation_id", "station", "taf_id", "valid_from", "valid_to", "status",
+        "obs_hash", "truth_policy_json", "truth_policy_hash", "profile_snapshot_json",
+        "profile_hash", "coverage_manifest_json", "created_at", "scored_at",
     ]
     con.execute("DELETE FROM evaluations WHERE evaluation_id = ?", [ev["evaluation_id"]])
     con.execute(
         f"INSERT INTO evaluations ({', '.join(cols)}) VALUES ({', '.join('$' + c for c in cols)})",
         {c: ev.get(c, None) for c in cols},
     )
+
+
+def pending_evaluations(con: duckdb.DuckDBPyConnection,
+                        before: datetime | None = None) -> list[dict]:
+    """Pending evaluation rows whose validity window has fully ELAPSED (valid_to <=
+    `before`, default now) -- the work list for score_taf.py --pending. Oldest first,
+    so a backlog scores in collection order."""
+    cutoff = _to_naive_utc(before) if before else datetime.now(timezone.utc).replace(tzinfo=None)
+    cur = con.execute(
+        "SELECT * FROM evaluations WHERE status = 'pending' AND valid_to <= ? "
+        "ORDER BY valid_to, evaluation_id", [cutoff])
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def finalize_evaluation(con: duckdb.DuckDBPyConnection, evaluation_id: str, *,
+                        status: str, obs_hash: str | None = None,
+                        truth_policy_json: str | None = None,
+                        truth_policy_hash: str | None = None,
+                        profile_snapshot_json: str | None = None,
+                        profile_hash: str | None = None,
+                        coverage_manifest_json: str | None = None) -> None:
+    """Flip a pending evaluation to scored|partial and stamp the truth provenance
+    (sec 11/12). UPDATE-in-place on the spine row; the created_at/identity columns
+    are never touched."""
+    con.execute(
+        "UPDATE evaluations SET status = ?, obs_hash = ?, truth_policy_json = ?, "
+        "truth_policy_hash = ?, profile_snapshot_json = ?, profile_hash = ?, "
+        "coverage_manifest_json = ?, scored_at = ? WHERE evaluation_id = ?",
+        [status, obs_hash, truth_policy_json, truth_policy_hash, profile_snapshot_json,
+         profile_hash, coverage_manifest_json,
+         datetime.now(timezone.utc).replace(tzinfo=None), evaluation_id])
 
 
 def evaluation(con: duckdb.DuckDBPyConnection, evaluation_id: str) -> dict | None:
@@ -920,3 +1013,411 @@ def scoring_window(
     )
     cols = [d[0] for d in cur.description]
     return _deserialize_obs([dict(zip(cols, r)) for r in cur.fetchall()])
+
+
+# ---------------------------------------------------------------------------
+# Per-scorer RESULT tables (scoring-design sec 11) -- the M4 deferred half.
+# One shared shape: a `*_runs` provenance row per (evaluation, taf, subject,
+# policy hash, scorer version) plus tall detail tables FK'd by scorer_run_id.
+# Immutability: a rerun with IDENTICAL inputs finds the existing run and returns
+# it -- runs are never replaced; any change (truth/policy/scorer version) is a
+# NEW run. History is append-only. Scoring MATH stays in the scorer modules;
+# these writers take plain dicts (Score.model_dump()) and map fields to columns.
+# ---------------------------------------------------------------------------
+
+SCORING_SCHEMA_VERSION = "1"    # bump when any result-table shape changes
+
+# Provenance columns shared by all three *_runs tables.
+_SCORER_RUN_COLS = """
+    scorer_run_id     VARCHAR   NOT NULL,
+    evaluation_id     VARCHAR   NOT NULL,
+    taf_id            VARCHAR,              -- NULL for a synthetic baseline (persistence)
+    subject           VARCHAR,              -- subject | persistence | human
+    producer_kind     VARCHAR,
+    producer_name     VARCHAR,
+    policy_name       VARCHAR,
+    policy_version    VARCHAR,
+    policy_json       JSON,
+    policy_hash       VARCHAR,
+    scorer_version    VARCHAR,
+    schema_version    VARCHAR,
+    created_at        TIMESTAMP,
+"""
+
+_RESULTS_DDL = [
+    f"""
+CREATE TABLE IF NOT EXISTS tafver_runs (
+    {_SCORER_RUN_COLS}
+    provisional         BOOLEAN,
+    combined_earned     DOUBLE,
+    combined_available  INTEGER,
+    combined_percent    DOUBLE,
+    pw_accuracy         DOUBLE,
+    obs_hash            VARCHAR,
+    profile_hash        VARCHAR,
+    category_stats_json JSON,
+    pw_event_bias_json  JSON,
+    PRIMARY KEY (scorer_run_id)
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS tafver_hourly (
+    scorer_run_id    VARCHAR   NOT NULL,
+    group_index      INTEGER,
+    group_type       VARCHAR,
+    interval_start   TIMESTAMP,
+    interval_end     TIMESTAMP,
+    lead_hr          INTEGER,
+    element          VARCHAR,
+    fcst_value       VARCHAR,
+    obs_value        VARCHAR,
+    fcst_cat         VARCHAR,
+    obs_cat          VARCHAR,
+    points_earned    DOUBLE,
+    points_available INTEGER,
+    status           VARCHAR,
+    reason           VARCHAR
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS tafver_summary (
+    scorer_run_id VARCHAR   NOT NULL,
+    element       VARCHAR,              -- 'combined' = a group-type bucket row
+    bucket        VARCHAR,              -- ALL | INITIAL | FM | BECMG | TEMPO | PROB
+    earned        DOUBLE,
+    available     INTEGER,
+    percent       DOUBLE
+);
+""",
+    f"""
+CREATE TABLE IF NOT EXISTS tafamend_runs (
+    {_SCORER_RUN_COLS}
+    trigger_count              INTEGER,
+    hours_scored               INTEGER,
+    hours_in_spec              INTEGER,
+    in_spec_fraction           DOUBLE,
+    hours_after_amd_service    INTEGER,
+    triggers_after_amd_service INTEGER,
+    per_rule_episodes_json     JSON,
+    rules_not_scored_json      JSON,
+    category_series_json       JSON,
+    PRIMARY KEY (scorer_run_id)
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS tafamend_rule_hours (
+    scorer_run_id     VARCHAR   NOT NULL,
+    hour              TIMESTAMP,
+    rule              VARCHAR,
+    result            VARCHAR,              -- pass | fail | unavailable
+    reason            VARCHAR,
+    fcst              VARCHAR,
+    obs               VARCHAR,
+    detail            VARCHAR,
+    after_amd_service BOOLEAN
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS tafamend_events (
+    scorer_run_id     VARCHAR   NOT NULL,
+    kind              VARCHAR,              -- rule_episode | trigger
+    rule              VARCHAR,              -- NULL on a trigger row
+    onset             TIMESTAMP,
+    end_time          TIMESTAMP,            -- NULL on a trigger row
+    hours             INTEGER,
+    worst_detail      VARCHAR,
+    rules_json        JSON,                 -- trigger rows: the merged rule list
+    after_amd_service BOOLEAN
+);
+""",
+    f"""
+CREATE TABLE IF NOT EXISTS tafskill_runs (
+    {_SCORER_RUN_COLS}
+    catalog_version      VARCHAR,
+    mace                 DOUBLE,
+    signed_mace_mean     DOUBLE,
+    worst_excursion_json JSON,
+    hours_scored         INTEGER,
+    hours_unavailable    INTEGER,
+    element_stats_json   JSON,
+    contingency_json     JSON,
+    deltas_json          JSON,              -- subject-vs-baseline deltas (subject row only)
+    category_series_json JSON,
+    PRIMARY KEY (scorer_run_id)
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS tafskill_element_rows (
+    scorer_run_id VARCHAR   NOT NULL,
+    grain         VARCHAR,                  -- hour | group | taf
+    hour          TIMESTAMP,
+    lead_hr       INTEGER,
+    group_type    VARCHAR,
+    element       VARCHAR,
+    fcst_value    DOUBLE,
+    obs_value     DOUBLE,
+    signed_error  DOUBLE,
+    abs_error     DOUBLE,
+    status        VARCHAR,
+    reason        VARCHAR
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS tafskill_event_hours (
+    scorer_run_id VARCHAR   NOT NULL,
+    hour          TIMESTAMP,
+    event         VARCHAR,
+    fcst          BOOLEAN,
+    obs           BOOLEAN,                  -- NULL = not evaluable this hour
+    via_tempo     BOOLEAN,
+    cell          VARCHAR                   -- hit | miss | false_alarm | correct_negative
+);
+""",
+    """
+CREATE TABLE IF NOT EXISTS tafskill_episodes (
+    scorer_run_id VARCHAR   NOT NULL,
+    event         VARCHAR,
+    disposition   VARCHAR,                  -- matched | missed | false_alarm
+    obs_onset     TIMESTAMP,
+    obs_end       TIMESTAMP,
+    fcst_onset    TIMESTAMP,
+    fcst_end      TIMESTAMP,
+    onset_error_h DOUBLE,
+    end_error_h   DOUBLE
+);
+""",
+]
+
+
+def init_results_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the per-scorer result tables if absent. Idempotent; WRITE-path side
+    effect only, like init_scoring_schema."""
+    for ddl in _RESULTS_DDL:
+        con.execute(ddl)
+
+
+def scorer_run_id(evaluation_id: str, taf_id: str | None, subject: str, scorer: str,
+                  policy_hash: str, scorer_version: str) -> str:
+    """Deterministic id for one scorer run: identical inputs -> identical id, which
+    is what makes reruns append-only no-ops (sec 11)."""
+    key = "|".join([evaluation_id, taf_id or "", subject, scorer, policy_hash,
+                    scorer_version, SCORING_SCHEMA_VERSION])
+    return f"sr_{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+
+
+def _j(payload) -> str | None:
+    """JSON-serialize a python object for a JSON column (None passes through)."""
+    return None if payload is None else json.dumps(payload, default=str)
+
+
+def _insert_scorer_run(con, table: str, meta: dict, extra: dict) -> tuple[str, bool]:
+    """Shared *_runs insert. Returns (scorer_run_id, created). created=False means an
+    identical run already exists and the caller must NOT re-insert tall rows."""
+    sid = scorer_run_id(meta["evaluation_id"], meta.get("taf_id"), meta["subject"],
+                        table, meta["policy_hash"], meta["scorer_version"])
+    if con.execute(f"SELECT 1 FROM {table} WHERE scorer_run_id = ?", [sid]).fetchone():
+        return sid, False
+    row = {
+        "scorer_run_id": sid, "evaluation_id": meta["evaluation_id"],
+        "taf_id": meta.get("taf_id"), "subject": meta["subject"],
+        "producer_kind": meta.get("producer_kind"), "producer_name": meta.get("producer_name"),
+        "policy_name": meta.get("policy_name"), "policy_version": meta.get("policy_version"),
+        "policy_json": _j(meta.get("policy")), "policy_hash": meta["policy_hash"],
+        "scorer_version": meta["scorer_version"], "schema_version": SCORING_SCHEMA_VERSION,
+        "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
+        **extra,
+    }
+    cols = list(row)
+    con.execute(
+        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('$' + c for c in cols)})",
+        row)
+    return sid, True
+
+
+def _insert_tall(con, table: str, sid: str, rows: list[dict], colmap: dict) -> None:
+    """Bulk-insert tall detail rows. colmap maps table column -> source dict key
+    (or a callable on the row dict)."""
+    if not rows:
+        return
+    cols = ["scorer_run_id", *colmap]
+    sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
+    params = [[sid] + [(src(r) if callable(src) else r.get(src)) for src in colmap.values()]
+              for r in rows]
+    con.executemany(sql, params)
+
+
+def insert_tafver_result(con: duckdb.DuckDBPyConnection, meta: dict, score: dict) -> tuple[str, bool]:
+    """Persist one TAFVER run: provenance row + hourly + summary tall rows, one txn.
+    `meta` carries evaluation_id/taf_id/subject/producer/policy provenance; `score`
+    is TafverScore.model_dump(). Idempotent by scorer_run_id (append-only reruns)."""
+    con.execute("BEGIN TRANSACTION")
+    try:
+        sid, created = _insert_scorer_run(con, "tafver_runs", meta, {
+            "provisional": score["provisional"],
+            "combined_earned": score["combined_earned"],
+            "combined_available": score["combined_available"],
+            "combined_percent": score["combined_percent"],
+            "pw_accuracy": score.get("pw_accuracy"),
+            "obs_hash": score["obs_hash"], "profile_hash": score["profile_hash"],
+            "category_stats_json": _j(score.get("category_stats")),
+            "pw_event_bias_json": _j(score.get("pw_event_bias")),
+        })
+        if created:
+            _insert_tall(con, "tafver_hourly", sid, score["rows"], {
+                "group_index": "group_index", "group_type": "group_type",
+                "interval_start": "interval_start", "interval_end": "interval_end",
+                "lead_hr": "lead_hr", "element": "element",
+                "fcst_value": "fcst_value", "obs_value": "obs_value",
+                "fcst_cat": "fcst_cat", "obs_cat": "obs_cat",
+                "points_earned": "points_earned", "points_available": "points_available",
+                "status": "status", "reason": "reason"})
+            summary = score["element_summaries"] + score["group_type_summaries"]
+            _insert_tall(con, "tafver_summary", sid, summary, {
+                "element": "element", "bucket": "bucket", "earned": "earned",
+                "available": "available", "percent": "percent"})
+        con.execute("COMMIT")
+        return sid, created
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
+def insert_tafamend_result(con: duckdb.DuckDBPyConnection, meta: dict, score: dict) -> tuple[str, bool]:
+    """Persist one amendment-bust run: provenance row + rule-hours + events, one txn.
+    `score` is TafAmendScore.model_dump(). Idempotent by scorer_run_id."""
+    con.execute("BEGIN TRANSACTION")
+    try:
+        sid, created = _insert_scorer_run(con, "tafamend_runs", meta, {
+            "trigger_count": score["trigger_count"],
+            "hours_scored": score["hours_scored"],
+            "hours_in_spec": score["hours_in_spec"],
+            "in_spec_fraction": score["in_spec_fraction"],
+            "hours_after_amd_service": score["hours_after_amd_service"],
+            "triggers_after_amd_service": score["triggers_after_amd_service"],
+            "per_rule_episodes_json": _j(score.get("per_rule_episodes")),
+            "rules_not_scored_json": _j(score.get("rules_not_scored")),
+            "category_series_json": _j(score.get("category_series")),
+        })
+        if created:
+            _insert_tall(con, "tafamend_rule_hours", sid, score["hourly_results"], {
+                "hour": "hour", "rule": "rule", "result": "result", "reason": "reason",
+                "fcst": "fcst", "obs": "obs", "detail": "detail",
+                "after_amd_service": "after_amd_service"})
+            events = ([{**e, "kind": "rule_episode", "rules_json": None}
+                       for e in score["rule_episodes"]]
+                      + [{"kind": "trigger", "rule": None, "onset": t["onset"], "end": None,
+                          "hours": None, "worst_detail": None,
+                          "rules_json": _j(t["rules"]),
+                          "after_amd_service": t["after_amd_service"]}
+                         for t in score["triggers"]])
+            _insert_tall(con, "tafamend_events", sid, events, {
+                "kind": "kind", "rule": "rule", "onset": "onset", "end_time": "end",
+                "hours": "hours", "worst_detail": "worst_detail", "rules_json": "rules_json",
+                "after_amd_service": "after_amd_service"})
+        con.execute("COMMIT")
+        return sid, created
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
+def insert_tafskill_result(con: duckdb.DuckDBPyConnection, meta: dict, score: dict,
+                           deltas: dict | None = None) -> tuple[str, bool]:
+    """Persist one skill run: provenance row + element rows + event hours + episodes,
+    one txn. `score` is TafSkillScore.model_dump(); `deltas` (subject rows only) is
+    the skill_deltas() output vs the persistence baseline. Idempotent by scorer_run_id."""
+    con.execute("BEGIN TRANSACTION")
+    try:
+        sid, created = _insert_scorer_run(con, "tafskill_runs", meta, {
+            "catalog_version": score["catalog_version"],
+            "mace": score["mace"], "signed_mace_mean": score["signed_mace_mean"],
+            "worst_excursion_json": _j(score.get("worst_excursion")),
+            "hours_scored": score["hours_scored"],
+            "hours_unavailable": score["hours_unavailable"],
+            "element_stats_json": _j(score.get("element_stats")),
+            "contingency_json": _j(score.get("contingency")),
+            "deltas_json": _j(deltas),
+            "category_series_json": _j(score.get("category_series")),
+        })
+        if created:
+            _insert_tall(con, "tafskill_element_rows", sid, score["element_rows"], {
+                "grain": "grain", "hour": "hour", "lead_hr": "lead_hr",
+                "group_type": "group_type", "element": "element",
+                "fcst_value": "fcst_value", "obs_value": "obs_value",
+                "signed_error": "signed_error", "abs_error": "abs_error",
+                "status": "status", "reason": "reason"})
+            _insert_tall(con, "tafskill_event_hours", sid, score["event_hours"], {
+                "hour": "hour", "event": "event", "fcst": "fcst", "obs": "obs",
+                "via_tempo": "via_tempo", "cell": "cell"})
+            _insert_tall(con, "tafskill_episodes", sid, score["episodes"], {
+                "event": "event", "disposition": "disposition",
+                "obs_onset": "obs_onset", "obs_end": "obs_end",
+                "fcst_onset": "fcst_onset", "fcst_end": "fcst_end",
+                "onset_error_h": "onset_error_h", "end_error_h": "end_error_h"})
+        con.execute("COMMIT")
+        return sid, created
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+
+
+# --- batch aggregators (sec 11): SUM tall rows across runs; scoring math beyond
+# --- SUM/COUNT (percentages, contingency scores) stays in the scorer modules.
+
+def tafver_points(con: duckdb.DuckDBPyConnection, *, subject: str = "subject",
+                  station: str | None = None) -> list[dict]:
+    """Pooled TAFVER points per element across runs: SUM(earned), SUM(available)
+    over scored hourly rows. The caller divides (anti-averaging: points pool, never
+    percentages)."""
+    sql = ("SELECT h.element, SUM(h.points_earned) AS earned, "
+           "SUM(h.points_available) AS available, COUNT(*) AS n_rows "
+           "FROM tafver_hourly h JOIN tafver_runs r USING (scorer_run_id) "
+           "JOIN evaluations e ON r.evaluation_id = e.evaluation_id "
+           "WHERE h.status = 'scored' AND r.subject = ?")
+    params: list = [subject]
+    if station:
+        sql += " AND e.station = ?"
+        params.append(station)
+    cur = con.execute(sql + " GROUP BY h.element ORDER BY h.element", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def skill_errors(con: duckdb.DuckDBPyConnection, *, subject: str = "subject",
+                 station: str | None = None) -> list[dict]:
+    """Pooled element errors across runs: n, mean signed error (bias), mean abs
+    error (MAE) over scored hour-grain rows."""
+    sql = ("SELECT w.element, COUNT(*) AS n, AVG(w.signed_error) AS bias, "
+           "AVG(w.abs_error) AS mae "
+           "FROM tafskill_element_rows w JOIN tafskill_runs r USING (scorer_run_id) "
+           "JOIN evaluations e ON r.evaluation_id = e.evaluation_id "
+           "WHERE w.status = 'scored' AND w.grain = 'hour' AND r.subject = ?")
+    params: list = [subject]
+    if station:
+        sql += " AND e.station = ?"
+        params.append(station)
+    cur = con.execute(sql + " GROUP BY w.element ORDER BY w.element", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def skill_cells(con: duckdb.DuckDBPyConnection, *, subject: str = "subject",
+                station: str | None = None) -> list[dict]:
+    """Pooled 2x2 contingency cells per event across runs (a=hit, b=false_alarm,
+    c=miss, d=correct_negative). Feed tafskill.contingency_scores for POD/FAR/CSI/HSS
+    -- summed cells FIRST, scores second (pooling rule, sec 9.2)."""
+    sql = ("SELECT w.event, "
+           "SUM(CASE WHEN w.cell = 'hit' THEN 1 ELSE 0 END) AS a, "
+           "SUM(CASE WHEN w.cell = 'false_alarm' THEN 1 ELSE 0 END) AS b, "
+           "SUM(CASE WHEN w.cell = 'miss' THEN 1 ELSE 0 END) AS c, "
+           "SUM(CASE WHEN w.cell = 'correct_negative' THEN 1 ELSE 0 END) AS d "
+           "FROM tafskill_event_hours w JOIN tafskill_runs r USING (scorer_run_id) "
+           "JOIN evaluations e ON r.evaluation_id = e.evaluation_id "
+           "WHERE w.cell IS NOT NULL AND r.subject = ?")
+    params: list = [subject]
+    if station:
+        sql += " AND e.station = ?"
+        params.append(station)
+    cur = con.execute(sql + " GROUP BY w.event ORDER BY w.event", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]

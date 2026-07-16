@@ -16,6 +16,7 @@ benchmark leakage-proof. No LLM, no network; testable with a synthetic RunResult
 import gzip
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,10 +66,14 @@ def write_transcript(run_id: str, res: RunResult, *, artifacts_dir: str | None =
     return path
 
 
-def read_transcript(path: str | Path) -> list[dict]:
+def read_transcript(path: str | Path, db_path: str | None = None) -> list[dict]:
     """Load a transcript blob back into the messages array, transparently handling a
-    gzipped (.gz) or a plain .json file -- so a replay reader need not care which it is."""
+    gzipped (.gz) or plain .json file. `runs.transcript_path` is stored RELATIVE to the DB
+    directory (so the DB + runs/ folder are portable together); pass `db_path` to resolve
+    such a relative path against the DB's parent -- an absolute path is used as-is."""
     p = Path(path)
+    if not p.is_absolute() and db_path is not None:
+        p = Path(db_path).parent / p
     if p.suffix == ".gz":
         with gzip.open(p, "rt", encoding="utf-8") as f:
             return json.load(f)
@@ -103,6 +108,10 @@ def persist_run(
         toolset_hash=th)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     transcript_path = write_transcript(run_id, res, artifacts_dir=artifacts_dir, db_path=db_path)
+    # Store the transcript path RELATIVE to the DB directory, so the benchmark DB and its
+    # runs/ folder move together (rsync to the laptop / cloud) and stay resolvable.
+    db_dir = Path(db_path or settings.db_path).parent
+    transcript_rel = os.path.relpath(transcript_path, db_dir)
 
     con = store.connect(db_path) if db_path else store.connect()
     try:
@@ -146,12 +155,13 @@ def persist_run(
             except Exception:  # noqa: BLE001 -- an unrenderable/unparseable TAF is not a crash
                 taf_id = None
 
-        # Pending evaluation: only meaningful when there is a TAF to score.
+        # Pending evaluation: only meaningful when there is a TAF to score. taf_id
+        # rides on the spine row so the pending scorer needs no join through runs.
         evaluation_id = None
         if taf_id is not None:
             evaluation_id = run_id
             store.insert_evaluation(con, {
-                "evaluation_id": evaluation_id, "station": station,
+                "evaluation_id": evaluation_id, "station": station, "taf_id": taf_id,
                 "valid_from": valid_from, "valid_to": valid_to,
                 "status": "pending", "created_at": now})
 
@@ -171,9 +181,10 @@ def persist_run(
             "convergence": res.convergence, "first_emit_step": res.first_emit_step,
             "nudge_step": res.nudge_step, "taf_id": taf_id,
             "taf_clean": res.final_taf is not None, "worksheet_id": worksheet_id,
-            "transcript_path": str(transcript_path), "fatal": res.fatal, "created_at": now})
+            "transcript_path": transcript_rel, "fatal": res.fatal, "created_at": now})
     finally:
         con.close()
 
     return {"run_id": run_id, "taf_id": taf_id, "worksheet_id": worksheet_id,
-            "evaluation_id": evaluation_id, "transcript_path": str(transcript_path)}
+            "evaluation_id": evaluation_id, "transcript_path": str(transcript_path),
+            "transcript_rel": transcript_rel}

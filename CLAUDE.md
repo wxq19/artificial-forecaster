@@ -512,11 +512,25 @@ a regression test):
    `role` + `alternate_indices`; TAFVER folds best-of via `_best_of`/`_score_all`. TEMPO/PROB still emit their
    own overlay rows (unchanged; align to best-of later if wanted).
 
-### STORE STATUS (important): results are NOT persisted yet
-`tafs` + `evaluations` schema exist, but the per-scorer RESULT tables (`tafver_*`/`tafamend_*`/`tafskill_*`)
-and the batch aggregator readers are DEFERRED to M4 -- a scoring run today produces Python objects + a
-markdown log only (`insert_evaluation` is defined but uncalled; `score_taf.py` scores straight from a
-`--taf-id`/`--taf-text`). Building these + the two-phase pending-evaluation write-path IS M4 step 3.
+### STORE STATUS: results persistence + --pending BUILT (M4 step 3 DONE, 2026-07-16)
+The per-scorer RESULT tables now exist (`store.init_results_schema`: tafver_runs/hourly/summary,
+tafamend_runs/rule_hours/events, tafskill_runs/element_rows/event_hours/episodes) with append-only
+idempotency (deterministic `scorer_run_id` over evaluation+taf+subject+policy_hash+scorer_version;
+identical reruns are no-ops, changed inputs are NEW runs) plus the batch aggregators
+(`tafver_points`/`skill_errors`/`skill_cells` -- summed cells/points; division + contingency scores
+stay in the scorer modules). `score_taf.py --pending` is the post-validity pass: selects elapsed
+pending evaluations (grace default 1h), checks truth coverage (default >=90% of window hours;
+`--backfill iem` fills gaps -- IEM DOES serve the military fields for METARs, it is TAFs it lacks),
+scores subject + persistence + the paired HUMAN routine TAF (`store.human_taf_for_window`), persists
+under one write_lock hold per evaluation, and flips pending->scored (or ->partial with
+`--allow-partial`; failed-required-coverage stays PENDING -- the two are never conflated). Evaluation
+rows now carry `taf_id` + `scored_at` (migrations bring old DBs forward); provenance (obs_hash via
+tafver.obs_hash over the exact scoring_window rows, truth-policy/profile hash via the new shared
+`tafstate.stable_hash`, coverage manifest) lands on the spine row. Each scorer module has a
+`SCORER_VERSION` const (bump on scored-output-changing fixes). Self-test
+`scripts/test_score_pending.py` 21/21 (offline; scored/partial/skip/future/idempotency/aggregators/
+taf_id-fallback-via-runs). Known limitation: human TAFs are parsed from raw (parse_body preferred
+when present, but no remark-stripper exists yet -- same as the validated KLSV grading path).
 
 ### M4 PLAN -- paired live collection (decisions locked with owner 2026-07-13)
 Goal: schedule the TAF AGENT to run in parallel with each HUMAN TAF so both are archived FROZEN together
@@ -534,10 +548,33 @@ Goal: schedule the TAF AGENT to run in parallel with each HUMAN TAF so both are 
 - **Pi:** unattended collection on an always-on Raspberry Pi (64-bit Pi OS Lite, `uv sync`, `.env`); two
   cron jobs under `flock`; pull data off via nightly `rsync` (one `.duckdb` file + archived raw + logs).
   Owner asked for a full Pi runbook when we automate.
-- **Build order:** (1) human-TAF archive path (`awc.fetch_taf` -> `tafs`, canonical=true, producer_kind=human);
-  (2) `scripts/collect.py` -- archive human + run agent + write a PENDING evaluation, NO scoring; (3)
-  `score_taf.py --pending` -- score elapsed windows, flip to scored, BUILD the deferred result tables; (4)
-  Pi/cron + retrieval runbook.
+- **Build order:** (1) human-TAF archive path (`awc.fetch_taf` -> `tafs`, canonical=true, producer_kind=human)
+  DONE; (2) `scripts/collect.py` -- archive human + run agent + write a PENDING evaluation, NO scoring --
+  DONE; (3) `score_taf.py --pending` -- score elapsed windows, flip to scored, BUILD the deferred result
+  tables -- DONE 2026-07-16 (see STORE STATUS above); (4) Pi/cron + retrieval runbook -- deployed 2026-07-16
+  (docs/pi_setup_log.md; crons PENDING install until the climo build finishes; a third cron entry runs
+  `score_taf.py --pending --backfill iem` every 6h).
+
+### COLLECTION HARDENING (review fixes, 2026-07-16 -- this session)
+- **Truth-obs banking via dual-write:** `collect.py` now ingests obs ONCE into the BENCHMARK DB (no
+  cutoff -- truth wants everything; the model never reads that DB) and copies the pre-cutoff back-window
+  into the per-run DB via new `store.copy_obs` (cutoff enforced in SQL). Successive 8-hourly cycles tile
+  the timeline, so verification obs accumulate as a side effect of collection; IEM is only the backfill.
+- **get_previous_taf leakage guard hardened:** `store.previous_human_taf` gained `valid_before`; the
+  collector passes the run's valid_from, so the current cycle's bulletin can NEVER qualify however early
+  it posts (KBLV was observed posting 30 min early; the 15-min issue buffer alone would break silently).
+  Roster routine TAFs verified live to stamp exactly on the valid hour; mid-cycle AMDs still pass the
+  filter by design (a human forecaster has them in hand too; the notaf ablation measures the anchoring).
+- **Stub run row:** collect.py inserts a `stop_reason='incomplete'` runs row BEFORE the agent runs (under
+  the lock); the final persist_run replaces it by run_id. A cell killed by schedule.py's 30-min timeout
+  now leaves a record instead of vanishing (a silent missing matrix cell).
+- **Temp-dir leak fixed:** the per-run DB dir is rmtree'd in a finally (Debian 13 /tmp is tmpfs -- leaked
+  dirs accumulated in RAM on the Pi). `--ingest-hours` default 12->24 (matches get_trend's look-back).
+- **`store.copy_climo` no longer swallows errors:** only CatalogException (source has no climo tables)
+  reads as not-built -> 0; a missing/locked/corrupt source now raises.
+- Verified end-to-end live (KWRI, bogus model id -> fatal captured, scratch DB): 24h obs banked, run-DB
+  copy cutoff correct, stub->final row replacement, human 1800Z routine TAF archived, temp dir cleaned.
+  All self-tests green (incl. new test_score_pending 21/21); ruff clean. NOT committed (owner reviews).
 
 ### UNCOMMITTED: everything is still in the working tree
 The entire scoring subsystem (this session) PLUS the earlier climo + imagery + worksheet work are all

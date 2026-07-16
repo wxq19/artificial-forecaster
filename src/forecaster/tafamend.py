@@ -36,6 +36,10 @@ from forecaster.tafstate import (
     resolve_group_state,
 )
 
+# Bump on any scored-output-changing code fix, even with unchanged policy JSON
+# (sec 11): a rerun with a new scorer_version is a NEW run, never a replace.
+SCORER_VERSION = "1"
+
 # Rules computable now, and the doctrine rules deferred for lack of data (sec 8.2).
 BUILD_NOW_RULES = ["category", "wind", "altimeter", "thunderstorm", "tempo", "change_timing"]
 DEFERRED_RULES = {

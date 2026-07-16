@@ -61,6 +61,11 @@ if tp.exists():
                   and any(p.get("type") == "image_url" for p in m["content"]) for m in loaded)
     check("transcript round-trips the messages (image included)",
           loaded == res.messages and has_img)
+# portability: the stored path is RELATIVE and resolves against the DB dir (DB + runs/ move together).
+check("transcript_rel is relative", not Path(summary["transcript_rel"]).is_absolute(),
+      summary["transcript_rel"])
+check("relative transcript resolves via db_path",
+      read_transcript(summary["transcript_rel"], db_path=DB) == res.messages)
 
 con = store.connect(DB, read_only=True)
 try:
@@ -76,7 +81,7 @@ try:
               and row["n_tool_calls"] == 2, f"{row['convergence']} {row['stop_reason']}")
         check("runs row: references set (taf_id, worksheet_id, transcript_path, clean)",
               row["taf_id"] == summary["taf_id"] and row["worksheet_id"] == summary["worksheet_id"]
-              and row["transcript_path"] == str(tp) and row["taf_clean"] is True)
+              and row["transcript_path"] == summary["transcript_rel"] and row["taf_clean"] is True)
 
     taf = store.taf(con, summary["taf_id"])
     check("emitted TAF archived (producer_kind artificial, linked by run_id)",
