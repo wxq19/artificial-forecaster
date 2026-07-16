@@ -27,9 +27,10 @@ _UA = "artificial-forecaster/0.1 (research; contact wquinten@proton.me)"
 
 # IEM rate-limits bursts: at the repo's 2s per-request throttle it 429s after ~26
 # requests (Phase A Q2). Each iem.load fires two requests, so we add an extra gap
-# between (year, month) loads AND back off on a 429.
+# between (year, month) loads AND back off on a 429 or a transient 5xx.
 _MIN_LOAD_GAP_S = 3.0
-_MAX_429_RETRIES = 5
+_MAX_HTTP_RETRIES = 5
+_RETRY_HTTP_CODES = (429, 500, 502, 503, 504)
 
 
 def _iem_sid(station: str) -> str:
@@ -121,13 +122,21 @@ def ingest_history(
     for year in range(start_year, end_year + 1):
         for month in months:
             start, end = _month_bounds(year, month)
-            for attempt in range(1, _MAX_429_RETRIES + 1):
+            for attempt in range(1, _MAX_HTTP_RETRIES + 1):
                 try:
                     summ = iem.load(station, start, end, db_path=scratch_db_path)
                     break
                 except urllib.error.HTTPError as e:
-                    if e.code == 429 and attempt < _MAX_429_RETRIES:
+                    # 429 = rate-limited; 5xx = IEM transiently overloaded/unavailable. Both
+                    # are retryable with the same backoff -- a single 503 must not fail a
+                    # whole station's build.
+                    if e.code in _RETRY_HTTP_CODES and attempt < _MAX_HTTP_RETRIES:
                         time.sleep(15 * attempt)         # measured-safe backoff (Phase A Q2)
+                        continue
+                    raise
+                except urllib.error.URLError:            # transient connection drop -> retry too
+                    if attempt < _MAX_HTTP_RETRIES:
+                        time.sleep(15 * attempt)
                         continue
                     raise
             per_year[year] = per_year.get(year, 0) + summ["inserted"]
