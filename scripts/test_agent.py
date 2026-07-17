@@ -61,12 +61,13 @@ def _tc(call_id: str, name: str, arguments: str):
 
 
 def _resp(*, content=None, reasoning=None, tool_calls=None, finish_reason="tool_calls",
-          ptok=100, ctok=50):
-    """A scripted chat.completions response (one choice)."""
+          ptok=100, ctok=50, usage_none=False):
+    """A scripted chat.completions response (one choice). usage_none simulates a provider
+    that returns usage:null (round-2 concern)."""
     msg = SimpleNamespace(content=content, reasoning=reasoning, tool_calls=tool_calls)
     choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice],
-                           usage=SimpleNamespace(prompt_tokens=ptok, completion_tokens=ctok))
+    usage = None if usage_none else SimpleNamespace(prompt_tokens=ptok, completion_tokens=ctok)
+    return SimpleNamespace(choices=[choice], usage=usage)
 
 
 class StubClient:
@@ -304,6 +305,19 @@ try:
     check("convergence: nudged (emit after nudge)",
           res.convergence == "nudged" and res.nudge_step == 1 and res.first_emit_step == 2,
           f"{res.convergence} nudge={res.nudge_step} emit={res.first_emit_step}")
+
+    # 11. usage:null response (round-2 provider) -> 0 tokens for the step, run proceeds.
+    _install_run_tool({"get_trend": ToolResult("ok"), "emit_taf": ToolResult("clean", taf=CLEAN)})
+    client = StubClient([
+        _resp(tool_calls=[_tc("un1", "get_trend", "{}")], usage_none=True),
+        _resp(tool_calls=[_tc("un2", "emit_taf", "{}")], ptok=200, ctok=80),
+    ])
+    res = run_agent(_seed(), _cfg(), client=client)
+    check("usage-null: run completes, step records 0 tokens, totals from valid steps",
+          res.stop_reason == "emitted_clean" and res.steps[0].prompt_tokens == 0
+          and res.steps[0].completion_tokens == 0
+          and res.prompt_tokens == 200 and res.completion_tokens == 80,
+          f"{res.stop_reason} {res.prompt_tokens}/{res.completion_tokens}")
 finally:
     agent.run_tool = _REAL_RUN_TOOL   # restore the real dispatch
 

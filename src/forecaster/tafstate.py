@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, time, timedelta
 
 from pydantic import BaseModel
 
 from forecaster.metar import CloudLayer, _parse_vis
-from forecaster.tafparse import TafGroup, TafObs
+from forecaster.tafparse import TafGroup, TafObs, WindOverride
 
 
 def stable_hash(payload) -> str:
@@ -223,6 +224,150 @@ def persistence_taf(ob: dict, valid_from: datetime, valid_to: datetime) -> TafOb
     )
 
 
+def _state_to_group(state: State, *, change_type, probability, start: datetime,
+                    end: datetime | None) -> TafGroup:
+    """Turn a resolved State back into a self-contained TafGroup (FM or prevailing) that
+    re-resolves to the SAME State. explicit_fields is set for exactly the KNOWN elements so
+    _forecast_state(base=None) reproduces the state. Ceiling -> one synthetic OVC layer at
+    the ceiling (unlimited -> no layer); unlimited vis -> P6SM. Used to bake the composite's
+    pure-FM prevailing timeline (T9)."""
+    ef: set[str] = set()
+    wind_dir_deg = wind_dir_card = wind_speed = wind_gust = None
+    if state.wind_speed_status == SPD_NUMERIC or state.wind_dir_status in (DIR_VRB, DIR_CALM):
+        ef.add("wind")
+        wind_speed = state.wind_speed
+        if state.wind_dir_status == DIR_NUMERIC:
+            wind_dir_deg = state.wind_dir
+        elif state.wind_dir_status == DIR_VRB:
+            wind_dir_card = "VRB"
+        if state.gust_status == GUST_PRESENT:
+            ef.add("gust")
+            wind_gust = state.wind_gust
+    vis_sm = vis_m = vis_flag = None
+    if state.vis_status == VIS_KNOWN_NUMERIC:
+        ef.add("visibility")
+        vis_sm, vis_m, vis_flag = state.vis_sm, state.vis_m, state.vis_flag
+    elif state.vis_status == VIS_KNOWN_UNLIMITED:
+        ef.add("visibility")
+        vis_sm, vis_flag = 6.0, "P"                       # P6SM -> unlimited
+    clouds: list[CloudLayer] = []
+    if state.ceiling_status == CEIL_KNOWN_NUMERIC:
+        ef.add("sky")
+        clouds = [CloudLayer(cover="OVC", height_ft=state.ceiling_ft)]
+    elif state.ceiling_status == CEIL_KNOWN_UNLIMITED:
+        ef.add("sky")                                     # empty clouds -> unlimited ceiling
+    weather: list[str] = []
+    if state.weather_status == WX_KNOWN:
+        ef.add("weather")
+        weather = list(state.weather)
+    qnh = None
+    if state.qnh_status == QNH_KNOWN:
+        ef.add("qnh")
+        qnh = state.qnh_inhg
+    return TafGroup(
+        change_type=change_type, probability=probability,
+        from_day=start.day, from_hour=start.hour, from_minute=start.minute,
+        to_day=(end.day if end else None), to_hour=(end.hour if end else None),
+        wind_dir_deg=wind_dir_deg, wind_dir_card=wind_dir_card,
+        wind_speed=wind_speed, wind_gust=wind_gust, wind_unit="KT",
+        visibility=None, vis_sm=vis_sm, vis_m=vis_m, vis_flag=vis_flag, cavok=False,
+        weather=weather, clouds=clouds, qnh_inhg=qnh, explicit_fields=ef)
+
+
+def composite_taf(bulletins: list[dict], valid_from: datetime,
+                  valid_to: datetime) -> tuple[TafObs, dict]:
+    """Synthesize the human's EFFECTIVE forecast over [valid_from, valid_to) from the
+    routine TAF + its amendments (T9). PURE-FM timeline: at each changepoint the GOVERNING
+    bulletin (the latest whose effective time has arrived) sets the prevailing via a self-
+    contained FM anchor -- so a superseded routine BECMG can never bleed past an amendment.
+    Each governing bulletin's TEMPO/PROB overlays are carried, clipped to its own segment.
+
+    `bulletins[0]` is the routine; the rest are amendments in ISSUE order. Each is a dict:
+    {'taf': TafObs, 'issue_time', 'valid_from', 'valid_to', 'taf_id'}. An amendment takes
+    effect at max(its valid_from, its issue hour). Returns (composite TafObs, construction)
+    where construction records the per-segment source taf_ids for provenance."""
+    routine = bulletins[0]
+    effs = [valid_from]
+    for b in bulletins[1:]:
+        e = max(b["valid_from"], b["issue_time"].replace(minute=0, second=0, microsecond=0))
+        effs.append(max(min(e, valid_to), valid_from, effs[-1]))    # clamp + monotonic
+    bounds = effs + [valid_to]
+
+    segs = [(bounds[i], bounds[i + 1], i) for i in range(len(bulletins))
+            if bounds[i + 1] > bounds[i]]
+
+    # Changepoints to sample: each segment start + the governing bulletin's own internal
+    # transitions (FM start / BECMG end) that fall inside the segment.
+    times: set[datetime] = set()
+    for a, z, i in segs:
+        times.add(a)
+        for g in absolutize(bulletins[i]["taf"], bulletins[i]["valid_from"],
+                            bulletins[i]["valid_to"]):
+            for tt in (g.start, g.end):
+                if tt is not None and a < tt < z:
+                    times.add(tt)
+    ordered = sorted(t for t in times if valid_from <= t < valid_to)
+
+    def _govern(t: datetime) -> int:
+        for a, z, i in segs:
+            if a <= t < z:
+                return i
+        return segs[-1][2]
+
+    def _state_at(i: int, t: datetime) -> State:
+        b = bulletins[i]
+        ag = absolutize(b["taf"], b["valid_from"], b["valid_to"])
+        return _baseline_state_at(ag, t, -1, b["taf"].wind_overrides)
+
+    groups: list[TafGroup] = []
+    prevailing: TafGroup | None = None
+    prev: State | None = None
+    for t in ordered:
+        st = _state_at(_govern(t), t)
+        if prev is not None and st == prev:
+            continue
+        if prevailing is None:
+            prevailing = _state_to_group(st, change_type=None, probability=None,
+                                         start=valid_from, end=valid_to)
+        else:
+            groups.append(_state_to_group(st, change_type="FM", probability=None,
+                                          start=t, end=None))
+        prev = st
+    if prevailing is None:      # degenerate (no sampled times) -> routine prevailing
+        prevailing = _state_to_group(_state_at(0, valid_from), change_type=None,
+                                     probability=None, start=valid_from, end=valid_to)
+
+    # TEMPO/PROB overlays from each governing bulletin, clipped to its segment.
+    for a, z, i in segs:
+        for g in absolutize(bulletins[i]["taf"], bulletins[i]["valid_from"],
+                            bulletins[i]["valid_to"]):
+            if g.group_type in ("TEMPO", "PROB") and g.end is not None:
+                s, e = max(g.start, a), min(g.end, z)
+                if e > s:
+                    groups.append(g.group.model_copy(update={
+                        "from_day": s.day, "from_hour": s.hour, "from_minute": None,
+                        "to_day": e.day, "to_hour": e.hour}))
+
+    construction = {
+        "routine_taf_id": routine.get("taf_id"),
+        "amendment_taf_ids": [b.get("taf_id") for b in bulletins[1:]],
+        "segments": [{"from": a.isoformat(), "to": z.isoformat(),
+                      "taf_id": bulletins[i].get("taf_id"),
+                      "producer": "routine" if i == 0 else "amendment"} for a, z, i in segs],
+    }
+    taf = TafObs(
+        station=routine["taf"].station,
+        issue_day=valid_from.day, issue_time=time(valid_from.hour, valid_from.minute),
+        valid_from_day=valid_from.day, valid_from_hour=valid_from.hour,
+        valid_to_day=valid_to.day, valid_to_hour=valid_to.hour,
+        amendment=False, corrected=False, nil=False, canceled=False,
+        qnh_inhg=None, prevailing=prevailing, groups=groups,
+        max_temp=routine["taf"].max_temp, min_temp=routine["taf"].min_temp,
+        raw=f"COMPOSITE {routine['taf'].station} routine+{len(bulletins) - 1} amd",
+    )
+    return taf, construction
+
+
 def observed_state(ob: dict) -> State:
     """Build a State from a stored METAR dict (store.window shape)."""
     s = State()
@@ -357,6 +502,51 @@ def absolute_validity(taf: TafObs, issue_ref: datetime) -> tuple[datetime, datet
     return issue, valid_from, valid_to
 
 
+_WND_AFT = re.compile(
+    r"\bWND\s+(VRB|\d{3})(\d{2,3})(?:G(\d{2,3}))?KT\s+AFTR?\s+(\d{2})(\d{2})\b")
+
+
+def parse_wind_after(remarks: str, issue_ref: datetime) -> list[WindOverride]:
+    """Parse 'WND <wind> AFT DDHH' remark(s) (from tafparse.strip_remarks) into structured
+    WindOverrides with an absolute `after` datetime, resolved against the TAF's calendar the
+    same way absolute_validity does. Chronological; a later `after` governs from its own
+    time. Empty/no-match -> []."""
+    out: list[WindOverride] = []
+    for m in _WND_AFT.finditer(remarks or ""):
+        dir_tok, spd, gust, dd, hh = m.groups()
+        out.append(WindOverride(
+            after=_abs(issue_ref, int(dd), int(hh)),
+            wind_dir=None if dir_tok == "VRB" else int(dir_tok),
+            is_vrb=(dir_tok == "VRB"),
+            wind_speed=int(spd),
+            wind_gust=int(gust) if gust else None))
+    out.sort(key=lambda o: o.after)
+    return out
+
+
+def _apply_wind_override(state: State, wind_overrides, t: datetime) -> State:
+    """If a WND ... AFT override is in force at t, replace the effective prevailing WIND
+    (dir/speed/gust only) with it. The latest override with after <= t wins. Returns a copy;
+    no override / none active -> the state unchanged."""
+    if not wind_overrides:
+        return state
+    active = [o for o in wind_overrides if o.after <= t]
+    if not active:
+        return state
+    o = max(active, key=lambda x: x.after)
+    s = state.model_copy()
+    if o.is_vrb:
+        s.wind_dir, s.wind_dir_status = None, DIR_VRB
+    else:
+        s.wind_dir, s.wind_dir_status = o.wind_dir, DIR_NUMERIC
+    s.wind_speed, s.wind_speed_status = o.wind_speed, SPD_NUMERIC
+    if o.wind_gust is not None:
+        s.wind_gust, s.gust_status = o.wind_gust, GUST_PRESENT
+    else:
+        s.wind_gust, s.gust_status = None, GUST_KNOWN_ABSENT
+    return s
+
+
 def absolutize(taf: TafObs, valid_from: datetime, valid_to: datetime) -> list[AbsGroup]:
     """Every group -> an AbsGroup with absolute naive-UTC start/end. Prevailing spans
     the whole window; FM starts at its exact minute (end None, resolved in
@@ -441,11 +631,13 @@ def opportunities(taf: TafObs, valid_from: datetime, valid_to: datetime) -> list
     return out
 
 
-def _baseline_state_at(abs_groups: list[AbsGroup], t: datetime, exclude_index: int) -> State:
+def _baseline_state_at(abs_groups: list[AbsGroup], t: datetime, exclude_index: int,
+                       wind_overrides=None) -> State:
     """The prevailing baseline at instant t: prevailing, replaced by the latest FM
     with start <= t (self-contained), then overlaid by every BECMG COMPLETE by t
     (end <= t). Excludes the group being resolved so a BECMG/TEMPO doesn't overlay
-    itself here."""
+    itself here. A WND ... AFT wind remark (if any) overrides the effective prevailing
+    wind from its own time forward (T5) -- applied LAST so it wins over the evolved wind."""
     state = _forecast_state(abs_groups[0].group, base=None)     # prevailing
     fms = [g for g in abs_groups
            if g.group_type == "FM" and g.start <= t and g.group_index != exclude_index]
@@ -458,7 +650,7 @@ def _baseline_state_at(abs_groups: list[AbsGroup], t: datetime, exclude_index: i
     )
     for b in becmgs:
         state = _forecast_state(b.group, base=state)
-    return state
+    return _apply_wind_override(state, wind_overrides, t)
 
 
 def resolve_group_state(taf: TafObs, group_index: int, valid_from: datetime,
@@ -470,7 +662,8 @@ def resolve_group_state(taf: TafObs, group_index: int, valid_from: datetime,
     target = next(g for g in abs_groups if g.group_index == group_index)
     if target.group_type in ("INITIAL", "FM"):
         return _forecast_state(target.group, base=None)
-    base = _baseline_state_at(abs_groups, target.start, exclude_index=group_index)
+    base = _baseline_state_at(abs_groups, target.start, exclude_index=group_index,
+                              wind_overrides=taf.wind_overrides)
     return _forecast_state(target.group, base=base)
 
 
@@ -486,7 +679,8 @@ def forecast_state(taf: TafObs, t: datetime, *, valid_from: datetime,
                    valid_to: datetime) -> ForecastState:
     """Prevailing baseline at t + TEMPO/PROB alternates whose window contains t."""
     abs_groups = absolutize(taf, valid_from, valid_to)
-    prevailing = _baseline_state_at(abs_groups, t, exclude_index=-1)
+    prevailing = _baseline_state_at(abs_groups, t, exclude_index=-1,
+                                    wind_overrides=taf.wind_overrides)
     active = []
     # baseline group active at t
     for a, b, g in _baseline_segments(abs_groups, valid_from, valid_to):

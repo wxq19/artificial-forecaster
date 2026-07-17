@@ -467,7 +467,45 @@ artificial-forecaster/
   with the climo+imagery working-tree changes). Two follow-ups if wanted: a live `required`-mode run, and a
   recent-valid-time run (obs + built climo) to exercise sanity_checks with real observed data.
 
-## NEXT SESSION -- pick up here (paused 2026-07-16)
+## NEXT SESSION -- pick up here (paused 2026-07-17)
+
+### GRIBSTREAM MODEL-DATA SUBSYSTEM -- BUILT this session; credit-gated confirmations remain
+The whole model-data subsystem is CODE-COMPLETE, offline-tested (`scripts/test_modeldata.py` 63/63),
+ruff-clean, and partially live-verified. Authoritative plan + full remaining-work list:
+`docs/gribstream_model_data.md` (gitignored). Gated OFF by default so the live Pi is untouched
+(`MODEL_DATA_ENABLED=false`, `MODEL_DATA_FLOW_RELATIVE=false`). ALL UNCOMMITTED (rides the working
+tree with the climo/imagery/worksheet/scoring/spatial work).
+- BUILT: Phase A-E (multi-coord `gribstream.fetch_points`; `store.model_data` archive; `modeldata.py`
+  orchestrator + `prefetch`/`prefetch_many`; 4 tools get_model_state/get_hazard_scan/
+  get_model_verification/get_nearby_model_data; collect.py/schedule.py integration) + IFS scaffold
+  (disabled) + flow-relative STEERING grid + batched roster-wide prefetch.
+- KEY FACTS: points are FREE <=500 (credits scale with HOURS x variables, not points); leakage guard
+  for model FORECASTS is only run<=issue via `asOf` (no read-cutoff); HRRR MSLP = `MSLMA`; flow
+  orientation = deep-layer 850/700/500 GFS steering mean at the ISSUE ANCHOR (not surface, not climo,
+  not forecast-mean); two-pass prefetch keeps prefetch and collect's copy in lockstep.
+- VERIFIED FREE (no GRIBStream credits): surface prefetch (KWRI, 494 cr, earlier) + get_model_state/
+  get_nearby_model_data render; and `get_model_verification` end-to-end using the cached archive + FREE
+  AWC obs (all 3 models matched 4 real hours; surfaced the GFS 12Z warm/dry bias). Offline tests cover
+  archive, formatters, collect copy path, grid/flow/batch/IFS, steering math + copy-reproducibility.
+- PICK UP (credit-gated CONFIRMATIONS when the API resets, low risk -- code is done):
+  1. Live with-HAZARDS prefetch (~1000 cr): `prefetch_model_data.py --station KWRI` -> confirm
+     get_hazard_scan on REAL pressure levels (icing/turbulence).
+  2. Full agent-loop run `collect.py --station KWRI --model google/gemma-4-31B-it --mode required
+     --model-data` (needs LLM credits) -> does the model CALL the get_model_* tools + fold them in.
+  3. OCONUS degrade (few cr): PAED/PABI/RJTY -> GFS+NBM + an HRRR "unavailable" note (both failure
+     modes already handled).
+  4. IFS: run `scripts/probe_ifs.py` (names VERIFIED from gribstream.com/models/ifsoper), handle the
+     `tcc` 0-1 FRACTION (state formatter needs *100 for IFS), then add `ifsoper` to `gribstream.MODELS`
+     + flip `modeldata._IFS_ENABLED`.
+  5. Flow-relative live confirm: run a prefetch with `MODEL_DATA_FLOW_RELATIVE=true` -> steering probe
+     works, oriented upstream points appear, copy reproduces the bearing.
+  6. Cost/budget guard, then `MODEL_DATA_ENABLED=true` on the Pi (SEPARATE credit line from the LLM
+     providers; ~500 cr/station surface / ~1000 with hazards; batching lowers multi-station cycles).
+  7. COMMIT the subsystem (ideally its own commit) once blessed.
+- DEFERRED (only if a run shows the need): multi-DIRECTION upstream extension for an evolving flow
+  (fan far points along initial AND later inflow bearings -- NOT a forecast-mean, which is unsound
+  across a regime change); IFS hazard bundle (icing t/r + shear u/v/w at `pl` levels); input-pinning
+  the OTHER live tools (imagery/maps/soundings) via the same snapshot-and-replay pattern.
 
 ### SPATIAL AWARENESS -- built + wired (2026-07-17); PRE-WARM + AVAILABILITY CHECK ahead of v2
 The spatial-awareness pair is built, VLM-verified (Gemma), and wired into the collection agent:

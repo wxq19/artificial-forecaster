@@ -15,8 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pydantic import ValidationError
 
 from forecaster import (
-    awc, charts, fcstsounding, imagery, neighbors, soundings, store, tafgen, tafparse,
-    terrain, worksheet, wxmaps,
+    awc, charts, fcstsounding, imagery, modeldata, neighbors, soundings, store, tafgen,
+    tafparse, terrain, worksheet, wxmaps,
 )
 from forecaster.config import settings
 from forecaster.tafgen import TafProduct
@@ -499,8 +499,116 @@ CHECK_TAF = {
     },
 }
 
+GET_MODEL_STATE = {
+    "type": "function",
+    "function": {
+        "name": "get_model_state",
+        "description": (
+            "Multi-model surface forecast table (GFS + HRRR + NBM side by side) for your "
+            "station or a pre-fetched neighbor, from archived model runs pinned to your issue "
+            "time. Columns: T/Td (C), wind, gust, MSLP, cloud%, vis, ceiling; rows are valid "
+            "times. Use it to see where the models AGREE or DISAGREE on the surface evolution "
+            "(e.g. peak gust timing). HRRR is CONUS-only + ~48h; NBM is a govt multi-model "
+            "BLEND (a consensus baseline, not an independent ingredient)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
+                "location": {"type": "string", "description": (
+                    "Optional pre-fetched point to read instead of the station (a neighbor "
+                    "ICAO or grid id); defaults to the station.")},
+                "model": {"type": "string", "enum": list(modeldata.MODELS),
+                          "description": "Optional single model; default shows all three."},
+                "hours": {"type": "integer", "description": "Optional cap on forecast hours shown (1-48)."},
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+GET_HAZARD_SCAN = {
+    "type": "function",
+    "function": {
+        "name": "get_hazard_scan",
+        "description": (
+            "Cross-model ICING + TURBULENCE diagnosis from GFS + HRRR pressure-level fields at "
+            "one valid time (no model has a native icing/turbulence field, so conditions are "
+            "diagnosed and confirmed across models). Reports per-level T/RH (+ GFS cloud-liquid) "
+            "for supercooled-icing potential, plus CAPE/omega/deep-layer shear for convective "
+            "and mechanical/CAT turbulence, each with a cross-model agreement note. The flags "
+            "are a stated rule over the raw values, not a verdict -- reason over the evidence."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
+                "location": {"type": "string", "description": (
+                    "Optional pre-fetched point (site or grid id); defaults to the station. "
+                    "Hazards are pre-fetched for the site + grid only, not neighbor airfields.")},
+                "valid_time": {"type": "string", "description": (
+                    "Optional ISO valid time, e.g. 2026-07-17T21:00Z; snaps to the nearest "
+                    "stored step. Defaults to the earliest forecast hour.")},
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+GET_MODEL_VERIFICATION = {
+    "type": "function",
+    "function": {
+        "name": "get_model_verification",
+        "description": (
+            "How the archived model runs scored against OBSERVED METARs at the recent forecast "
+            "hours leading up to your issue time -- per-hour forecast-vs-observed T/Td plus a "
+            "mean bias per model. Exposes a run's warm/cold or dry/moist bias so you can weight "
+            "the raw model output. Reads obs already in the store (leakage-safe), so it only "
+            "covers hours at or before your issue time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
+                "model": {"type": "string", "enum": list(modeldata.MODELS),
+                          "description": "Optional single model; default shows all three."},
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+GET_NEARBY_MODEL_DATA = {
+    "type": "function",
+    "function": {
+        "name": "get_nearby_model_data",
+        "description": (
+            "One model field's value at ALL pre-fetched points around your station (the site, "
+            "neighbor airfields, and a coarse upstream grid) at one valid time -- for gradient "
+            "and advection reasoning (e.g. is colder/moister air upstream?). Pick a variable "
+            "ALIAS: surface t2m, td2m, gust, mslp, vis, ceil, tcdc (wind is u10/v10 for GFS/HRRR "
+            "or wind/wdir for NBM). Values convert to friendly units where known."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
+                "variable": {"type": "string", "description": (
+                    "Field alias, e.g. t2m (2m temp), mslp, gust, vis.")},
+                "model": {"type": "string", "enum": list(modeldata.MODELS),
+                          "description": "Model to read (default gfs)."},
+                "valid_time": {"type": "string", "description": (
+                    "Optional ISO valid time; snaps to the nearest stored step. Defaults to "
+                    "the earliest forecast hour.")},
+            },
+            "required": ["station", "variable"],
+        },
+    },
+}
+
 TOOLS = [QUERY_OBS, GET_LATEST, GET_TREND, GET_SOUNDING, GET_MAP, GET_FCST_SOUNDING,
          GET_POINT_FORECAST, GET_CLIMO, GET_IMAGERY, GET_LOOP, GET_NEARBY_OBS, GET_TERRAIN,
+         GET_MODEL_STATE, GET_HAZARD_SCAN, GET_MODEL_VERIFICATION, GET_NEARBY_MODEL_DATA,
          GET_CURRENT_TAF, CHECK_TAF]
 
 # The OUTPUT tool: the model emits its forecast as the fields of a TafProduct, and
@@ -817,6 +925,13 @@ def _submit_worksheet(args: dict, *, evidence_ids: list[str] | None = None) -> T
         "TAF from your forecast_timeline and taf_strategy.", worksheet=ws, findings=[])
 
 
+def _fetch_stamp() -> str:
+    """UTC wall-clock stamp for a 'latest'-image receipt. STAR/IEM serve the most recent
+    frame with no embedded valid-time, so the fetch time is the only cycle marker the model
+    (and later per-run drift analysis) has -- it belongs on the receipt's first line."""
+    return f"{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}"
+
+
 def _get_sounding(args: dict) -> ToolResult:
     """Fetch an observed skew-T image from a public provider (network, no DB) and
     hand it back for the model to read. Site ids live in the provider's namespace,
@@ -828,18 +943,38 @@ def _get_sounding(args: dict) -> ToolResult:
     source = str(args.get("source") or "spc").lower()
     if source not in ("spc", "wyoming"):
         return ToolResult(f'error: unknown source {source!r}; use "spc" or "wyoming"')
+    t = soundings.synoptic_time()
+    note = ""
     try:
-        t = soundings.synoptic_time()
         url = soundings.skewt_url(site, t, source=source)
         img = soundings.fetch_skewt(site, t, source=source)
     except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
-        return ToolResult(
-            f"error: could not fetch {source} sounding for {str(site).upper()} "
-            f"({type(e).__name__}: {e}); the site may have no launch at this synoptic time, "
-            "or the id may be wrong for this provider (SPC: 3-letter site or WMO; Wyoming: WMO)"
-        )
+        # Forecasters have a backup provider. SPC and Wyoming serve the SAME observed RAOBs,
+        # so on an SPC miss retry Wyoming -- but only when a Wyoming id is derivable. Wyoming
+        # takes WMO numbers only, and no site->WMO mapping exists here, so the fallback fires
+        # only for a numeric (WMO) id; a 3-letter SPC site gets honest feedback instead.
+        if source == "spc" and str(site).isdigit():
+            try:
+                url = soundings.skewt_url(site, t, source="wyoming")
+                img = soundings.fetch_skewt(site, t, source="wyoming")
+                source = "wyoming"
+                note = (f"note: SPC unavailable ({type(e).__name__}: {e}); serving Wyoming "
+                        "sounding for the same station/time.\n")
+            except Exception as e2:  # noqa: BLE001 -- both providers failed -> feedback
+                return ToolResult(
+                    f"error: could not fetch sounding for {str(site).upper()} from SPC "
+                    f"({type(e).__name__}: {e}) or Wyoming ({type(e2).__name__}: {e2})")
+        else:
+            tail = ("" if source == "wyoming" or not str(site).isalpha()
+                    else f"; SPC failed and no WMO number is known for {str(site).upper()} "
+                         "(pass a WMO number to enable the Wyoming fallback)")
+            return ToolResult(
+                f"error: could not fetch {source} sounding for {str(site).upper()} "
+                f"({type(e).__name__}: {e}); the site may have no launch at this synoptic "
+                f"time, or the id may be wrong for this provider (SPC: 3-letter site or WMO; "
+                f"Wyoming: WMO){tail}")
     receipt = (
-        f"Observed skew-T for {str(site).upper()} at {t:%Y-%m-%dT%H:%MZ} "
+        f"{note}Observed skew-T for {str(site).upper()} at {t:%Y-%m-%dT%H:%MZ} "
         f"(source: {source}, {url}); image follows."
     )
     return ToolResult(receipt, images=[img])
@@ -869,6 +1004,24 @@ def _get_map(args: dict) -> ToolResult:
         url = wxmaps.map_url(name, fhr=fhr, run=run)
         img = wxmaps.fetch_map(name, fhr=fhr, run=run)
     except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
+        # TT is third-party + URL-fragile; on failure fall back to the closest SPC
+        # mesoanalysis ANALYSIS chart so the model keeps upper-air context. The receipt
+        # states the degradation loudly -- it is NOW, not the forecast hour requested.
+        fb = wxmaps.TT_TO_SPC_MESO.get(name) if spec.source == "tt" else None
+        if fb:
+            fb_spec = wxmaps.CATALOG[fb]
+            try:
+                fb_url = wxmaps.map_url(fb)
+                fb_img = wxmaps.fetch_map(fb)
+            except Exception as e2:  # noqa: BLE001 -- both failed -> feedback
+                return ToolResult(f"error: could not fetch chart {name} ({type(e).__name__}: {e}); "
+                                  f"SPC fallback {fb} also failed ({type(e2).__name__}: {e2})")
+            note = (f"note: forecast panel unavailable (TropicalTidbits {type(e).__name__}: {e}); "
+                    f"serving the CURRENT ANALYSIS (SPC mesoanalysis {fb_spec.label}) instead "
+                    f"-- this is now, not the f{fhr:03d} forecast you asked for.")
+            return ToolResult(
+                f"{note}\n{fb_spec.label} [{fb}] (source: {fb_spec.source}, {fb_url}); "
+                "image follows.", images=[fb_img])
         return ToolResult(f"error: could not fetch chart {name} ({type(e).__name__}: {e})")
     lead = f", GFS f{fhr:03d} run {run:%Y-%m-%dT%H:%MZ}" if spec.source == "tt" else ""
     return ToolResult(
@@ -924,7 +1077,7 @@ def _imagery_satellite(region: str | None, product: str | None,
     except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
         return ToolResult(f"error: could not fetch {product} satellite "
                           f"({type(e).__name__}: {e})")
-    receipt = (f"{product} satellite -- {label} "
+    receipt = (f"{product} satellite -- {label}, fetched {_fetch_stamp()} "
                f"(source: {imagery.satellite_source(region)}, {url}); research/informational "
                "imagery, not an operational source. image follows.")
     return ToolResult(receipt, images=[img])
@@ -941,7 +1094,8 @@ def _radar_national(note: str) -> ToolResult:
         source, url = "NWS RIDGE", imagery.NWS_RIDGE_GIF_URL
     else:
         source, url = "IEM NEXRAD composite", imagery.radar_url("national")
-    return ToolResult(f"{note} (source: {source}, {url}); image follows.", images=[img])
+    return ToolResult(f"{note}, fetched {_fetch_stamp()} (source: {source}, {url}); "
+                      "image follows.", images=[img])
 
 
 def _radar_regional(region: str) -> ToolResult:
@@ -951,8 +1105,8 @@ def _radar_regional(region: str) -> ToolResult:
         img = imagery.fetch_radar("regional", region=region)
     except Exception as e:  # noqa: BLE001 -- feedback, not a dead loop
         return ToolResult(f"error: could not fetch {region} radar ({type(e).__name__}: {e})")
-    return ToolResult(f"{label} regional radar mosaic (source: IEM NEXRAD composite, {url}); "
-                      "image follows.", images=[img])
+    return ToolResult(f"{label} regional radar mosaic, fetched {_fetch_stamp()} "
+                      f"(source: IEM NEXRAD composite, {url}); image follows.", images=[img])
 
 
 def _radar_degrade(icao: str, lat: float, lon: float, reason: str) -> ToolResult:
@@ -1010,9 +1164,9 @@ def _radar_for_station(icao: str, product: str | None) -> ToolResult:
         except Exception as e:  # noqa: BLE001 -- degrade, don't dead-end (provider hiccup/outage)
             return _radar_degrade(icao, lat, lon,
                                   f"station radar fetch for {icao} failed ({type(e).__name__}: {e})")
-        receipt = (f"Station-scale radar around {icao} (nearest WSR-88D: {site['id']} "
-                   f"{site['name']}, {dist:.0f} km; source: IEM NEXRAD composite, {url}); "
-                   "image follows.")
+        receipt = (f"Station-scale radar around {icao}, fetched {_fetch_stamp()} "
+                   f"(nearest WSR-88D: {site['id']} {site['name']}, {dist:.0f} km; "
+                   f"source: IEM NEXRAD composite, {url}); image follows.")
         return ToolResult(receipt, images=[img])
     reason = (f"nearest WSR-88D to {icao} is {near[1]:.0f} km away (beyond the {guard:.0f} km "
               f"local-radar guard)" if near else f"no radar site found near {icao}")
@@ -1421,6 +1575,359 @@ def _get_terrain(args: dict) -> ToolResult:
     return ToolResult(_fmt_terrain(icao, p, neigh, len(context)), images=[png])
 
 
+# ---------------------------------------------------------------------------
+# GRIBStream model-data tools. These read the model_data ARCHIVE (populated by
+# modeldata.prefetch, network happens OUT of the agent loop) on the read-only conn, so
+# they are dispatched in the DB-connected branch of run_tool -- no network here. The
+# formatters are lifted from scripts/gribstream_full_demo.py (the blessed product shapes).
+# ---------------------------------------------------------------------------
+
+def _k2c(k):
+    return None if k is None else k - 273.15
+
+
+def _ms2kt(ms):
+    return None if ms is None else ms * 1.94384
+
+
+def _vis_sm_md(m):
+    if m is None:
+        return "--"
+    sm = m / 1609.34
+    return "P6" if sm >= 6 else f"{sm:.1f}"
+
+
+def _ceil_ft_md(m):
+    if m is None or m > 15000 or m < 0:   # fill / no ceiling
+        return "none"
+    return f"{round(m * 3.28084 / 100) * 100:d}"
+
+
+def _wind_cell_md(vm: dict, model: str) -> str:
+    """Wind cell for a pivoted variable map: NBM stores speed/dir; GFS/HRRR store u/v."""
+    if model == "nbm":
+        spd, d = vm.get("wind"), vm.get("wdir")
+        if spd is None or d is None:
+            return "--"
+        return f"{int(round(d)) % 360:03d}/{round(_ms2kt(spd)):02d}"
+    u, v = vm.get("u10"), vm.get("v10")
+    if u is None or v is None:
+        return "--"
+    dd, ss = _uv_to_dirspd(u, v)
+    return f"{dd:03d}/{ss:02d}"
+
+
+def _pivot_series(rows: list[dict]) -> list[tuple]:
+    """Tall model_data rows -> [(valid_time, run, {alias: value})] ordered by valid_time,
+    keeping the LATEST run's value for each (valid_time, variable)."""
+    cells: dict = {}   # valid_time -> {var: (run, value)}
+    for r in rows:
+        vt, var, run, val = r["valid_time"], r["variable"], r["run"], r["value"]
+        c = cells.setdefault(vt, {})
+        if var not in c or (run is not None and c[var][0] is not None and run > c[var][0]):
+            c[var] = (run, val)
+    out = []
+    for vt in sorted(cells):
+        varmap = {var: rv[1] for var, rv in cells[vt].items()}
+        runs = {rv[0] for rv in cells[vt].values() if rv[0] is not None}
+        out.append((vt, max(runs) if runs else None, varmap))
+    return out
+
+
+_WIDE_START = datetime(1970, 1, 1)
+_WIDE_END = datetime(2100, 1, 1)
+
+
+def _resolve_md_location(con, station: str, location: str | None) -> tuple | None:
+    """Map a requested location name to (lat, lon, loc_id) from the archive. Defaults to the
+    station itself. Returns None if the name isn't pre-fetched (caller lists what is)."""
+    want = str(location or station).upper()
+    for lc in store.model_data_locations(con):
+        if (lc["loc_id"] or "").upper() == want:
+            return (lc["lat"], lc["lon"], lc["loc_id"])
+    return None
+
+
+def _md_locations_hint(con) -> str:
+    locs = store.model_data_locations(con)
+    if not locs:
+        return ("(no model data has been pre-fetched into this database; run "
+                "scripts/prefetch_model_data.py --station <ICAO>)")
+    return "available pre-fetched locations: " + ", ".join(lc["loc_id"] for lc in locs if lc["loc_id"])
+
+
+def _fmt_model_state(con, station: str, loc: tuple, models: list[str], hours: int | None) -> str:
+    lat, lon, loc_id = loc
+    blocks: list[str] = []
+    peaks: dict = {}
+    for model in models:
+        rows = store.model_data_series(con, model, lat, lon, start=_WIDE_START, end=_WIDE_END)
+        series = _pivot_series(rows)
+        if not series:
+            continue
+        if hours is not None:
+            cutoff = series[0][0] + timedelta(hours=hours)
+            series = [s for s in series if s[0] <= cutoff]
+        run = next((r for _, r, _ in series if r), None)
+        lines = [
+            f"{model.upper()} surface forecast for {loc_id} -- run "
+            f"{run:%Y-%m-%dT%HZ}" if run else f"{model.upper()} surface forecast for {loc_id}",
+            f"{'Valid (Z)':<15}{'T C':>5}{'Td C':>6}{'Wind':>8}{'Gst':>5}"
+            f"{'MSLP':>7}{'Cld%':>6}{'Vis':>6}{'Ceil ft':>9}",
+        ]
+        gusts = []
+        for vt, _r, vm in series:
+            gk = _ms2kt(vm.get("gust"))
+            if gk is not None:
+                gusts.append(gk)
+            t, td, mslp, cld = _k2c(vm.get("t2m")), _k2c(vm.get("td2m")), vm.get("mslp"), vm.get("tcdc")
+            lines.append(
+                f"{vt:%Y-%m-%dT%HZ}"
+                f"{('%5.0f' % t) if t is not None else '   --'}"
+                f"{('%6.0f' % td) if td is not None else '    --'}"
+                f"{_wind_cell_md(vm, model):>8}"
+                f"{('%5.0f' % gk) if gk is not None else '   --'}"
+                f"{('%7.0f' % (mslp / 100)) if mslp is not None else '     --'}"
+                f"{('%6.0f' % cld) if cld is not None else '    --'}"
+                f"{_vis_sm_md(vm.get('vis')):>6}"
+                f"{_ceil_ft_md(vm.get('ceil')):>9}"
+            )
+        blocks.append("\n".join(lines))
+        peaks[model] = max(gusts) if gusts else None
+    if not blocks:
+        return (f"(no model data pre-fetched for {loc_id}). {_md_locations_hint(con)}")
+    synopsis = "  ".join(f"{m.upper()} peak gust {v:.0f}kt" if v else f"{m.upper()} gust --"
+                         for m, v in peaks.items())
+    return "\n\n".join(blocks) + f"\n\nCROSS-MODEL: {synopsis}"
+
+
+def _get_model_state(con, station: str, args: dict) -> ToolResult:
+    loc = _resolve_md_location(con, station, args.get("location"))
+    if loc is None:
+        return ToolResult(f"error: {str(args.get('location') or station).upper()} is not a "
+                          f"pre-fetched model-data location. {_md_locations_hint(con)}")
+    model = args.get("model")
+    models = [str(model).lower()] if model else list(modeldata.MODELS)
+    hours = args.get("hours")
+    hours = _int_arg(hours, hours, lo=1, hi=48) if hours is not None else None
+    return ToolResult(_fmt_model_state(con, station, loc, models, hours))
+
+
+_ICE_LEVELS = ("650 mb", "600 mb", "550 mb", "500 mb", "450 mb", "400 mb")
+_VVEL_LEVELS = ("700 mb", "500 mb", "300 mb")
+
+
+def _pick_valid_time(series: list[tuple], want) -> tuple | None:
+    """Choose the series entry nearest a requested valid time (or the first if none asked)."""
+    if not series:
+        return None
+    if want is None:
+        return series[0]
+    return min(series, key=lambda s: abs((s[0] - want).total_seconds()))
+
+
+def _fmt_hazard_scan(con, station: str, loc: tuple, want) -> str:
+    lat, lon, loc_id = loc
+    # read each model's hazard vars, pivot, pick a shared-ish valid time from GFS first
+    piv = {}
+    for model in ("gfs", "hrrr"):
+        rows = store.model_data_series(con, model, lat, lon, start=_WIDE_START, end=_WIDE_END)
+        piv[model] = _pivot_series(rows)
+    ref = _pick_valid_time(piv["gfs"] or piv["hrrr"], want)
+    if ref is None:
+        return (f"(no pressure-level hazard data pre-fetched for {loc_id} -- prefetch runs with "
+                f"hazards enabled for the site + grid only). {_md_locations_hint(con)}")
+    valid = ref[0]
+    out = [f"Hazard scan for {loc_id}, valid {valid:%Y-%m-%dT%HZ} -- conditions diagnosed from "
+           "GFS + HRRR (no native icing/turbulence field; we confirm the ENVIRONMENT across "
+           "models). Reason over the evidence; the flags are a rule, not a verdict.", ""]
+
+    # ICING: supercooled water (T in [-16,0] C, RH>=70%; GFS CLMR>0 confirms cloud liquid)
+    out.append("ICING (T in -16..0 C with RH>=70%; GFS CLMR>0 confirms supercooled liquid):")
+    ice: dict = {}
+    for model in ("gfs", "hrrr"):
+        entry = _pick_valid_time(piv[model], valid)
+        if entry is None:
+            out.append(f"  {model.upper()}: no data at valid time")
+            continue
+        _vt, run, vm = entry
+        out.append(f"  {model.upper()} (run {run:%Y-%m-%dT%HZ}):" if run else f"  {model.upper()}:")
+        for lv in _ICE_LEVELS:
+            p = lv[:3]
+            t, rh = _k2c(vm.get(f"t{p}")), vm.get(f"rh{p}")
+            if t is None or rh is None:
+                continue
+            clw = vm.get(f"clw{p}")
+            flag = (-16.0 <= t <= 0.0) and rh >= 70.0
+            clw_s = f" CLW={clw * 1000:.2f}g/kg" if clw is not None else ""
+            ice.setdefault(lv, {})[model] = flag
+            out.append(f"    {lv:<7} T={t:>5.1f}C RH={rh:>3.0f}%{clw_s:<16} "
+                       f"{'ICING' if flag else '-'}")
+    if ice:
+        out.append("  agreement: " + "; ".join(
+            f"{lv} " + ("BOTH icing" if set(v.values()) == {True}
+                        else "no icing" if set(v.values()) == {False} else f"DISAGREE {v}")
+            for lv, v in ice.items() if v))
+
+    # TURBULENCE: convective (CAPE + ascent) and shear-driven (deep-layer bulk shear)
+    out += ["", "TURBULENCE (convective: CAPE + ascent; mechanical/CAT: 850-300mb bulk shear):"]
+    summ: dict = {}
+    for model in ("gfs", "hrrr"):
+        entry = _pick_valid_time(piv[model], valid)
+        if entry is None:
+            continue
+        _vt, run, vm = entry
+        cape, cin = vm.get("cape"), vm.get("cin")
+        w = {lv[:3]: vm.get(f"w{lv[:3]}") for lv in _VVEL_LEVELS}
+        max_up = min((x for x in w.values() if x is not None), default=None)  # omega<0 = up
+        u8, v8, u3, v3 = vm.get("u850"), vm.get("v850"), vm.get("u300"), vm.get("v300")
+        deep = (_ms2kt(math.hypot(u3 - u8, v3 - v8)) if None not in (u8, v8, u3, v3) else None)
+        summ[model] = (cape, deep)
+        parts = [f"CAPE={cape:.0f}J/kg" if cape is not None else "CAPE=--",
+                 f"CIN={cin:.0f}" if cin is not None else "CIN=--",
+                 f"max ascent(omega)={max_up:.1f}Pa/s" if max_up is not None else "omega=--",
+                 f"850-300mb shear={deep:.0f}kt" if deep is not None else "shear=--"]
+        if model == "gfs" and vm.get("hlcy") is not None:
+            parts.append(f"SRH(0-3km)={vm['hlcy']:.0f}m2/s2")
+        out.append(f"  {model.upper()} (run {run:%Y-%m-%dT%HZ}): " + ", ".join(parts)
+                   if run else f"  {model.upper()}: " + ", ".join(parts))
+    if len(summ) == 2:
+        cg, ch = summ["gfs"][0], summ["hrrr"][0]
+        sg, sh = summ["gfs"][1], summ["hrrr"][1]
+        conv = ("BOTH show convective potential" if (cg or 0) > 500 and (ch or 0) > 500
+                else "single-model convective signal" if (cg or 0) > 500 or (ch or 0) > 500
+                else "neither model convective")
+        shr = ("deep shear >40kt in both (organized/CAT)" if (sg or 0) > 40 and (sh or 0) > 40
+               else "modest shear")
+        out.append(f"  agreement: {conv}; {shr}")
+    return "\n".join(out)
+
+
+def _get_hazard_scan(con, station: str, args: dict) -> ToolResult:
+    loc = _resolve_md_location(con, station, args.get("location"))
+    if loc is None:
+        return ToolResult(f"error: {str(args.get('location') or station).upper()} is not a "
+                          f"pre-fetched model-data location. {_md_locations_hint(con)}")
+    want = None
+    if args.get("valid_time"):
+        try:
+            want = datetime.strptime(str(args["valid_time"]).replace("Z", "")[:16], "%Y-%m-%dT%H:%M")
+        except ValueError:
+            return ToolResult('error: valid_time must be ISO like "2026-07-17T21:00Z"')
+    return ToolResult(_fmt_hazard_scan(con, station, loc, want))
+
+
+_VER_ALIASES = ("t2m", "td2m", "u10", "v10", "wind", "wdir")
+
+
+def _fmt_model_verification(con, station: str, models: list[str]) -> str:
+    lat, lon, _ = _resolve_md_location(con, station, None) or (None, None, None)
+    if lat is None:
+        return f"error: {station} is not a pre-fetched model-data location. {_md_locations_hint(con)}"
+    # obs truth from the DB (leakage-safe: the per-run DB is cut off at issue time). Keyed by
+    # nearest whole hour so a :53 METAR aligns to the top-of-hour model step.
+    out = [f"Model-vs-obs verification for {station} -- archived forecast (from runs <= issue) "
+           "vs observed METARs at the matching hours. Positive T/Td error = model too warm/moist.",
+           ""]
+    matched_any = False
+    for model in models:
+        rows = store.model_data_series(con, model, lat, lon, start=_WIDE_START, end=_WIDE_END,
+                                       variables=list(_VER_ALIASES))
+        series = _pivot_series(rows)
+        if not series:
+            continue
+        lo, hi = series[0][0], series[-1][0]
+        obs = {}
+        for o in store.window(con, station, lo - timedelta(hours=1), hi + timedelta(hours=1)):
+            key = (o["obs_time"] + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
+            obs[key] = o
+        run = next((r for _, r, _ in series if r), None)
+        header = f"{model.upper()} (run {run:%Y-%m-%dT%HZ}):" if run else f"{model.upper()}:"
+        block = [header, f"  {'Valid (Z)':<15}{'T f/o':>11}{'Terr':>6}{'Td f/o':>11}{'Tderr':>7}"]
+        terrs = []
+        for vt, _r, vm in series:
+            o = obs.get(vt)
+            if o is None:
+                continue
+            tf, tdf = _k2c(vm.get("t2m")), _k2c(vm.get("td2m"))
+            to, tdo = o.get("temp_c"), o.get("dewpoint_c")
+            te = f"{tf - to:+.1f}" if tf is not None and to is not None else "--"
+            tde = f"{tdf - tdo:+.1f}" if tdf is not None and tdo is not None else "--"
+            if tf is not None and to is not None:
+                terrs.append(tf - to)
+            tfo = f"{tf:.0f}/{to}" if tf is not None and to is not None else "--"
+            tdfo = f"{tdf:.0f}/{tdo}" if tdf is not None and tdo is not None else "--"
+            block.append(f"  {vt:%Y-%m-%dT%HZ}{tfo:>11}{te:>6}{tdfo:>11}{tde:>7}")
+        if len(block) == 2:
+            continue   # no overlapping obs for this model
+        matched_any = True
+        if terrs:
+            block.append(f"  -> mean T bias {sum(terrs) / len(terrs):+.1f}C over {len(terrs)} hrs")
+        out.append("\n".join(block))
+        out.append("")
+    if not matched_any:
+        out.append("(no observed METARs overlap the archived forecast valid times yet -- "
+                   "verification needs obs at the pre-issue forecast hours in the store)")
+    return "\n".join(out)
+
+
+def _get_model_verification(con, station: str, args: dict) -> ToolResult:
+    model = args.get("model")
+    models = [str(model).lower()] if model else list(modeldata.MODELS)
+    return ToolResult(_fmt_model_verification(con, station, models))
+
+
+# Human-readable unit hints for the spatial field tool's common aliases.
+_FIELD_UNITS = {"t2m": ("C", _k2c), "td2m": ("C", _k2c), "gust": ("kt", _ms2kt),
+                "vis": ("SM", lambda m: None if m is None else m / 1609.34),
+                "mslp": ("hPa", lambda p: None if p is None else p / 100)}
+
+
+def _fmt_nearby_model_data(con, model: str, variable: str, want) -> str:
+    # find a stored valid time nearest `want` (or the first) by checking one location
+    locs = store.model_data_locations(con)
+    if not locs:
+        return _md_locations_hint(con)
+    ref = None
+    for lc in locs:
+        vts = store.model_data_valid_times(con, model, lc["lat"], lc["lon"])
+        if vts:
+            ref = min(vts, key=lambda v: abs((v - want).total_seconds())) if want else vts[0]
+            break
+    if ref is None:
+        return f"(no {model.upper()} data pre-fetched). {_md_locations_hint(con)}"
+    field = store.model_data_field(con, model, variable, valid_time=ref)
+    if not field:
+        return (f"(no {model.upper()} '{variable}' at {ref:%Y-%m-%dT%HZ}; check the alias -- "
+                "surface aliases: t2m td2m gust mslp vis ceil tcdc; wind is u10/v10 or wind/wdir)")
+    unit, conv = _FIELD_UNITS.get(variable, ("native", lambda x: x))
+    out = [f"{model.upper()} '{variable}' ({unit}) across pre-fetched points, valid "
+           f"{ref:%Y-%m-%dT%HZ} -- for gradient/advection reasoning (sorted by location id):",
+           f"  {'loc':<10}{'lat':>9}{'lon':>10}{'value':>10}"]
+    for r in field:
+        cv = conv(r["value"])
+        vs = "--" if cv is None else (f"{cv:.1f}" if unit != "native" else f"{cv:.3g}")
+        out.append(f"  {(r['loc_id'] or ''):<10}{r['lat']:>9.4f}{r['lon']:>10.4f}{vs:>10}")
+    return "\n".join(out)
+
+
+def _get_nearby_model_data(con, station: str, args: dict) -> ToolResult:
+    variable = str(args.get("variable") or "").strip()
+    if not variable:
+        return ToolResult('error: get_nearby_model_data needs a "variable" alias, e.g. '
+                          '"variable": "t2m" (surface: t2m td2m gust mslp vis ceil tcdc)')
+    model = str(args.get("model") or "gfs").lower()
+    if model not in modeldata.MODELS:
+        return ToolResult(f"error: unknown model {model!r}; choose from {', '.join(modeldata.MODELS)}")
+    want = None
+    if args.get("valid_time"):
+        try:
+            want = datetime.strptime(str(args["valid_time"]).replace("Z", "")[:16], "%Y-%m-%dT%H:%M")
+        except ValueError:
+            return ToolResult('error: valid_time must be ISO like "2026-07-17T21:00Z"')
+    return ToolResult(_fmt_nearby_model_data(con, model, variable, want))
+
+
 def _stamp_fetched(result: ToolResult) -> ToolResult:
     """Append the UTC fetch time to a network receipt, unless the fetch errored. The
     cycle/valid time of model-run products is already on the receipt; this pins the
@@ -1512,6 +2019,14 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
             return _get_nearby_obs(con, station, args)
         if name == "get_climo":
             return _get_climo(con, args)
+        if name == "get_model_state":
+            return _get_model_state(con, station, args)
+        if name == "get_hazard_scan":
+            return _get_hazard_scan(con, station, args)
+        if name == "get_model_verification":
+            return _get_model_verification(con, station, args)
+        if name == "get_nearby_model_data":
+            return _get_nearby_model_data(con, station, args)
         return ToolResult(f"error: unknown tool {name!r}")
     except Exception as e:  # noqa: BLE001 -- any read-tool failure becomes feedback, not a dead loop
         return ToolResult(f"error: {name} failed ({type(e).__name__}: {e})")

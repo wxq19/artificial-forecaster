@@ -13,7 +13,7 @@ exact from raw here, like METAR pressure) and NSW (survives in the raw line).
 """
 
 import re
-from datetime import time
+from datetime import datetime, time
 
 from pydantic import BaseModel
 from metar_taf_parser.parser.parser import TAFParser
@@ -56,11 +56,58 @@ _TOK_WX = re.compile(rf"(?:[+-]|VC)?(?:(?:{_WX_DESC})(?:{_WX_PHEN})*|(?:{_WX_PHE
 # The field keys explicit_fields can hold (the resolver's overlay vocabulary).
 EXPLICIT_FIELD_KEYS = frozenset({"wind", "gust", "visibility", "weather", "sky", "qnh"})
 
+# AF TAF remarks (AFMAN 15-124). They have NO delimiter, so the library folds them into
+# the last group -- corrupting it (and, for WND ... AFT, losing a real wind forecast). The
+# scoring path strips them into parse_body before parsing. Extend from doctrine, not
+# imagination: anything unrecognized is LEFT in the body (never guessed away).
+#   WND ... AFT DDHH can appear ANYWHERE (observed mid-body), so it is grabbed globally;
+#   the metwatch/amend-service remarks sit at the TAIL and are stripped iteratively.
+_RMK_WND_AFT = re.compile(
+    r"\bWND\s+(?:VRB\d{2,3}|\d{3}\d{2,3}(?:G\d{2,3})?)KT\s+AFTR?\s+\d{4}(?:\d{2})?\b")
+_RMK_TAIL = (
+    re.compile(r"\s+LAST\s+NO\s+AMDS(?:\s+AFT\s+\d{4})?(?:\s+NEXT\s+\d{4})?\s*$"),
+    re.compile(r"\s+AMD\s+(?:LTD\s+TO|NOT\s+SKED)\b.*$"),
+    re.compile(r"\s+LIMITED\s+METWATCH\b.*$"),
+)
+
+
+def strip_remarks(raw: str) -> tuple[str, str]:
+    """Split an AF TAF into (body, remarks). Conservative: pull the WND ... AFT wind remark
+    from wherever it sits, then iteratively strip trailing metwatch/amend-service remarks;
+    everything unrecognized stays in the body. `body` is safe to parse(); `remarks` feeds
+    tafstate.parse_wind_after. A civil TAF with no remarks returns (raw, "")."""
+    body = raw.strip().rstrip("=").strip()
+    removed: list[str] = []
+    body = _RMK_WND_AFT.sub(lambda m: removed.append(m.group(0)) or " ", body)
+    changed = True
+    while changed:
+        changed = False
+        for pat in _RMK_TAIL:
+            if m := pat.search(body):
+                removed.append(m.group(0).strip())
+                body = body[:m.start()].rstrip()
+                changed = True
+    body = re.sub(r"\s{2,}", " ", body).strip()
+    return body, " ".join(r.strip() for r in removed)
+
 
 class TafTemp(BaseModel):
     temp_c: int                # forecast max (TX) or min (TN) temperature
     day: int                   # day-of-month it occurs
     hour: int                  # UTC hour it occurs
+
+
+class WindOverride(BaseModel):
+    """A 'WND <wind> AFT DDHH' human-TAF remark (AFMAN 15-124): the forecaster's actual
+    wind forecast for hours at/after `after`. Wind ONLY (dir/speed/gust). Scored as a full
+    prevailing overlay from its own time forward (T5). Data-only here (no absolutization);
+    tafstate.parse_wind_after builds these with the absolute `after` datetime."""
+
+    after: datetime            # absolute naive UTC from which this wind applies
+    wind_dir: int | None = None    # None when variable
+    is_vrb: bool = False       # the wind group was VRB
+    wind_speed: int
+    wind_gust: int | None = None
 
 
 # AF hazard groups (AFMAN 15-124 1.3.9-1.3.11). Defined here on the PARSE side
@@ -167,6 +214,7 @@ class TafObs(BaseModel):
     groups: list[TafGroup]     # change groups, in TAF order
     max_temp: TafTemp | None   # TX
     min_temp: TafTemp | None   # TN
+    wind_overrides: list[WindOverride] = []   # 'WND ... AFT DDHH' remarks (set at score time)
     raw: str                   # original line, untouched
 
 

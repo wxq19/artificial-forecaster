@@ -22,6 +22,17 @@ class Settings(BaseSettings):
     # base_url is the portability seam (per-endpoint, never hardcoded in the client).
     gribstream_base_url: str = "https://gribstream.com/api/v2"
     gribstream_api_key: str = ""
+    # Model-data capability (gribstream.py + modeldata.py). A SWITCHABLE experiment tier:
+    # OFF by default because prefetch BILLS credits every cycle and the human-parity baseline
+    # runs at a defined tier. When on, collect.py prefetches the station's model neighborhood
+    # at issue time and grants the get_model_* tools; off, those tools are stripped and no
+    # credits are spent. Flip via MODEL_DATA_ENABLED in .env.
+    model_data_enabled: bool = False
+    # Flow-relative spatial grid: when on, prefetch adds extra UPSTREAM sample points along
+    # the station's climatological prevailing wind (from the climo product) so advection is
+    # sampled farther upwind. Off = the omnidirectional fixed grid only (no climo dependency).
+    # Points are free (<=500), so this is a focus/resolution choice, not a cost one.
+    model_data_flow_relative: bool = False
     # Climatology period-of-record. end_year is the last COMPLETE year: a historical
     # valid-time run can't absorb post-cutoff obs through the climo product (leakage guard).
     climo_start_year: int = 2006

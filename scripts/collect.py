@@ -30,7 +30,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from forecaster import awc, neighbors, stations, store, tafgen
+from forecaster import awc, modeldata, neighbors, stations, store, tafgen
 from forecaster import worksheet as wksht
 from forecaster.agent import AgentConfig, run_agent
 from forecaster.config import settings
@@ -130,6 +130,7 @@ def _ingest_obs(icao: str, model_icao: str, neighbor_icaos: list[str],
 
 
 def main() -> int:
+    t0 = datetime.now(timezone.utc).replace(tzinfo=None)   # process start -> runs.duration_s
     ap = argparse.ArgumentParser(description="Collect one agent TAF run, paired with the human TAF.")
     ap.add_argument("--station", required=True, help="roster ICAO (see forecaster.stations)")
     ap.add_argument("--model", default=settings.llm_model, help="model id (default: settings.llm_model)")
@@ -142,6 +143,10 @@ def main() -> int:
                     help="pre-cutoff obs back-window (24 matches get_trend's default look-back)")
     ap.add_argument("--neighbors", action=argparse.BooleanOptionalAction, default=True,
                     help="also ingest nearby-station obs for get_nearby_obs (spatial awareness)")
+    ap.add_argument("--model-data", action=argparse.BooleanOptionalAction,
+                    default=settings.model_data_enabled,
+                    help="GRIBStream model-data tier: prefetch the station's model neighborhood at "
+                         "issue time and grant the get_model_* tools (BILLS credits; off by default)")
     ap.add_argument("--ingest-only", action="store_true",
                     help="fetch+bank obs (home+proxy+neighbors) into the benchmark DB and exit -- "
                          "the scheduler runs this ONCE per station so the matrix cells share one "
@@ -181,6 +186,13 @@ def main() -> int:
         with store.write_lock(args.db):
             load = _ingest_obs(icao, model_icao, neighbor_icaos, args.ingest_hours, bench_db)
         print(f"[{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}] ingest-only {icao}: {json.dumps(load)}")
+        # Prefetch the model neighborhood ONCE per station/cycle (like obs banking): as_of =
+        # valid_from pins the run cutoff, so the archive is leakage-safe and the matrix cells
+        # copy it for 0 credits. Gated: no credits unless --model-data is on.
+        if args.model_data:
+            md = modeldata.prefetch(icao, as_of=valid_from, db_path=bench_db)
+            print(f"  model-data prefetch {icao}: inserted {md['rows_inserted']} rows, "
+                  f"{md['credits_charged']} credits" + (f"; notes={md['notes']}" if md["notes"] else ""))
         return 0
 
     short = args.model.split("/")[-1]
@@ -231,35 +243,52 @@ def main() -> int:
                 bcon.close()
             rcon = store.connect(run_db)
             try:
+                # Cutoff anchors on valid_from, NOT issue: a scheduled run has issue ==
+                # valid_from, but a manual run keeps its wall-clock minutes -- cutting at
+                # `issue` would copy obs from inside the scoring window (e.g. a 03:00 ob
+                # into a run invoked at 03:07 forecasting from 03:00).
                 n_obs = store.copy_obs(rcon, bench_db, icao,
-                                       before=issue, hours=args.ingest_hours)
+                                       before=valid_from, hours=args.ingest_hours)
                 if model_icao != icao:
                     n_obs += store.copy_obs(rcon, bench_db, model_icao,
-                                            before=issue, hours=args.ingest_hours)
+                                            before=valid_from, hours=args.ingest_hours)
                 for nb in neighbor_icaos:       # same cutoff -> leakage-safe by construction
                     n_obs += store.copy_obs(rcon, bench_db, nb,
-                                            before=issue, hours=args.ingest_hours)
+                                            before=valid_from, hours=args.ingest_hours)
                 # init_scoring_schema so get_previous_taf reads a real (possibly empty)
                 # tafs table; copy_climo creates the climo schema itself, so get_climo
                 # returns clean "not built" feedback rather than a SQL error.
                 store.init_scoring_schema(rcon)
                 n_climo = store.copy_climo(rcon, bench_db, icao)
+                # Model-data archive: leakage-safe by construction (prefetched with
+                # as_of=valid_from), so it copies with NO cutoff -- just the station's
+                # coordinate neighborhood. copy_model_data creates its own schema, so the
+                # get_model_* tools return clean "not pre-fetched" feedback on an empty archive.
+                n_md = (store.copy_model_data(
+                            rcon, bench_db,
+                            coords=modeldata.station_coords(icao, as_of=valid_from, db_path=bench_db))
+                        if args.model_data else store.init_model_data_schema(rcon) or 0)
                 if prev_taf:
                     store.insert_taf(rcon, prev_taf)
             finally:
                 rcon.close()
         return _run_and_persist(args, st, icao, issue, valid_from, valid_to,
-                                run_db, prev_taf, n_climo, n_obs, load,
-                                run_id, experiment_id)
+                                run_db, prev_taf, n_climo, n_obs, n_md, load,
+                                run_id, experiment_id, t0)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
 def _run_and_persist(args, st, icao, issue, valid_from, valid_to,
-                     run_db, prev_taf, n_climo, n_obs, load,
-                     run_id, experiment_id) -> int:
+                     run_db, prev_taf, n_climo, n_obs, n_md, load,
+                     run_id, experiment_id, started_at) -> int:
     """The agent run + final persist (split from main so the temp-dir finally wraps it)."""
-    toolset = [t for t in TOOLS if t["function"]["name"] != "get_current_taf"]
+    # Strip get_current_taf (leakage) always; strip the model-data tier unless enabled (a
+    # switchable experiment axis -- off means the archive is empty and no credits were spent).
+    _MODEL_DATA_TOOLS = {"get_model_state", "get_hazard_scan", "get_model_verification",
+                         "get_nearby_model_data"}
+    _drop = {"get_current_taf"} | (set() if args.model_data else _MODEL_DATA_TOOLS)
+    toolset = [t for t in TOOLS if t["function"]["name"] not in _drop]
     if args.taf_access:
         toolset.append(GET_PREVIOUS_TAF)
     toolset += ([SUBMIT_WORKSHEET] if args.mode != "off" else []) + [EMIT_TAF]
@@ -274,7 +303,8 @@ def _run_and_persist(args, st, icao, issue, valid_from, valid_to,
 
     print(f"[{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}] collect {icao} valid {valid_from:%d%H%M}Z "
           f"| model={args.model} temp={args.temperature} mode={args.mode} seed={cfg.seed} "
-          f"taf_access={args.taf_access} climo_months={n_climo} run_obs={n_obs}"
+          f"taf_access={args.taf_access} climo_months={n_climo} run_obs={n_obs} "
+          f"model_data={n_md if args.model_data else 'off'}"
           + (f" (prev {prev_taf['bulletin_type']} {prev_taf['issue_time_utc']:%d%H%MZ})"
              if prev_taf else (" (no prior TAF on file)" if args.taf_access else "")))
     res = run_agent(messages, cfg)
@@ -292,7 +322,7 @@ def _run_and_persist(args, st, icao, issue, valid_from, valid_to,
             res, run_id=run_id, station=icao, issue_time=issue,
             valid_from=valid_from, valid_to=valid_to, worksheet_mode=args.mode,
             experiment_id=experiment_id, harness_git_sha=_git_sha(), model=args.model,
-            evidence_mode=settings.evidence_mode, db_path=args.db)
+            evidence_mode=settings.evidence_mode, db_path=args.db, started_at=started_at)
 
     print(f"  human TAF: {'NEW ' + str(human['new']) if human['new'] else 'no new bulletin'}")
     print(f"  persisted: run_id={summary['run_id']} taf_id={summary['taf_id']} "

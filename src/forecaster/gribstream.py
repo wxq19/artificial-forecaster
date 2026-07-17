@@ -33,9 +33,14 @@ from .config import settings
 
 # Models exposed by the API (per gribstream.com/docs). Each is a path segment:
 # POST {base_url}/{model}/timeseries. gfs+hrrr overlap the BUFKIT set; nbm is the govt
-# multi-model BLEND (a consensus BASELINE, not raw-model spread). ifsoper (ECMWF IFS) is
-# available too -- deferred to keep credits down; add it here when we wire IFS in.
+# multi-model BLEND (a consensus BASELINE, not raw-model spread).
+#   MODELS       = the DEFAULT prefetch set (what modeldata pulls unless told otherwise).
+#   VALID_MODELS = everything the API accepts, INCLUDING ifsoper (ECMWF IFS). IFS is kept
+#     OUT of MODELS on purpose -- its GRIB variable names on GRIBStream are unverified
+#     (scripts/probe_ifs.py), so it is fetchable (for the probe / opt-in) but never pulled
+#     by default until the names are confirmed. Add it to MODELS once probed.
 MODELS = ("gfs", "hrrr", "nbm")
+VALID_MODELS = ("gfs", "hrrr", "nbm", "ifsoper")
 
 # Local pull ARCHIVE: every response is cached to disk keyed by a stable hash of the
 # request, so a repeat pull of the same slice (e.g. the 6 matrix cells at one station/
@@ -83,10 +88,18 @@ class TimeSeries:
 
     @property
     def credits(self) -> int:
-        """Best-effort credit estimate for what came back: valid_times * variables * 1
-        (single-point). Charged on RETURNED rows, so a 0-row window costs nothing."""
-        n_vars = len(self.columns) - len(_TS_COLS) - len(_META_COLS)
-        return len(self.rows) * max(n_vars, 0)
+        """Best-effort credit estimate for what came back, per the API formula
+            distinct_valid_times * variables * ceil(coordinates / 500).
+        Coordinates sit INSIDE ceil(/500), so 1 point and 500 points cost the same -- the
+        multi-coordinate batching lever. Charged on RETURNED rows, so a 0-row window costs
+        nothing. (The old single-point estimate `rows * vars` overcounted an N-coord pull
+        by N, since rows = times * coords.)"""
+        n_vars = max(len(self.columns) - len(_TS_COLS) - len(_META_COLS), 0)
+        if not self.rows or not n_vars:
+            return 0
+        n_times = len({r["forecasted_time"] for r in self.rows if r.get("forecasted_time")})
+        n_coords = len({(r.get("lat"), r.get("lon")) for r in self.rows}) or 1
+        return n_times * n_vars * math.ceil(n_coords / 500)
 
     @property
     def charged(self) -> int:
@@ -96,8 +109,8 @@ class TimeSeries:
 
 def endpoint_url(model: str) -> str:
     """The timeseries endpoint for a model (provenance without fetching)."""
-    if model not in MODELS:
-        raise ValueError(f"unknown model {model!r}; choose from {MODELS}")
+    if model not in VALID_MODELS:
+        raise ValueError(f"unknown model {model!r}; choose from {VALID_MODELS}")
     return f"{settings.gribstream_base_url}/{model}/timeseries"
 
 
@@ -181,42 +194,42 @@ def _parse_csv(text: str) -> tuple[list[str], list[dict]]:
     return columns, rows
 
 
-def fetch_timeseries(
+def fetch_points(
     model: str,
-    lat: float,
-    lon: float,
+    coords: list[tuple[float, float, str]],
     variables: list[Var],
     *,
     from_time: datetime | None = None,
     until_time: datetime | None = None,
     times: list[datetime] | None = None,
-    name: str = "",
     as_of: datetime | None = None,
     min_lead: str | None = None,
     max_lead: str | None = None,
     use_cache: bool = True,
 ) -> TimeSeries:
-    """Fetch a single-point forecast time series.
+    """Fetch a MULTI-coordinate forecast time series in ONE request -- the batching lever.
 
-    Give EITHER a window (`from_time`, `until_time` -- returns every model step inside it)
-    OR an explicit `times` list (the API's timesList -- returns only those valid times, so a
-    tool can subsample, e.g. 2-hourly across 30 h, without paying for every hourly step).
+    `coords` is a list of (lat, lon, name); each returned row is tagged by lat/lon/name so
+    a caller demuxes by location. Up to 500 coordinates cost the SAME as one (they sit
+    inside ceil(coords/500) in the credit formula), so pull the surrounding area generously.
 
-    `as_of` (a model run cutoff) yields a leakage-safe point-in-time view: only forecasts
-    issued at/before it are considered -- pass the TAF issue time for historical replay.
-    `min_lead`/`max_lead` are API duration strings ('1h', '48h'). Every returned row carries
-    `forecasted_at` (the run it came from); `.runs` collects the distinct set.
-
-    `use_cache` (default True) serves an identical prior request from the local archive for
-    0 credits. Credits = returned_valid_times * len(variables) for a single point -- keep
-    windows narrow while the free pool is small.
+    Time selection, `as_of`, leads, and caching behave exactly as `fetch_timeseries` (which
+    is now a single-coordinate wrapper over this). Credits ~ valid_times * variables *
+    ceil(len(coords)/500) -- discipline stays on hours/variables, not points.
     """
     if not variables:
         raise ValueError("at least one variable is required")
-    if model not in MODELS:
-        raise ValueError(f"unknown model {model!r}; choose from {MODELS}")
+    if model not in VALID_MODELS:
+        raise ValueError(f"unknown model {model!r}; choose from {VALID_MODELS}")
+    if not coords:
+        raise ValueError("at least one coordinate is required")
+    if len(coords) > 500:
+        raise ValueError(
+            f"{len(coords)} coordinates exceeds the 500-per-request limit (past 500 the "
+            "coordinate credit factor doubles); chunk the call into <=500-point batches"
+        )
     body: dict = {
-        "coordinates": [{"lat": lat, "lon": lon, "name": name}],
+        "coordinates": [{"lat": lat, "lon": lon, "name": name} for lat, lon, name in coords],
         "variables": [v.as_dict() for v in variables],
     }
     if times is not None:
@@ -246,3 +259,40 @@ def fetch_timeseries(
     runs = sorted({r["forecasted_at"] for r in rows if r.get("forecasted_at")})
     return TimeSeries(model=model, url=endpoint_url(model), columns=columns,
                       rows=rows, runs=runs, cached=cached)
+
+
+def fetch_timeseries(
+    model: str,
+    lat: float,
+    lon: float,
+    variables: list[Var],
+    *,
+    from_time: datetime | None = None,
+    until_time: datetime | None = None,
+    times: list[datetime] | None = None,
+    name: str = "",
+    as_of: datetime | None = None,
+    min_lead: str | None = None,
+    max_lead: str | None = None,
+    use_cache: bool = True,
+) -> TimeSeries:
+    """Fetch a SINGLE-point forecast time series -- a thin wrapper over `fetch_points`.
+
+    Give EITHER a window (`from_time`, `until_time` -- returns every model step inside it)
+    OR an explicit `times` list (the API's timesList -- returns only those valid times, so a
+    tool can subsample, e.g. 2-hourly across 30 h, without paying for every hourly step).
+
+    `as_of` (a model run cutoff) yields a leakage-safe point-in-time view: only forecasts
+    issued at/before it are considered -- pass the TAF issue time for historical replay.
+    `min_lead`/`max_lead` are API duration strings ('1h', '48h'). Every returned row carries
+    `forecasted_at` (the run it came from); `.runs` collects the distinct set.
+
+    `use_cache` (default True) serves an identical prior request from the local archive for
+    0 credits. Credits = returned_valid_times * len(variables) for a single point -- keep
+    windows narrow while the free pool is small.
+    """
+    return fetch_points(
+        model, [(lat, lon, name)], variables,
+        from_time=from_time, until_time=until_time, times=times,
+        as_of=as_of, min_lead=min_lead, max_lead=max_lead, use_cache=use_cache,
+    )

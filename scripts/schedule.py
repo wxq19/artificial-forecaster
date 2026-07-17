@@ -26,7 +26,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from forecaster import stations
+from forecaster import modeldata, stations
+from forecaster.config import settings
 
 KIMI = "moonshotai/Kimi-K2.7-Code"
 MINIMAX = "MiniMaxAI/MiniMax-M3"
@@ -59,7 +60,11 @@ MATRIX: list[Cell] = [
 ]
 
 # Per-cell wall-clock cap so a hung model/network call can't stall the hour's batch.
-CELL_TIMEOUT_S = 1800
+# Round-1 evidence (25 events): median cell finished ~9 min after the hour, p90 18, worst
+# batch tail 25 min -- but that finish-lag CONFOUNDS queue time with runtime, so the tail
+# is not proven runtime. 1500 sits safely above any plausible single-cell runtime; drop to
+# 1200 once runs.duration_s (T10) shows max well under 20 min.
+CELL_TIMEOUT_S = 1500
 
 # How many collection subprocesses to run concurrently. Each is one python process
 # rendering matplotlib charts + calling the API, so this is bounded by the HOST's CPU/RAM,
@@ -94,6 +99,9 @@ def main() -> int:
     ap.add_argument("--max-parallel", type=int, default=MAX_PARALLEL,
                     help=f"concurrent collection subprocesses (default {MAX_PARALLEL})")
     ap.add_argument("--db", default=None, help="benchmark DB path (default: settings.db_path)")
+    ap.add_argument("--model-data", action=argparse.BooleanOptionalAction, default=None,
+                    help="force the GRIBStream model-data tier on/off for this dispatch "
+                         "(default: inherit collect.py's MODEL_DATA_ENABLED; BILLS credits when on)")
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc).replace(tzinfo=None, minute=0, second=0, microsecond=0)
@@ -107,9 +115,21 @@ def main() -> int:
     if not stns:
         return 0
 
+    # Whether the model-data tier is on for this dispatch: explicit --model-data wins, else
+    # the collector's settings default. Model-data prefetch is done ONCE, BATCHED, in-process
+    # (below) -- not per ingest subprocess -- so the union of due stations' neighborhoods is
+    # one set of <=500-coord requests instead of N.
+    model_data_on = args.model_data if args.model_data is not None else settings.model_data_enabled
+
+    def _md_flag() -> list[str]:
+        # None -> inherit collect's settings default; True/False -> force it for this dispatch.
+        return [] if args.model_data is None else (
+            ["--model-data"] if args.model_data else ["--no-model-data"])
+
     def _ingest_cmd(st: stations.Station) -> list[str]:
+        # Obs banking only -- prefetch is batched in-process, so tell the subprocess NOT to.
         cmd = [sys.executable, str(_COLLECT), "--station", st.icao, "--ingest-only",
-               "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
+               "--no-model-data", "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
         return cmd + (["--db", args.db] if args.db else [])
 
     def _cell_cmd(st: stations.Station, cell: Cell) -> list[str]:
@@ -118,11 +138,14 @@ def main() -> int:
                "--taf-access" if cell.taf_access else "--no-taf-access",
                "--no-ingest",  # obs are pre-banked once per station by the ingest pass below
                "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
-        return cmd + (["--db", args.db] if args.db else [])
+        return cmd + _md_flag() + (["--db", args.db] if args.db else [])
 
     if args.dry_run:
         for st in stns:
             print(f"  DRY-RUN would ingest: {st.icao} (once)")
+        if model_data_on:
+            print(f"  DRY-RUN would prefetch model-data (batched): {', '.join(s.icao for s in stns)}")
+        for st in stns:
             for cell in MATRIX:
                 print(f"  DRY-RUN would fire:   {st.icao} {cell.label} ({cell.model.split('/')[-1]})")
         return 0
@@ -143,6 +166,21 @@ def main() -> int:
             status = f"FAILED rc={rc}" if rc is not None else "TIMEOUT"
             tail = "\n".join(output.strip().splitlines()[-6:]) if output.strip() else "(no output)"
             print(f"----- {label}: {status} -- SKIPPING {st.icao} cells -----\n{tail}\n")
+
+    # Phase 1b -- ONE batched model-data prefetch for all ingested stations (they share this
+    # cycle's issue time). Points are free <=500, so the union costs ~1 request/model instead
+    # of N. A failure here is non-fatal: the cells with --model-data just copy an empty archive
+    # and the get_model_* tools return "not pre-fetched" feedback.
+    if model_data_on and ready:
+        try:
+            md = modeldata.prefetch_many([st.icao for st in ready], as_of=issue, db_path=args.db)
+            print(f"----- model-data prefetch: {md['rows_inserted']} rows across "
+                  f"{md['coords']} coords in {md['requests']} request(s), "
+                  f"{md['credits_charged']} credits -----"
+                  + (f"\n  notes: {md['notes']}" if md["notes"] else ""))
+        except Exception as e:  # noqa: BLE001 -- prefetch failure must not abort the cells
+            print(f"----- model-data prefetch FAILED ({type(e).__name__}: {e}) -- "
+                  "cells will find an empty archive -----")
 
     # Phase 2 -- run the matrix cells (--no-ingest) for the successfully-ingested stations.
     jobs = [(f"{st.icao} {cell.label} ({cell.model.split('/')[-1]})", _cell_cmd(st, cell))

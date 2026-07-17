@@ -8,7 +8,7 @@ essential for the scoring join to line human vs artificial forecasts up by stati
 import hashlib
 from datetime import datetime, timezone
 
-from forecaster.tafparse import parse
+from forecaster.tafparse import parse, strip_remarks
 from forecaster.tafstate import absolute_validity
 
 
@@ -26,19 +26,34 @@ def build_taf_row(
     canonical: bool = False,
     bulletin_type: str | None = None,
     parse_body: str | None = None,
+    salt: str | None = None,
 ) -> dict:
     """Parse a raw TAF and build a `tafs` row dict with an absolute UTC window and a
     content-derived taf_id. Pure (no DB); tested deterministically. Callers may add the
-    lineage columns (run_id, experiment_id, worksheet_id, taf_product_json) afterward."""
-    obs = parse(raw)
+    lineage columns (run_id, experiment_id, worksheet_id, taf_product_json) afterward.
+
+    `salt` (e.g. a run_id) disambiguates the taf_id ONLY: two matrix cells emitting
+    byte-identical TAF text must not collide on taf_id (each needs its own lineage row),
+    while the human/poller path passes no salt so content-dedup is preserved. The
+    `content_sha256` COLUMN always hashes the raw alone (tamper evidence, salt-independent)."""
+    # Populate parse_body with the remark-stripped body when remarks were actually present
+    # (AF remarks have no delimiter and corrupt the parse). NULL when nothing was stripped,
+    # so a clean TAF's column stays NULL (the raw stays byte-exact in raw_taf either way).
+    if parse_body is None:
+        stripped, _rmk = strip_remarks(raw)
+        if stripped != raw.strip().rstrip("=").strip():
+            parse_body = stripped
+    obs = parse(parse_body if parse_body is not None else raw)
     issue, valid_from, valid_to = absolute_validity(obs, issue_ref)
     if bulletin_type is None:
         bulletin_type = ("correction" if obs.corrected else
                          "cancellation" if obs.canceled else
                          "amendment" if obs.amendment else "routine")
     sha = content_sha256(raw)
+    id_sha = (hashlib.sha256((raw.strip() + "|" + salt).encode("utf-8")).hexdigest()
+              if salt else sha)
     return {
-        "taf_id": f"{obs.station}-{issue:%Y%m%d%H%M}-{sha[:12]}",
+        "taf_id": f"{obs.station}-{issue:%Y%m%d%H%M}-{id_sha[:12]}",
         "station": obs.station,
         "issue_time_utc": issue,
         "valid_from_utc": valid_from,

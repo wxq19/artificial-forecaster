@@ -93,6 +93,16 @@ CATALOG: dict[str, ChartSpec] = {
     ]
 }
 
+# Fallback when a TT (third-party, hotlink-gated, URL-fragile) forecast panel fails: the
+# closest SPC mesoanalysis ANALYSIS chart at the same level. NOTE this is CURRENT analysis,
+# not the forecast hour asked for -- the tool receipt must say so explicitly (T8).
+TT_TO_SPC_MESO: dict[str, str] = {
+    "gfs_500mb": "meso_500mb",          # 500mb hgt/vort -> SPC 500mb
+    "gfs_250mb": "meso_300mb",          # 250mb jet -> SPC 300mb (nearest level)
+    "gfs_mslp_precip": "meso_mslp",     # MSLP + precip -> SPC MSLP
+    "gfs_850mb_temp": "meso_850mb",     # 850mb temp -> SPC 850mb
+}
+
 # TT samples GFS every 6 hours; a forecast hour must land on that grid.
 GFS_STEP_H = 6
 GFS_MAX_FHR = 384

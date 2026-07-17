@@ -160,13 +160,17 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
             res.stop_reason = "fatal"
             return res
 
-        res.prompt_tokens += r.usage.prompt_tokens
-        res.completion_tokens += r.usage.completion_tokens
+        # usage is always present on Together, but round 2 adds providers -- a null usage
+        # response must record 0 tokens, not crash (a run is data, not a crash).
+        pt = r.usage.prompt_tokens if r.usage else 0
+        ct = r.usage.completion_tokens if r.usage else 0
+        res.prompt_tokens += pt
+        res.completion_tokens += ct
         msg = r.choices[0].message
         tcs = msg.tool_calls or []
         rec = StepRecord(
             n=n, finish_reason=r.choices[0].finish_reason,
-            prompt_tokens=r.usage.prompt_tokens, completion_tokens=r.usage.completion_tokens,
+            prompt_tokens=pt, completion_tokens=ct,
             content=(msg.content or "").strip(),
             reasoning=(getattr(msg, "reasoning", None) or "").strip(),
             served_model=getattr(r, "model", None),

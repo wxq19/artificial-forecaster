@@ -33,7 +33,7 @@ from forecaster.tafstate import (
 
 # Bump on any scored-output-changing code fix, even with unchanged policy JSON
 # (sec 11): a rerun with a new scorer_version is a NEW run, never a replace.
-SCORER_VERSION = "1"
+SCORER_VERSION = "2"   # 2: WND ... AFT overlay + remark stripping (T5)
 
 _ELEMENTS = ["ceiling", "visibility", "wind_speed", "wind_dir", "wind_gust",
              "present_weather", "altimeter"]

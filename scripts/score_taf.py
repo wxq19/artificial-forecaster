@@ -28,13 +28,24 @@ from pathlib import Path
 
 from forecaster import iem, stations, store, tafamend, tafskill, tafver
 from forecaster.config import settings
-from forecaster.tafparse import parse
+from forecaster.tafparse import parse, strip_remarks
 from forecaster.tafamend import AmendPolicy, TafAmendScore, score_amend
 from forecaster.tafskill import SkillPolicy, TafSkillScore, score_skill, skill_deltas
 from forecaster.tafver import TafverPolicy, TafverScore, obs_hash, score_tafver
 from forecaster.tafstate import (
-    TruthPolicy, absolute_validity, default_profile, persistence_taf, stable_hash,
+    TruthPolicy, absolute_validity, composite_taf, default_profile, parse_wind_after,
+    persistence_taf, stable_hash,
 )
+
+
+def _parse_scored(raw: str, parse_body: str | None, issue_ref: datetime):
+    """Parse a TAF for scoring: strip AF remarks (parse_body when archived, else strip at
+    score time so already-archived rows are covered retroactively) and attach any
+    'WND ... AFT' wind overrides derived from the remarks (T5)."""
+    body, remarks = strip_remarks(raw)
+    taf = parse(parse_body if parse_body is not None else body)
+    taf.wind_overrides = parse_wind_after(remarks, issue_ref)
+    return taf
 
 PERSISTENCE_MAX_AGE_MIN = 90            # baseline lookback (sec 10 versioned default)
 _UNBUILT = {}
@@ -75,12 +86,13 @@ def run(
         subject_row = store.taf(con, taf_id)
         if not subject_row:
             raise ValueError(f"taf_id not found: {taf_id}")
-        taf = parse(subject_row.get("parse_body") or subject_row["raw_taf"])
+        taf = _parse_scored(subject_row["raw_taf"], subject_row.get("parse_body"),
+                            subject_row["issue_time_utc"])
         station = subject_row["station"]
         vf, vt = subject_row["valid_from_utc"], subject_row["valid_to_utc"]
         canonical = subject_row.get("canonical")
     else:
-        taf = parse(raw)
+        taf = _parse_scored(raw, None, issue_ref)
         _, vf, vt = absolute_validity(taf, issue_ref)
         station, canonical = taf.station, False
 
@@ -109,13 +121,31 @@ def run(
         hrow = store.human_taf_for_window(con, station, vf)
         if hrow is not None and hrow["taf_id"] != taf_id:
             try:
-                htaf = parse(hrow.get("parse_body") or hrow["raw_taf"])
+                htaf = _parse_scored(hrow["raw_taf"], hrow.get("parse_body"),
+                                     hrow["issue_time_utc"])
                 results.append(score_one("human", htaf, tid=hrow["taf_id"]))
             except Exception as e:  # noqa: BLE001 -- an unparseable human TAF is reported, not fatal
                 results.append({"name": "human", **unavailable,
                                 "error": f"{type(e).__name__}: {e}"})
         else:
             results.append({"name": "human", **unavailable})
+        # Amendment-aware human baseline (T9): if the poller archived >=1 amendment for
+        # this window, ALSO score the effective routine+amendments composite. No amendment
+        # -> no composite row (it would duplicate the routine).
+        bulls = store.human_bulletins_for_window(con, station, vf, vt)
+        if len(bulls) > 1:
+            try:
+                parsed = [{"taf": _parse_scored(b["raw_taf"], b.get("parse_body"),
+                                                b["issue_time_utc"]),
+                           "issue_time": b["issue_time_utc"], "valid_from": b["valid_from_utc"],
+                           "valid_to": b["valid_to_utc"], "taf_id": b["taf_id"]} for b in bulls]
+                ctaf, construction = composite_taf(parsed, vf, vt)
+                r = score_one("human_composite", ctaf)
+                r["construction"] = construction
+                results.append(r)
+            except Exception as e:  # noqa: BLE001 -- a composite failure is reported, not fatal
+                results.append({"name": "human_composite", **unavailable,
+                                "error": f"{type(e).__name__}: {e}"})
     if "persistence" in baselines:
         anchor = _persistence_anchor(obs, vf)
         if anchor is not None:
@@ -304,6 +334,8 @@ def _producer_meta(con, r: dict) -> dict:
     if r["name"] == "persistence":
         return {"producer_kind": "baseline",
                 "producer_name": f"persistence-{PERSISTENCE_MAX_AGE_MIN}min"}
+    if r["name"] == "human_composite":      # synthetic routine+amendments effective forecast
+        return {"producer_kind": "human", "producer_name": "composite"}
     if r.get("taf_id"):
         row = store.taf(con, r["taf_id"])
         if row:

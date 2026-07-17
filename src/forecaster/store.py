@@ -521,6 +521,209 @@ def copy_obs(con: duckdb.DuckDBPyConnection, src_db_path: str, station: str, *,
         con.execute("DETACH obssrc")
 
 
+# ---------------------------------------------------------------------------
+# Model-data archive (model_data). Point forecast time series pulled from GRIBStream
+# (gribstream.py) for a TAF site + its neighbors + a coarse upstream grid, ONE tall
+# float table indexed by coordinate so per-location read tools serve the agent for free.
+# Distinct from obs on the leakage axis: a model FORECAST issued before the TAF issue
+# time was legitimately available (the human had it too), so the only guard is
+# run <= issue_time, enforced at PREFETCH via asOf (modeldata.py) -- the archive needs no
+# valid_time read-cutoff. Same seam rule as obs/climo: all model_data SQL lives HERE.
+# ---------------------------------------------------------------------------
+
+# lat/lon are stored ROUNDED so an archive read matches a requested point by equality
+# (the coordinate list is deterministic geometry, not free text, so rounding is lossless
+# for our purposes). Keep this in sync between insert and every read filter.
+_LL_DP = 4
+
+
+def _round_ll(v: float) -> float:
+    return round(float(v), _LL_DP)
+
+
+_MODEL_DATA_DDL = """
+CREATE TABLE IF NOT EXISTS model_data (
+    model       VARCHAR   NOT NULL,   -- gfs|hrrr|nbm|ifsoper
+    run         TIMESTAMP NOT NULL,   -- forecasted_at (naive UTC) = the model cycle
+    valid_time  TIMESTAMP NOT NULL,   -- forecasted_time (naive UTC)
+    lat         DOUBLE    NOT NULL,   -- rounded to _LL_DP so reads match by equality
+    lon         DOUBLE    NOT NULL,
+    loc_id      VARCHAR,              -- coordinate name (neighbor ICAO or grid id)
+    variable    VARCHAR   NOT NULL,   -- alias (t2m, td2m, rh500, ...)
+    value       DOUBLE,               -- native units; NULL if masked
+    member      INTEGER   NOT NULL DEFAULT 0,   -- ensemble id (0 = deterministic)
+    as_of       TIMESTAMP,            -- the asOf cutoff used at fetch (leakage provenance)
+    fetched_at  TIMESTAMP,            -- wall-clock of the pull
+    PRIMARY KEY (model, run, valid_time, lat, lon, variable, member)
+);
+"""
+
+
+def init_model_data_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the model_data table if absent. Idempotent. Write-path side effect (the
+    read-only tool conn never runs it); the prefetch orchestrator calls it before insert."""
+    con.execute(_MODEL_DATA_DDL)
+
+
+def insert_model_data(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
+    """Bulk-insert model_data rows (one per model x run x valid_time x coord x variable x
+    member). IMMUTABLE archive: a repeat PK is a no-op (ON CONFLICT DO NOTHING) -- a model
+    run's value for a valid time never changes, so re-ingest is idempotent like copy_obs.
+    Rounds lat/lon on the way in. Each row dict carries: model, run, valid_time, lat, lon,
+    loc_id, variable, value, member (default 0), as_of, fetched_at. Returns rows added."""
+    if not rows:
+        return 0
+    before = con.execute("SELECT count(*) FROM model_data").fetchone()[0]
+    for r in rows:
+        con.execute(
+            "INSERT INTO model_data VALUES ($model, $run, $valid_time, $lat, $lon, "
+            "$loc_id, $variable, $value, $member, $as_of, $fetched_at) "
+            "ON CONFLICT DO NOTHING",
+            {
+                "model": r["model"],
+                "run": _to_naive_utc(r["run"]) if r.get("run") else None,
+                "valid_time": _to_naive_utc(r["valid_time"]),
+                "lat": _round_ll(r["lat"]),
+                "lon": _round_ll(r["lon"]),
+                "loc_id": r.get("loc_id"),
+                "variable": r["variable"],
+                "value": r.get("value"),
+                "member": int(r.get("member") or 0),
+                "as_of": _to_naive_utc(r["as_of"]) if r.get("as_of") else None,
+                "fetched_at": _to_naive_utc(r["fetched_at"]) if r.get("fetched_at") else None,
+            },
+        )
+    return con.execute("SELECT count(*) FROM model_data").fetchone()[0] - before
+
+
+def model_data_series(
+    con: duckdb.DuckDBPyConnection,
+    model: str,
+    lat: float,
+    lon: float,
+    *,
+    start: datetime,
+    end: datetime,
+    variables: list[str] | None = None,
+) -> list[dict]:
+    """One location's model rows for a model over [start, end] (valid_time inclusive),
+    ordered by valid_time then variable. `variables` optionally restricts the alias set.
+    Matches the point by ROUNDED lat/lon equality (see _round_ll). Returns tall dict rows
+    (model, run, valid_time, lat, lon, loc_id, variable, value, member); the caller pivots
+    variable->value per valid time (preferring the latest run if several are present)."""
+    sql = ("SELECT * FROM model_data WHERE model = ? AND lat = ? AND lon = ? "
+           "AND valid_time BETWEEN ? AND ?")
+    params: list = [model, _round_ll(lat), _round_ll(lon),
+                    _to_naive_utc(start), _to_naive_utc(end)]
+    if variables:
+        sql += f" AND variable IN ({','.join('?' * len(variables))})"
+        params += list(variables)
+    sql += " ORDER BY valid_time, variable"
+    cur = con.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def model_data_locations(
+    con: duckdb.DuckDBPyConnection, *, run: datetime | None = None
+) -> list[dict]:
+    """Distinct pre-fetched locations in the archive: (loc_id, lat, lon, models, n_rows),
+    nearest-name-first is not meaningful so ordered by loc_id. A tool advertises these so
+    the model knows which points it may query. Optional `run` restricts to one cycle. In a
+    per-run collection DB this returns exactly the copied station neighborhood."""
+    sql = ("SELECT loc_id, lat, lon, string_agg(DISTINCT model, ',') AS models, "
+           "count(*) AS n_rows FROM model_data")
+    params: list = []
+    if run is not None:
+        sql += " WHERE run = ?"
+        params.append(_to_naive_utc(run))
+    sql += " GROUP BY loc_id, lat, lon ORDER BY loc_id"
+    cur = con.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def model_data_field(
+    con: duckdb.DuckDBPyConnection,
+    model: str,
+    variable: str,
+    *,
+    valid_time: datetime,
+    run: datetime | None = None,
+) -> list[dict]:
+    """One variable's value at ONE valid time across ALL pre-fetched locations -- the
+    spatial slice a gradient/advection tool reads. Returns [{loc_id, lat, lon, value, run}]
+    ordered by loc_id, keeping the LATEST run per location if several are present."""
+    sql = ("SELECT loc_id, lat, lon, value, run FROM model_data "
+           "WHERE model = ? AND variable = ? AND valid_time = ?")
+    params: list = [model, variable, _to_naive_utc(valid_time)]
+    if run is not None:
+        sql += " AND run = ?"
+        params.append(_to_naive_utc(run))
+    sql += " ORDER BY loc_id, run DESC"
+    cur = con.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    seen: set = set()
+    out: list[dict] = []
+    for r in rows:  # rows already run-DESC; first per loc_id is the latest run
+        if r["loc_id"] in seen:
+            continue
+        seen.add(r["loc_id"])
+        out.append(r)
+    return out
+
+
+def model_data_valid_times(
+    con: duckdb.DuckDBPyConnection, model: str, lat: float, lon: float
+) -> list[datetime]:
+    """Distinct valid times stored for a model at a point (rounded), ascending. Lets a tool
+    default a window/valid-time to what the archive actually holds."""
+    cur = con.execute(
+        "SELECT DISTINCT valid_time FROM model_data WHERE model = ? AND lat = ? AND lon = ? "
+        "ORDER BY valid_time",
+        [model, _round_ll(lat), _round_ll(lon)],
+    )
+    return [r[0] for r in cur.fetchall()]
+
+
+def copy_model_data(
+    con: duckdb.DuckDBPyConnection,
+    src_db_path: str,
+    *,
+    coords: list[tuple[float, float, str]] | None = None,
+) -> int:
+    """Copy model_data rows from the benchmark DB into `con` (a per-run collection DB) so
+    the model-data tools work there for 0 credits -- mirrors copy_obs/copy_climo. Leakage-
+    safe by construction: the archive was pre-fetched with asOf = issue_time, so every
+    row's run <= issue_time already (no read-cutoff needed here, unlike copy_obs).
+
+    `coords` is the station's coordinate set (site + neighbors + grid, the SAME list the
+    prefetch used) as (lat, lon, name); rows are filtered to those ROUNDED points so only
+    the relevant neighborhood is copied. If None, copies ALL model_data (small scratch DBs
+    only). Returns rows copied. The caller holds write_lock on the source if a writer runs."""
+    init_model_data_schema(con)
+    con.execute(f"ATTACH '{src_db_path}' AS mdsrc (READ_ONLY)")
+    try:
+        before = con.execute("SELECT count(*) FROM model_data").fetchone()[0]
+        if coords:
+            pairs = {(_round_ll(la), _round_ll(lo)) for la, lo, _ in coords}
+            values = ",".join(f"({la},{lo})" for la, lo in pairs)
+            con.execute(
+                "INSERT INTO model_data SELECT * FROM mdsrc.model_data "
+                f"WHERE (lat, lon) IN (VALUES {values}) ON CONFLICT DO NOTHING"
+            )
+        else:
+            con.execute("INSERT INTO model_data SELECT * FROM mdsrc.model_data "
+                        "ON CONFLICT DO NOTHING")
+        return con.execute("SELECT count(*) FROM model_data").fetchone()[0] - before
+    except duckdb.CatalogException:
+        # Source has no model_data table yet -> nothing to copy (not an error).
+        return 0
+    finally:
+        con.execute("DETACH mdsrc")
+
+
 def climo_meta(con: duckdb.DuckDBPyConnection, station: str) -> dict | None:
     """The station's climo metadata row, or None if not built."""
     cur = con.execute("SELECT * FROM climo_meta WHERE station = ?", [station])
@@ -832,6 +1035,26 @@ def human_taf_for_window(con: duckdb.DuckDBPyConnection, station: str,
     return dict(zip(cols, row)) if row else None
 
 
+def human_bulletins_for_window(con: duckdb.DuckDBPyConnection, station: str,
+                               valid_from: datetime, valid_to: datetime) -> list[dict]:
+    """The human's OPERATIONAL product over a scoring window (T9): the routine TAF (as
+    human_taf_for_window selects it) PLUS every human/official amendment/correction for the
+    same station issued within [routine issue_time, valid_to), issue-time ascending. Empty
+    if no routine is archived. Feeds tafstate.composite_taf. JSON columns as strings."""
+    routine = human_taf_for_window(con, station, valid_from)
+    if routine is None:
+        return []
+    cur = con.execute(
+        "SELECT * FROM tafs WHERE station = ? AND producer_kind IN ('human', 'official') "
+        "AND bulletin_type IN ('amendment', 'correction') "
+        "AND issue_time_utc >= ? AND issue_time_utc < ? "
+        "ORDER BY issue_time_utc ASC",
+        [station, routine["issue_time_utc"], _to_naive_utc(valid_to)])
+    cols = [d[0] for d in cur.description]
+    amds = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return [routine, *amds]
+
+
 def archived_human_tafs(con: duckdb.DuckDBPyConnection, *, before: datetime,
                         station: str | None = None,
                         routine_only: bool = True) -> list[dict]:
@@ -952,6 +1175,9 @@ CREATE TABLE IF NOT EXISTS runs (
     worksheet_id      VARCHAR,              -- the worksheet in taf_worksheets, if any
     transcript_path   VARCHAR,              -- path to messages.json (the frozen transcript blob)
     fatal             VARCHAR,              -- error string if the run crashed
+    window_mismatch   VARCHAR,              -- set if the emitted TAF's window != the requested one (no evaluation created); NULL = matched
+    duration_s        DOUBLE,               -- wall-clock seconds the collect process spent on the run (disambiguates queue-vs-runtime)
+    tool_errors_json  JSON,                 -- {tool_name: n_failed_calls}; {} = a run where every tool call succeeded
     created_at        TIMESTAMP,
     PRIMARY KEY (run_id)
 );
@@ -963,7 +1189,8 @@ CREATE TABLE IF NOT EXISTS runs (
 _RUNS_MIGRATIONS = (
     ("served_model", "VARCHAR"), ("system_fingerprint", "VARCHAR"), ("base_url", "VARCHAR"),
     ("temperature", "DOUBLE"), ("max_tokens", "INTEGER"), ("seed", "INTEGER"),
-    ("toolset_hash", "VARCHAR"),
+    ("toolset_hash", "VARCHAR"), ("window_mismatch", "VARCHAR"), ("duration_s", "DOUBLE"),
+    ("tool_errors_json", "JSON"),
 )
 
 
@@ -987,7 +1214,8 @@ def insert_run(con: duckdb.DuckDBPyConnection, run: dict) -> None:
         "worksheet_mode", "config_id", "harness_git_sha", "prompt_tokens",
         "completion_tokens", "n_steps", "n_tool_calls", "tools_used_json", "stop_reason",
         "convergence", "first_emit_step", "nudge_step", "taf_id", "taf_clean",
-        "worksheet_id", "transcript_path", "fatal", "created_at",
+        "worksheet_id", "transcript_path", "fatal", "window_mismatch", "duration_s",
+        "tool_errors_json", "created_at",
     ]
     con.execute("DELETE FROM runs WHERE run_id = ?", [run["run_id"]])
     con.execute(

@@ -19,8 +19,11 @@ from populate_runs_demo import (
     _ISSUE, _STATION, _VALID_FROM, _VALID_TO, example_result,
 )
 
+from forecaster.metar import CloudLayer
+from forecaster.tafgen import TafProduct, TafProductGroup
+
 from forecaster import store
-from forecaster.agent import RunResult
+from forecaster.agent import RunResult, StepRecord
 from forecaster.runlog import persist_run, read_transcript
 
 
@@ -94,6 +97,8 @@ try:
     ev = store.evaluation(con, summary["evaluation_id"])
     check("pending evaluation written", ev is not None and ev["status"] == "pending"
           and ev["valid_from"] == _VALID_FROM, str(ev and ev.get("status")))
+    check("clean run: tool_errors_json is '{}' (no failed calls)",
+          row["tool_errors_json"] == "{}", str(row and row.get("tool_errors_json")))
 finally:
     con.close()
 
@@ -122,6 +127,87 @@ try:
     row = store.run(con, "RUN_B")
     check("no-emit: runs row exists with NULL taf_id + convergence 'never'",
           row is not None and row["taf_id"] is None and row["convergence"] == "never")
+finally:
+    con.close()
+
+# 4. Window tripwire: a TAF emitted with a validity one day off the requested window.
+#    The TAF is still archived (taf_id set, tafs row present) but NO evaluation is created,
+#    and the runs row records window_mismatch.
+offset = example_result()
+offset.final_taf = offset.last_taf = TafProduct(
+    station=_STATION, issue_day=15, issue_hour=15, issue_minute=55,
+    valid_from_day=16, valid_from_hour=16, valid_to_day=17, valid_to_hour=22,  # one day off
+    prevailing=TafProductGroup(wind_dir=240, wind_speed=10, vis_m=9999,
+                               clouds=[CloudLayer(cover="FEW", height_ft=10000)]),
+    military=False,
+)
+offset.worksheet = None
+s3 = _persist(offset, "RUN_C", tmp)
+check("mismatch: taf_id set but evaluation_id None",
+      s3["taf_id"] is not None and s3["evaluation_id"] is None,
+      f"taf_id={s3['taf_id']} eval={s3['evaluation_id']}")
+con = store.connect(DB, read_only=True)
+try:
+    row = store.run(con, "RUN_C")
+    check("mismatch: runs row records window_mismatch + taf_id",
+          row is not None and row["window_mismatch"] is not None and row["taf_id"] == s3["taf_id"],
+          str(row and row.get("window_mismatch")))
+    check("mismatch: tafs row exists, NO evaluations row",
+          store.taf(con, s3["taf_id"]) is not None
+          and con.execute("SELECT count(*) FROM evaluations WHERE evaluation_id = 'RUN_C'").fetchone()[0] == 0)
+    # matching-window case (RUN_A) left window_mismatch NULL.
+    a = store.run(con, "RUN_A")
+    check("match: window_mismatch NULL for a matching-window run", a["window_mismatch"] is None)
+finally:
+    con.close()
+
+# 5. Salt: byte-identical TAF text under a DIFFERENT run_id -> a DISTINCT taf_id + its own
+#    tafs row (RUN_A and RUN_D emit the same _clean_taf() text).
+s4 = _persist(example_result(), "RUN_D", tmp)
+check("salt: identical TAF text, distinct run_id -> distinct taf_id",
+      s4["taf_id"] is not None and s4["taf_id"] != summary["taf_id"],
+      f"{summary['taf_id']} vs {s4['taf_id']}")
+con = store.connect(DB, read_only=True)
+try:
+    tD = store.taf(con, s4["taf_id"])
+    check("salt: RUN_D has its own tafs row + lineage",
+          tD is not None and tD["run_id"] == "RUN_D")
+finally:
+    con.close()
+
+# 6. Duration: a started_at anchor -> a plausible runs.duration_s (> 0, < timeout).
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+
+s5 = persist_run(
+    example_result(), run_id="RUN_E", station=_STATION, issue_time=_ISSUE,
+    valid_from=_VALID_FROM, valid_to=_VALID_TO, worksheet_mode="advisory",
+    db_path=DB, artifacts_dir=str(tmp / "runs"),
+    started_at=_dt.now(_tz.utc).replace(tzinfo=None) - _td(seconds=42))
+con = store.connect(DB, read_only=True)
+try:
+    row = store.run(con, "RUN_E")
+    check("duration: runs.duration_s plausible (> 0, < timeout)",
+          row is not None and row["duration_s"] is not None
+          and 40 <= row["duration_s"] < 1500, str(row and row.get("duration_s")))
+    # no started_at -> NULL duration (RUN_A path)
+    check("duration: NULL when started_at omitted", store.run(con, "RUN_A")["duration_s"] is None)
+finally:
+    con.close()
+
+# 7. Tool-error tracking: a step whose call receipt starts with 'error:' -> counted per tool.
+failing = example_result()
+failing.steps.insert(0, StepRecord(
+    n=0, finish_reason="tool_calls", prompt_tokens=100, completion_tokens=10, content="", reasoning="",
+    calls=[{"name": "get_map", "args": "{}", "result": "error: could not fetch chart", "n_images": 0}]))
+s6 = persist_run(
+    failing, run_id="RUN_F", station=_STATION, issue_time=_ISSUE,
+    valid_from=_VALID_FROM, valid_to=_VALID_TO, worksheet_mode="advisory",
+    db_path=DB, artifacts_dir=str(tmp / "runs"))
+con = store.connect(DB, read_only=True)
+try:
+    row = store.run(con, "RUN_F")
+    check("tool-error: failed call counted per tool", row["tool_errors_json"] == '{"get_map": 1}',
+          str(row and row.get("tool_errors_json")))
 finally:
     con.close()
 

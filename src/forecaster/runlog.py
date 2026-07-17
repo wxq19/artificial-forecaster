@@ -96,6 +96,7 @@ def persist_run(
     evidence_mode: str | None = None,
     db_path: str | None = None,
     artifacts_dir: str | None = None,
+    started_at: datetime | None = None,
 ) -> dict:
     """Persist one agent run: transcript file + `runs` row + archived TAF + worksheet +
     a PENDING evaluation. Idempotent by run_id (re-persisting replaces, never duplicates).
@@ -107,6 +108,20 @@ def persist_run(
         seed=res.seed, worksheet_mode=worksheet_mode, evidence_mode=evidence_mode,
         toolset_hash=th)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # Tool failures made queryable: count, per tool, the calls whose receipt first line
+    # signalled failure -- a live tool that errored (AWC hiccup, TT 403, BUFKIT 404) means
+    # the model forecast with less data. {} = every tool call succeeded. (A per-tool CAP is
+    # a budget stop, not a data failure -- counted separately so it doesn't read as an error.)
+    tool_errors: dict[str, int] = {}
+    for step in res.steps:
+        for call in step.calls:
+            line = (call.get("result") or "")
+            if line.startswith("error:"):
+                tool_errors[call["name"]] = tool_errors.get(call["name"], 0) + 1
+    duration_s = None
+    if started_at is not None:
+        duration_s = (now - started_at.astimezone(timezone.utc).replace(tzinfo=None)
+                      if started_at.tzinfo else now - started_at).total_seconds()
     transcript_path = write_transcript(run_id, res, artifacts_dir=artifacts_dir, db_path=db_path)
     # Store the transcript path RELATIVE to the DB directory, so the benchmark DB and its
     # runs/ folder move together (rsync to the laptop / cloud) and stay resolvable.
@@ -141,24 +156,42 @@ def persist_run(
         # Archive the emitted TAF. A malformed last_taf that will not render/parse is
         # still RECORDED on the run (taf_id NULL) -- it just cannot be scored.
         taf_id = None
+        window_mismatch = None
         if product is not None:
             try:
                 raw = tafgen.render_taf(product)
+                # salt the taf_id with run_id: two matrix cells emitting identical TAF text
+                # must not collide on taf_id (each needs its own lineage row).
                 row = build_taf_row(raw, issue_ref=issue_time, producer_kind="artificial",
-                                    producer_name=model, source="agent_run", canonical=True)
+                                    producer_name=model, source="agent_run", canonical=True,
+                                    salt=run_id)
                 row["run_id"] = run_id
                 row["experiment_id"] = experiment_id
                 row["worksheet_id"] = worksheet_id
                 row["taf_product_json"] = product.model_dump_json()
                 store.insert_taf(con, row)
                 taf_id = row["taf_id"]
+                # Tripwire: the emitted TAF's own validity (parsed from its text) must match
+                # the window we asked for. A mis-anchored day token would otherwise be scored
+                # against the wrong hours -- possibly pre-issue hours the model saw. The
+                # archive still records what was emitted (honest); we just refuse to create a
+                # (mis-anchored) evaluation. Compare naive-UTC: build_taf_row already yields
+                # naive, so drop any tzinfo on the requested bounds before comparing.
+                req_from = valid_from.replace(tzinfo=None)
+                req_to = valid_to.replace(tzinfo=None)
+                if row["valid_from_utc"] != req_from or row["valid_to_utc"] != req_to:
+                    window_mismatch = (
+                        f"taf {row['valid_from_utc']:%Y-%m-%dT%H:%M}.."
+                        f"{row['valid_to_utc']:%Y-%m-%dT%H:%M} != requested "
+                        f"{req_from:%Y-%m-%dT%H:%M}..{req_to:%Y-%m-%dT%H:%M}")
             except Exception:  # noqa: BLE001 -- an unrenderable/unparseable TAF is not a crash
                 taf_id = None
 
-        # Pending evaluation: only meaningful when there is a TAF to score. taf_id
-        # rides on the spine row so the pending scorer needs no join through runs.
+        # Pending evaluation: only meaningful when there is a TAF to score AND its window
+        # matches the request. taf_id rides on the spine row so the pending scorer needs no
+        # join through runs.
         evaluation_id = None
-        if taf_id is not None:
+        if taf_id is not None and window_mismatch is None:
             evaluation_id = run_id
             store.insert_evaluation(con, {
                 "evaluation_id": evaluation_id, "station": station, "taf_id": taf_id,
@@ -181,7 +214,9 @@ def persist_run(
             "convergence": res.convergence, "first_emit_step": res.first_emit_step,
             "nudge_step": res.nudge_step, "taf_id": taf_id,
             "taf_clean": res.final_taf is not None, "worksheet_id": worksheet_id,
-            "transcript_path": transcript_rel, "fatal": res.fatal, "created_at": now})
+            "transcript_path": transcript_rel, "fatal": res.fatal,
+            "window_mismatch": window_mismatch, "duration_s": duration_s,
+            "tool_errors_json": json.dumps(tool_errors), "created_at": now})
     finally:
         con.close()
 

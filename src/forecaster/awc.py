@@ -168,6 +168,31 @@ def load_metar(
     }
 
 
+def fetch_taf_rows(
+    station: str,
+    *,
+    producer_kind: str = "human",
+    producer_name: str | None = None,
+    source: str = "awc_poll",
+    canonical: bool = True,
+) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Fetch the current TAF(s) for one station and build their `tafs` rows -- the
+    NETWORK-only half of load_taf (no store import used). Returns (rows, parse_errors).
+    Split out so the poller can do all its throttled AWC fetches OUTSIDE the single-writer
+    lock, then archive them in one quick locked pass (T2)."""
+    parse_errors: list[tuple[str, str]] = []
+    rows: list[dict] = []
+    for issue, raw in fetch_taf(station):
+        try:
+            row = build_taf_row(raw, issue_ref=issue, producer_kind=producer_kind,
+                                producer_name=producer_name, source=source, canonical=canonical)
+        except Exception as e:  # noqa: BLE001 -- a bad bulletin is logged & skipped, not fatal
+            parse_errors.append((raw, str(e)))
+            continue
+        rows.append(row)
+    return rows, parse_errors
+
+
 def load_taf(
     station: str,
     *,
@@ -184,20 +209,15 @@ def load_taf(
     bulletin adds 0 rows. `canonical=True` marks a TAF frozen at issue time, before its
     truth exists. Returns a summary listing which taf_ids were newly archived.
 
-    The CALLER holds store.write_lock around this on the shared benchmark DB."""
-    parse_errors: list[tuple[str, str]] = []
+    The CALLER holds store.write_lock around this on the shared benchmark DB. (The poller
+    instead uses fetch_taf_rows to fetch off-lock; this stays for collect.py's single-cell
+    path where fetch + archive under one lock hold is fine.)"""
+    rows, parse_errors = fetch_taf_rows(
+        station, producer_kind=producer_kind, producer_name=producer_name,
+        source=source, canonical=canonical)
+
     new_ids: list[str] = []
     seen_ids: list[str] = []
-    rows: list[dict] = []
-    for issue, raw in fetch_taf(station):
-        try:
-            row = build_taf_row(raw, issue_ref=issue, producer_kind=producer_kind,
-                                producer_name=producer_name, source=source, canonical=canonical)
-        except Exception as e:  # noqa: BLE001 -- a bad bulletin is logged & skipped, not fatal
-            parse_errors.append((raw, str(e)))
-            continue
-        rows.append(row)
-
     new_bulletins: list[tuple[str, str]] = []       # (taf_id, bulletin_type) for the new rows
     con = store.connect(db_path) if db_path else store.connect()
     try:
