@@ -29,7 +29,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from forecaster import awc, stations, store, tafgen
+from forecaster import awc, neighbors, stations, store, tafgen
 from forecaster import worksheet as wksht
 from forecaster.agent import AgentConfig, run_agent
 from forecaster.config import settings
@@ -104,6 +104,8 @@ def main() -> int:
     ap.add_argument("--issue-time", help="UTC issue time (e.g. 2026-07-16T2300Z); default: now")
     ap.add_argument("--ingest-hours", type=float, default=24.0,
                     help="pre-cutoff obs back-window (24 matches get_trend's default look-back)")
+    ap.add_argument("--neighbors", action=argparse.BooleanOptionalAction, default=True,
+                    help="also ingest nearby-station obs for get_nearby_obs (spatial awareness)")
     ap.add_argument("--max-steps", type=int, default=24, help="tool-calling turns (ample by default)")
     ap.add_argument("--max-tokens", type=int, default=16000, help="per-turn completion budget")
     ap.add_argument("--db", default=None, help="benchmark DB path (default: settings.db_path)")
@@ -146,12 +148,23 @@ def main() -> int:
         #      bulletin can never qualify however early it posted);
         #   4. stub the runs row, so a cell killed by the scheduler's timeout still
         #      leaves a record (persist_run replaces it by run_id on success).
+        # Nearest-neighbor airfields for spatial awareness (get_nearby_obs); best-effort per
+        # neighbor so one dud id (no live AWC METAR) never sinks the run. Banked into the
+        # benchmark DB and copied under the SAME cutoff as the home station, so the tool is
+        # leakage-safe by the same SQL guard.
+        neighbor_icaos = ([n[0] for n in neighbors.neighbors_of(icao)]
+                          if args.neighbors else [])
         with store.write_lock(args.db):
             load = awc.load_metar(icao, hours=args.ingest_hours, db_path=bench_db)
             if model_icao != icao:              # also bank the proxy's obs for the model tools
                 load = {"base": load,
                         "proxy": awc.load_metar(model_icao, hours=args.ingest_hours,
                                                 db_path=bench_db)}
+            for nb in neighbor_icaos:
+                try:
+                    awc.load_metar(nb, hours=args.ingest_hours, db_path=bench_db)
+                except Exception as e:  # noqa: BLE001 -- a dud neighbor is skipped, not fatal
+                    print(f"  neighbor {nb} ingest skipped ({type(e).__name__}: {e})")
             bcon = store.connect(bench_db)      # RW so a fresh benchmark DB gets its schema
             try:
                 store.init_scoring_schema(bcon)
@@ -177,6 +190,9 @@ def main() -> int:
                                        before=issue, hours=args.ingest_hours)
                 if model_icao != icao:
                     n_obs += store.copy_obs(rcon, bench_db, model_icao,
+                                            before=issue, hours=args.ingest_hours)
+                for nb in neighbor_icaos:       # same cutoff -> leakage-safe by construction
+                    n_obs += store.copy_obs(rcon, bench_db, nb,
                                             before=issue, hours=args.ingest_hours)
                 # init_scoring_schema so get_previous_taf reads a real (possibly empty)
                 # tafs table; copy_climo creates the climo schema itself, so get_climo

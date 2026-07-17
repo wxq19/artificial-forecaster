@@ -45,9 +45,8 @@ def save(name: str, data: bytes, url: str) -> None:
 
 
 def sat(region: str, product: str) -> None:
-    save(f"sat_{region}_{product}",
-         imagery.fetch_satellite(region, product),
-         imagery.satellite_url(region, product))
+    data, url = imagery.fetch_satellite(region, product)
+    save(f"sat_{region}_{product}", data, url)
 
 
 def radar_station(icao: str) -> None:
@@ -80,8 +79,12 @@ else:
     print("satellite:")
     for prod in ("geocolor", "infrared", "water_vapor"):
         sat("conus_east", prod)
-    for reg in ("conus_west", "southern_plains", "hawaii"):
-        sat(reg, "geocolor")
+    for reg in ("conus_west", "southern_plains", "hawaii",
+                "himawari_full_disk", "himawari_japan", "europe", "middle_east", "africa"):
+        try:
+            sat(reg, "geocolor")
+        except Exception as e:  # noqa: BLE001 -- record and continue so one bad region doesn't sink the run
+            print(f"  FAIL sat_{reg}_geocolor  {type(e).__name__}: {e}")
     print("radar:")
     radar_region("national")
     radar_region("southern_plains")

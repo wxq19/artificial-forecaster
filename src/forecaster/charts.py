@@ -7,6 +7,7 @@ so legibility at small size matters more than polish.
 """
 
 import io
+import math
 
 import matplotlib
 import numpy as np
@@ -315,3 +316,56 @@ def skewt(profile) -> bytes:
     fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
     plt.close(fig)  # release the figure - matplotlib leaks if you don't
     return buf.getvalue()
+
+
+# --- Satellite loops: compose fetched frames into a filmstrip or a short video --------
+# imagery.py fetches the time-stamped frames; this seam composes them (frames are read
+# with PIL, which matplotlib already pulls in). A VLM can't watch motion, so a loop is
+# either ONE labeled filmstrip image (universal) or a short mp4 (video-capable models).
+def filmstrip(frames: list[tuple[str, bytes]], *, title: str = "", cols: int = 3) -> bytes:
+    """Compose loop frames (oldest -> newest, each a (utc_label, image_bytes)) into ONE
+    labeled grid image, so any vision model reads the change-over-time in a single image."""
+    from PIL import Image
+
+    imgs = [(lbl, np.asarray(Image.open(io.BytesIO(b)).convert("RGB"))) for lbl, b in frames]
+    ncol = min(len(imgs), max(1, cols))
+    nrow = math.ceil(len(imgs) / ncol)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(ncol * 3.1, nrow * 3.1 + 0.3))
+    for ax in np.atleast_1d(axes).ravel():
+        ax.axis("off")
+    for ax, (lbl, im) in zip(np.atleast_1d(axes).ravel(), imgs):
+        ax.imshow(im)
+        ax.set_title(lbl, fontsize=9)
+    if title:
+        fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def loop_mp4(frames: list[tuple[str, bytes]], *, fps: float = 2.0, hold_last: int = 2) -> bytes:
+    """Encode loop frames (oldest -> newest) into a short mp4 for video-capable models.
+    Frames are normalized to a common EVEN size (libx264) and stamped with their UTC
+    label; the final frame is held a beat so the current state lingers."""
+    import tempfile
+
+    import imageio.v2 as imageio
+    from PIL import Image, ImageDraw
+
+    base = Image.open(io.BytesIO(frames[0][1])).convert("RGB")
+    w, h = (base.width - base.width % 2, base.height - base.height % 2)
+    arrs = []
+    for lbl, b in frames:
+        im = Image.open(io.BytesIO(b)).convert("RGB").resize((w, h))
+        draw = ImageDraw.Draw(im)
+        draw.rectangle([0, 0, 128, 18], fill=(0, 0, 0))
+        draw.text((4, 4), lbl, fill=(255, 255, 255))
+        arrs.append(np.asarray(im))
+    arrs += [arrs[-1]] * max(0, hold_last)
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
+        imageio.mimwrite(tmp.name, arrs, format="FFMPEG", fps=fps, codec="libx264",
+                         macro_block_size=1, pixelformat="yuv420p")
+        tmp.seek(0)
+        return tmp.read()

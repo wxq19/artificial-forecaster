@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.5.4",
+    "global-land-mask>=1.0.0",
+    "imageio>=2.37.3",
+    "imageio-ffmpeg>=0.6.0",
     "matplotlib>=3.11.0",
     "metar-taf-parser-mivek>=1.13.1",
     "metpy>=1.7.1",
@@ -14,7 +17,11 @@ dependencies = [
     "python-dotenv>=1.2.2",
 ]
 [dependency-groups]
-dev = ["ruff>=0.15.18"]
+dev = [
+    "notebook>=7.6.0",
+    "pandas>=3.0.3",
+    "ruff>=0.15.18",
+]
 [tool.hatch.build.targets.wheel]
 packages = ["src/forecaster"]
 [tool.uv]

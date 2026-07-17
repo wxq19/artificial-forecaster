@@ -467,9 +467,78 @@ artificial-forecaster/
   with the climo+imagery working-tree changes). Two follow-ups if wanted: a live `required`-mode run, and a
   recent-valid-time run (obs + built climo) to exercise sanity_checks with real observed data.
 
-## NEXT SESSION -- pick up here (paused 2026-07-13)
+## NEXT SESSION -- pick up here (paused 2026-07-16)
 
-### TAF SCORING SUBSYSTEM built (M0-M3 of docs/taf_score.md) -- 2026-07-13
+### GO LIVE ON THE PI -- built + deployed + idle; 3 steps to start collecting (2026-07-16)
+The whole M4 automated-collection system is BUILT, COMMITTED + PUSHED, and DEPLOYED to the Pi.
+The Pi is idle and clean (no crons running, not billing). Pure tests green (tafstate 40, runlog 15,
+agent 30, worksheet 19, score_pending 21); ruff clean. Full command audit: `docs/pi_setup_log.md`.
+
+WHAT'S BUILT THIS SESSION:
+- **Roster** (`stations.py`): 10 MILITARY, 8-hourly, 30h, military-format (TX/TN + meters vis + QNH INS)
+  airfields, each with its `cycle` (UTC issue hours): KWRI 02/10/18, KMIB 01/09/17, KRCA 03/11/19,
+  KSSC 07/15/23, KDMA 03/11/19, KVBG 06/14/22 (prov), KFTK 03/11/19 (prov), PAED 05/13/21,
+  PABI 06/14/22 (prov), RJTY 05/13/21. Discovered via `scripts/probe_bufkit_stations.py` /
+  `probe_stations_extended.py` (BUFKIT gate) + `probe_taf_cycles.py` (OGIMET cycle confirm). Dropped:
+  6-hourly civil-format fields (no TX/TN) + BUFKIT-but-no-AWC-TAF + irregular KGRK.
+- **Collector** (`scripts/collect.py`): one matrix cell/run. Obs BANKED into the benchmark DB once
+  (truth accumulates as a side effect of collection), then the pre-cutoff back-window COPIED into a
+  throwaway per-run DB with cutoff enforced in SQL (`store.copy_obs`); climo COPIED in (`store.copy_climo`);
+  leakage-safe `get_previous_taf` (from our archive, prior-cycle only) instead of `get_current_taf`
+  (dropped); mandatory worksheet (`--mode required`); ample reasoning (max_steps 24, max_tokens 16000) +
+  agent truncation-recovery guard (`_LENGTH_NUDGE`). Persists a PENDING evaluation.
+- **Scheduler** (`scripts/schedule.py`): one hourly cron consults `stations.cycle`, fires due stations'
+  matrix in parallel (bounded `ThreadPoolExecutor`, `MAX_PARALLEL` default 2; cron uses `--max-parallel 3`
+  for the Pi 5). MATRIX = 6 cells/event: 3-model CONTROL (Kimi `moonshotai/Kimi-K2.7-Code`, MiniMax
+  `MiniMaxAI/MiniMax-M3`, Gemma `google/gemma-4-31B-it`; worksheet required, temp 0, prior TAF) + 3 MiniMax
+  ablations (temp 0.2 / no-worksheet / no-prior-TAF). Inkling `thinkingmachines/inkling` COMMENTED OUT --
+  404 on Together (verify via `scripts/ping_models.py`). ~180 runs/day.
+  FUTURE: add Inkling and Kimi K3 to the tested-model set (Inkling once it's reachable on Together; Kimi K3
+  as the successor to the current Kimi K2.7 control). Verify both model strings via `scripts/ping_models.py`
+  before wiring them into the matrix.
+- **Poller** (`scripts/poll_tafs.py`): archives new/amended human TAFs every 5 min (idempotent by content
+  hash; shows bulletin type). Feeds `get_previous_taf`.
+- **Provenance**: seed (config.llm_seed=1337), temperature, max_tokens, base_url, toolset_hash, served_model,
+  system_fingerprint, hashed config_id on every `runs` row. Transcript paths stored RELATIVE to the DB dir
+  (`runlog`) so DB + `data/runs/` are portable together (`read_transcript(path, db_path=)` resolves).
+- **Scoring `--pending`** (`scripts/score_taf.py`, `test_score_pending.py` 21/21): flips elapsed pending
+  evaluations, `--backfill iem` fills obs gaps.
+- **climo 503 fix**: builds now retry 5xx + connection errors, not just 429. LESSON: never run two climo
+  builds at once -- IEM 503s (server-side overload, not per-IP). Build single-client.
+- **Harvest** (`scripts/harvest.sh`): Pi -> laptop `data/benchmark/` (flock-consistent DB snapshot + rsync
+  transcripts) -> `onedrive:artificial-forecaster/` (rclone; verified round-trip) -> optional prune of Pi
+  transcripts >N days (PRUNE=1). Pull results back a few times/week; code+`.env` never pulled.
+
+PI STATE (`pi@192.168.0.21`, hostname `wx-collector`, Pi 5 / 4-core / 8GB / 109GB free), verified
+live 2026-07-16 end of session: UTC timezone; git+uv installed; repo at `7d03f60` -- NEEDS `git pull`
+to reach the pushed `1e2c394` ("Bug fixes for the automated runs" = the collect rework + copy_obs +
+--pending scorer + relative transcript paths); `uv sync` done; `.env` transferred; models ping 3/3;
+crontab EMPTY (confirmed `no crontab for pi`). JULY climo VERIFIED COMPLETE in the DB for all 10
+stations (1 climo_monthly + 24 climo_hourly rows each) -- the build log shows only 5 "OK" lines
+because it was restarted mid-build after the `Climo fix'` pull; that is a LOG artifact, the DB is
+complete. Do NOT re-run the July build.
+
+GO-LIVE STEPS (next session):
+1. On Pi: `cd ~/artificial-forecaster && git pull` (gets reworked collect.py / store.copy_obs / relative
+   paths / scorer). Confirm HEAD == origin.
+2. ONE test run: `~/.local/bin/uv run python scripts/collect.py --station KWRI --model google/gemma-4-31B-it
+   --mode required` -- confirm climo_months>0, get_previous_taf served, emit clean, relative transcript path.
+3. Install the 3 UTC cron entries from `docs/pi_setup_log.md` (poller `*/5`, scheduler `:02 --max-parallel 3`,
+   scorer `35 */6 --pending --backfill iem`). -> LIVE. GET EXPLICIT GO-LIVE OK FIRST (billed + recurring).
+4. FIRST-SCORE SANITY CHECK (~31h after the first collection cycle = 30h validity + 1h grace): eyeball
+   `logs/score.log` and one `logs/tafscore_*.md` on the Pi -- this is the first time the whole
+   collect->score loop runs on REAL data (the scoring self-tests only prove internal consistency).
+   Expect: status=scored, coverage ~100% (obs banked by collect's dual-write), subject + human +
+   persistence rows in the comparison table.
+5. (Optional) `rclone config` on the Pi for continuous Pi->cloud backup (the laptop harvest leaves a
+   loss window if the SD card dies between pulls).
+
+CAVEATS: climo is JULY-ONLY (this test ~1 week per owner) -- if collection runs into August, build
+August BEFORE Aug 1 (`build_climo.py --station <icao> --months 8`, one station at a time -- concurrent
+IEM builds 503). Satellite images ~1MB base64; transcripts ~1-3MB/run -> ~1.3-3.8GB/week (prune keeps
+the Pi lean).
+
+### (historical 2026-07-13) TAF SCORING SUBSYSTEM built (M0-M3 of docs/taf_score.md)
 Implemented the whole scoring ENGINE from `docs/taf_score.md` (three orthogonal scorers on shared
 primitives). All PURE modules (no duckdb/SQL/network/matplotlib/LLM); naive-UTC throughout; ruff clean.
 - **M0 shared foundation** -- `src/forecaster/tafstate.py`: absolutizer + forecast-state resolver +
@@ -748,6 +817,18 @@ follow-ups:
   authorized DoD environment, not commercial cloud. Flag this if it comes up.
 
 ## Known problems to address
+- **Live network tools drift with wall clock (FIX ACTION for the next large experiment; flagged
+  2026-07-16 at go-live).** The DB-side leakage guards are airtight (obs + prior-TAF cutoffs are
+  pinned to the ISSUE time and enforced in SQL, so scheduler fire time / heavy-hour spillover
+  cannot leak truth). But the live network tools (get_imagery, get_map, get_sounding,
+  get_fcst_sounding, get_point_forecast) fetch whatever is posted at WALL-CLOCK time: a cell that
+  executes minutes-to-an-hour after the pinned issue time sees slightly fresher imagery, and
+  possibly a newer model cycle, than the human forecaster had at issue. Input-fidelity drift, not
+  truth leakage (the verifying METARs are never exposed) -- acceptable for this ~1-week run, but
+  before the NEXT big collection, pin those inputs to issue time: snapshot-and-archive the network
+  products at (or just before) the issue hour and serve the agent the frozen copies (the M4
+  "snapshot-and-replay (b)" path; also what makes historical valid times airtight and enables
+  Batch API / multi-model replay off identical inputs).
 - **break-on-`length` kills a truncated emit turn (DEFERRED 2026-07-09 -- pending the worksheet).** In
   `test_taf_agent.py`, a turn that hits the completion cap comes back `finish_reason=length` with no
   tool_calls; the loop treats that as "model answered" and BREAKS. So a model whose emit-reasoning turn

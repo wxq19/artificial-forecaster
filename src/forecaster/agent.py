@@ -79,6 +79,7 @@ class AgentConfig:
     tool_caps: dict[str, int] | None = None
     worksheet_mode: str = "advisory"    # off|advisory|required -- governs the emit_taf GATE only
     evidence: bool = True               # thread [evidence_id: ev_NNN] onto data-tool receipts
+    video: bool = False                 # served model accepts video_url (mp4 loops); else filmstrip only
     stop_on_clean_taf: bool = True      # stop as soon as emit_taf returns a validate()-clean TAF
     step_budget_nudge: bool = False     # at turn max_steps-2, nudge to emit if none attempted yet
     db_path: str | None = None
@@ -195,6 +196,7 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
             for tc in tcs]})
 
         images: list[tuple[str, bytes]] = []
+        videos: list[tuple[str, bytes]] = []
         for tc in tcs:
             name = tc.function.name
             res.used[name] += 1
@@ -242,6 +244,8 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
 
             label_line = result.text.splitlines()[0] if result.text else name
             images += [(label_line, im) for im in result.images]
+            if cfg.video:
+                videos += [(label_line, v) for v in result.videos]
 
             if name == "submit_taf_worksheet" and result.worksheet is not None:
                 res.worksheet_findings = result.findings
@@ -261,7 +265,7 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
 
         # A tool reply is text-only in the OpenAI format, so images ride in a follow-up
         # user message (batched: one message for all of this turn's charts).
-        if images:
+        if images or videos:
             content = [{"type": "text", "text": "Images from the tool calls above, each "
                         "preceded by its tool's receipt line:"}]
             for label_line, im in images:
@@ -269,6 +273,13 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
                 b64 = base64.b64encode(im).decode()
                 content.append({"type": "image_url",
                                 "image_url": {"url": f"data:{_image_mime(im)};base64,{b64}"}})
+            # Video (mp4 loops) only when the served model accepts video_url (cfg.video);
+            # otherwise the loop's filmstrip image above carries the sequence.
+            for label_line, vid in videos:
+                content.append({"type": "text", "text": f"[video loop for: {label_line}]"})
+                b64 = base64.b64encode(vid).decode()
+                content.append({"type": "video_url",
+                                "video_url": {"url": f"data:video/mp4;base64,{b64}"}})
             messages.append({"role": "user", "content": content})
 
         # One-time convergence nudge: budget nearly spent and no emit attempt yet.

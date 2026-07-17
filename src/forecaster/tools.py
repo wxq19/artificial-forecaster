@@ -15,7 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pydantic import ValidationError
 
 from forecaster import (
-    awc, charts, fcstsounding, imagery, soundings, store, tafgen, tafparse, worksheet, wxmaps,
+    awc, charts, fcstsounding, imagery, neighbors, soundings, store, tafgen, tafparse,
+    terrain, worksheet, wxmaps,
 )
 from forecaster.config import settings
 from forecaster.tafgen import TafProduct
@@ -31,6 +32,7 @@ class ToolResult:
 
     text: str
     images: list[bytes] = field(default_factory=list)
+    videos: list[bytes] = field(default_factory=list)   # mp4 loops (video-capable models only)
     window: tuple | None = None   # (start, end) for time-bounded tools (Fix 3 guard)
     taf: TafProduct | None = None   # emit_taf hands back the captured forecast object
     worksheet: TafWorksheet | None = None   # submit_taf_worksheet hands back the accepted worksheet
@@ -302,10 +304,12 @@ GET_IMAGERY = {
             "Fetch OBSERVED satellite or radar imagery as an image for spatial awareness "
             "-- cloud extent and erosion, stratus/fog footprint, convective/cloud-top "
             "structure, moisture, and precipitation coverage. Set `kind`: 'satellite' "
-            "(GOES imagery; `product` defaults to geocolor, also visible, infrared, "
-            "water_vapor. For a specific airport give its `station` ICAO and the tool picks "
-            "the sector that covers it -- do NOT guess a `region`; use `region` only for a "
-            "broad or named area) or 'radar' (NEXRAD reflectivity; give a `station` ICAO for "
+            "(geostationary imagery -- GOES over the Americas, Himawari over the W Pacific/"
+            "E Asia, Meteosat over Europe/Africa/Middle East; `product` defaults to geocolor, "
+            "also visible, infrared, water_vapor. For a specific airport give its `station` "
+            "ICAO and the tool picks the sector that covers it -- do NOT guess a `region`; use "
+            "`region` only for a broad or named area) or 'radar' (NEXRAD reflectivity, CONUS "
+            "only; give a `station` ICAO for "
             "the local view, a `region` for a mosaic, or set product national_mosaic for "
             "broad context). Radar auto-degrades to a regional or national mosaic when "
             "no credible radar is near the station, and says so in the receipt. Imagery is "
@@ -339,6 +343,88 @@ GET_IMAGERY = {
                 },
             },
             "required": ["kind"],
+        },
+    },
+}
+
+GET_LOOP = {
+    "type": "function",
+    "function": {
+        "name": "get_loop",
+        "description": (
+            "Fetch a short satellite LOOP (a time sequence of frames) centered on an airport, "
+            "to see MOTION and TREND that a single still cannot show -- cloud advection, "
+            "growth/erosion, fog burn-off, convective initiation. Returns a labeled filmstrip "
+            "image (oldest to newest) and, for video-capable models, a short video. Give the "
+            "`station` ICAO; optionally `product` (geocolor default/visible/infrared/"
+            "water_vapor), `frames` (2-10, default 6), and `step_min` (minutes between frames, "
+            "default 30). GOES (Americas) and Himawari (Japan/W Pacific) loops are wide-area; "
+            "Meteosat (Europe/Africa/Middle East) loops are station-centered."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KWRI"},
+                "product": {"type": "string", "enum": list(imagery.SAT_PRODUCTS),
+                            "description": "geocolor (default)/visible/infrared/water_vapor"},
+                "frames": {"type": "integer", "description": "number of frames, 2-10 (default 6)"},
+                "step_min": {"type": "integer",
+                             "description": "minutes between frames (default 30)"},
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+GET_NEARBY_OBS = {
+    "type": "function",
+    "function": {
+        "name": "get_nearby_obs",
+        "description": (
+            "Return the latest surface observation (METAR) from the nearest airfields "
+            "AROUND this station -- the mesoscale picture for upstream advection, frontal "
+            "position, and whether a restriction (fog, low ceiling, gusts) is regional or "
+            "purely local. Each neighbor is labeled with its distance, compass bearing FROM "
+            "your station, and elevation difference, so you can reason about what is "
+            "upwind/upslope. Neighbors are read from the same observation store as your own "
+            "obs (never live), pre-filtered to before your cutoff. Use it to sanity-check "
+            "your own trend against the surrounding network."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KWRI"},
+                "n": {
+                    "type": "integer",
+                    "description": "How many nearest neighbors to return (default 5, max 5)",
+                },
+            },
+            "required": ["station"],
+        },
+    },
+}
+
+GET_TERRAIN = {
+    "type": "function",
+    "function": {
+        "name": "get_terrain",
+        "description": (
+            "Return the STATIC terrain and coastline around an airport as a text summary "
+            "plus a shaded-relief map image -- station elevation, local relief, the "
+            "directions terrain rises (upslope) and falls (downslope), the landform "
+            "(valley/basin, ridge/exposed, sloped, flat), and the nearest coast (direction "
+            "and distance). Use it to anticipate terrain-driven weather: upslope fog and "
+            "precipitation, downslope drying/warming, cold-air pooling in valleys, and "
+            "sea-breeze or advection fog near a coast. Geography only -- it never changes "
+            "and is not a forecast; combine it with the obs, trend, and model data. NOTE: "
+            "the coast check sees OCEAN only, so large inland lakes are not flagged."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KVBG"},
+            },
+            "required": ["station"],
         },
     },
 }
@@ -402,7 +488,8 @@ CHECK_TAF = {
 }
 
 TOOLS = [QUERY_OBS, GET_LATEST, GET_TREND, GET_SOUNDING, GET_MAP, GET_FCST_SOUNDING,
-         GET_POINT_FORECAST, GET_CLIMO, GET_IMAGERY, GET_CURRENT_TAF, CHECK_TAF]
+         GET_POINT_FORECAST, GET_CLIMO, GET_IMAGERY, GET_LOOP, GET_NEARBY_OBS, GET_TERRAIN,
+         GET_CURRENT_TAF, CHECK_TAF]
 
 # The OUTPUT tool: the model emits its forecast as the fields of a TafProduct, and
 # our code renders + checks it. The parameter schema IS the pydantic model's JSON
@@ -453,6 +540,30 @@ SUBMIT_WORKSHEET = {
 }
 
 
+def _decoded_line(r: dict) -> str:
+    """One scannable decoded ob line (no leading indent): time | type | wind | vis |
+    ceiling | present-wx | T/Td. Shared by _fmt and the neighbor renderer."""
+    wind = "—"
+    if r["wind_speed"] is not None:
+        d = (
+            f"{r['wind_dir_deg']:03d}"
+            if r["wind_dir_deg"] is not None
+            else (r["wind_dir_card"] or "VRB")
+        )
+        g = f"G{r['wind_gust']}" if r["wind_gust"] else ""
+        wind = f"{d}/{r['wind_speed']}{g}"
+    vis = "—" if r["vis_sm"] is None else f"{(r['vis_flag'] or '')}{r['vis_sm']:g}SM"
+    ceil = "unlim" if r["ceiling_ft"] is None else f"{r['ceiling_ft']}ft"
+    wx = " ".join(r["weather"]) or "-"
+    t = "—" if r["temp_c"] is None else f"{r['temp_c']}"
+    dp = "—" if r["dewpoint_c"] is None else f"{r['dewpoint_c']}"
+    kind = r["report_type"] or "—"
+    return (
+        f"{r['obs_time']:%Y-%m-%dT%H:%MZ} {kind:<5} {wind:<11} "
+        f"{vis:<7} {ceil:<7} {wx:<14} {t}/{dp}"
+    )
+
+
 def _fmt(rows: list[dict], order: str = "oldest first") -> str:
     """Per ob: a decoded summary line (our normalized vis_sm/ceiling_ft) followed
     by the RAW METAR beneath it, so nothing the decoder skips — RMK, RVR, exact
@@ -469,25 +580,7 @@ def _fmt(rows: list[dict], order: str = "oldest first") -> str:
         "decoded cols: UTC time (ISO) | type | wind | vis | ceiling | present-wx | T/Td(C)",
     ]
     for r in rows:
-        wind = "—"
-        if r["wind_speed"] is not None:
-            d = (
-                f"{r['wind_dir_deg']:03d}"
-                if r["wind_dir_deg"] is not None
-                else (r["wind_dir_card"] or "VRB")
-            )
-            g = f"G{r['wind_gust']}" if r["wind_gust"] else ""
-            wind = f"{d}/{r['wind_speed']}{g}"
-        vis = "—" if r["vis_sm"] is None else f"{(r['vis_flag'] or '')}{r['vis_sm']:g}SM"
-        ceil = "unlim" if r["ceiling_ft"] is None else f"{r['ceiling_ft']}ft"
-        wx = " ".join(r["weather"]) or "-"
-        t = "—" if r["temp_c"] is None else f"{r['temp_c']}"
-        dp = "—" if r["dewpoint_c"] is None else f"{r['dewpoint_c']}"
-        td = f"{t}/{dp}"
-        kind = r["report_type"] or "—"
-        out.append(
-            f"  {r['obs_time']:%Y-%m-%dT%H:%MZ} {kind:<5} {wind:<11} {vis:<7} {ceil:<7} {wx:<14} {td}"
-        )
+        out.append(f"  {_decoded_line(r)}")
         out.append(f"    {r['raw']}")
     return "\n".join(out)
 
@@ -779,6 +872,8 @@ def _imagery_satellite(region: str | None, product: str | None,
     guess which sector sees the field; else default conus_east. Product defaults to
     geocolor (day/night blended -- no night-visible failure)."""
     picked_for = ""
+    center: tuple[float, float] | None = None
+    icao = ""
     if not region and station:
         icao = str(station).upper()
         try:
@@ -790,24 +885,36 @@ def _imagery_satellite(region: str | None, product: str | None,
         region = imagery.satellite_region_for_latlon(lat, lon)
         if region is None:
             return ToolResult(
-                f"no GOES satellite coverage for {icao} (outside the GOES East/West view). "
-                "OCONUS satellite (Meteosat/Himawari) is not yet available -- use radar or "
-                "another data tool for this location.")
-        picked_for = f" (nearest sector for {icao})"
+                f"no geostationary satellite coverage for {icao} (outside the GOES/Himawari/"
+                "Meteosat footprints -- e.g. mid-ocean or polar). use radar or another data "
+                "tool for this location.")
+        center = (lat, lon)
+        picked_for = f" (covering sector for {icao})"
     region = region or "conus_east"
     if region not in imagery.SAT_REGIONS:
         return ToolResult(f"error: {region!r} is not a satellite region; choose from: "
                           + ", ".join(imagery.SAT_REGIONS))
     product = product if product in imagery.SAT_PRODUCTS else "geocolor"
+    # OSPO Japan has no geocolor; its day/night default is enhanced IR, so relabel honestly.
+    if imagery.SAT_REGIONS[region].provider == "himawari_ospo" and product == "geocolor":
+        product = "infrared"
+    # Meteosat takes an arbitrary bbox, so for a specific station we center a TIGHT local view
+    # on it instead of the wide fixed region (the station-crop upgrade). Others use the sector.
+    meteosat_point = center is not None and \
+        imagery.SAT_REGIONS[region].provider == "meteosat_eumetsat_wms"
     try:
-        url = imagery.satellite_url(region, product)
-        img = imagery.fetch_satellite(region, product)
+        if meteosat_point:
+            img, url = imagery.fetch_meteosat_point(center[0], center[1], product)
+            label = f"Meteosat -- centered on {icao}"
+        else:
+            img, url = imagery.fetch_satellite(region, product)
+            label = f"{imagery.SAT_REGIONS[region].label}{picked_for}"
     except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
-        return ToolResult(f"error: could not fetch {product} satellite for {region} "
+        return ToolResult(f"error: could not fetch {product} satellite "
                           f"({type(e).__name__}: {e})")
-    receipt = (f"GOES {product} satellite -- {imagery.SAT_REGIONS[region].label}{picked_for} "
-               f"(source: NESDIS/STAR, {url}); research/informational imagery, not an "
-               "operational source. image follows.")
+    receipt = (f"{product} satellite -- {label} "
+               f"(source: {imagery.satellite_source(region)}, {url}); research/informational "
+               "imagery, not an operational source. image follows.")
     return ToolResult(receipt, images=[img])
 
 
@@ -898,6 +1005,43 @@ def _radar_for_station(icao: str, product: str | None) -> ToolResult:
     reason = (f"nearest WSR-88D to {icao} is {near[1]:.0f} km away (beyond the {guard:.0f} km "
               f"local-radar guard)" if near else f"no radar site found near {icao}")
     return _radar_degrade(icao, lat, lon, reason)
+
+
+def _get_loop(args: dict) -> ToolResult:
+    """Fetch a short satellite loop for a station and compose it into a filmstrip (image,
+    universal) + a short mp4 (video-capable models). Network, no DB. A missing station,
+    no-coverage point, or too-few frames comes back as feedback, not a crash."""
+    station = args.get("station")
+    if not station:
+        return ToolResult('error: get_loop needs a "station" ICAO, e.g. "station": "KWRI".')
+    icao = str(station).upper()
+    product = str(args["product"]).lower() if args.get("product") else "geocolor"
+    if product not in imagery.SAT_PRODUCTS:
+        product = "geocolor"
+    frames = _int_arg(args.get("frames"), imagery.LOOP_DEFAULT_FRAMES,
+                      lo=2, hi=imagery.LOOP_MAX_FRAMES)
+    step = _int_arg(args.get("step_min"), imagery.LOOP_DEFAULT_STEP_MIN, lo=10, hi=120)
+    try:
+        lat, lon = awc.station_latlon(icao)       # live AWC lookup (network, no DB)
+    except Exception as e:  # noqa: BLE001 -- unknown id becomes feedback, not a crash
+        return ToolResult(f"error: could not resolve a location for {icao} "
+                          f"({type(e).__name__}: {e}).")
+    try:
+        fr, source, coverage = imagery.satellite_loop(lat, lon, product,
+                                                      frames=frames, step_min=step)
+    except Exception as e:  # noqa: BLE001 -- no coverage / fetch failure -> feedback
+        return ToolResult(f"error: could not build a satellite loop for {icao} "
+                          f"({type(e).__name__}: {e}).")
+    if len(fr) < 2:
+        return ToolResult(f"error: only {len(fr)} loop frame(s) available for {icao}; "
+                          "cannot show motion.")
+    span = f"{fr[0][0]} -> {fr[-1][0]}"
+    strip = charts.filmstrip(fr, title=f"{icao} {coverage} loop  {span}")
+    mp4 = charts.loop_mp4(fr)
+    receipt = (f"satellite LOOP -- {coverage} for {icao}: {len(fr)} frames, {span} "
+               f"(source: {source}); labeled filmstrip image (oldest->newest) and a short "
+               "video follow. research/informational imagery, not an operational source.")
+    return ToolResult(receipt, images=[strip], videos=[mp4])
 
 
 def _get_imagery(args: dict) -> ToolResult:
@@ -1146,6 +1290,84 @@ def _get_climo(con, args: dict) -> ToolResult:
     return ToolResult(_fmt_climo(meta, monthly, hourly))
 
 
+def _get_nearby_obs(con, station: str, args: dict) -> ToolResult:
+    """Latest ob from each of the nearest neighbor airfields (DB read, leakage-safe -- the
+    per-run DB is already cut off at the issue time). Each row is annotated with distance,
+    bearing FROM the home station, and elevation delta so the model can reason spatially."""
+    n = _int_arg(args.get("n"), 5, lo=1, hi=5)
+    rows = neighbors.neighbors_of(station)[:n]
+    if not rows:
+        return ToolResult(
+            f"(no neighbor stations on file for {station}; the nearest-neighbor roster covers "
+            "the benchmark's forecast stations)"
+        )
+    out = [
+        f"Nearest {len(rows)} airfields to {station}, latest observation each. "
+        "Distance/bearing are FROM your station; elev is the neighbor minus your field.",
+        "decoded cols: UTC time (ISO) | type | wind | vis | ceiling | present-wx | T/Td(C)",
+    ]
+    for icao, dist, brg, de in rows:
+        head = f"{icao}  {dist:.0f} km {brg}  {de:+d} m"
+        latest = store.latest(con, icao, 1)
+        if not latest:
+            out.append(f"{head}  | (no observation in store within the window)")
+            continue
+        r = latest[0]
+        out.append(f"{head}  | {_decoded_line(r)}")
+        out.append(f"    {r['raw']}")
+    return ToolResult("\n".join(out))
+
+
+def _dirs(ds: list[str], cap: int = 6) -> str:
+    """Compass-direction list for the terrain rose: strongest first (already sorted), capped
+    for scannability with a trailing '+N more' when the terrain rises/falls many ways."""
+    if not ds:
+        return "none"
+    shown = " ".join(ds[:cap])
+    return shown if len(ds) <= cap else f"{shown} (+{len(ds) - cap} more)"
+
+
+def _fmt_terrain(icao: str, p) -> str:
+    """Text 'terrain rose' for a TerrainProfile -- the scannable companion to the hillshade."""
+    reach = max(p.ranges_km)
+    lines = [
+        f"{icao} terrain (static geography; not a forecast):",
+        f"  elevation {p.center_elev_m:.0f} m | relief {p.relief_m:.0f} m within "
+        f"{reach:.0f} km | landform: {p.landform}",
+        f"  upslope (terrain rises toward): {_dirs(p.upslope)}",
+        f"  downslope (terrain falls toward): {_dirs(p.downslope)}",
+    ]
+    if p.max_rise:
+        b, d, r = p.max_rise
+        lines.append(f"  steepest rise: +{d:.0f} m to the {b} within {r:.0f} km")
+    if p.coast:
+        lines.append(f"  nearest coast: {p.coast[0]:.0f} km to the {p.coast[1]}")
+    else:
+        lines.append("  nearest coast: none within 150 km (inland; inland lakes not detected)")
+    lines.append("  topographic relief map (north up; station marked; 25/50 mi range rings) "
+                 "follows.")
+    return "\n".join(lines)
+
+
+def _get_terrain(args: dict) -> ToolResult:
+    """Static terrain + coastline around a station: text rose + hillshade image (network
+    fetch for elevation, no DB). An unknown ICAO or a fetch failure is feedback, not a crash."""
+    icao = str(args.get("station") or "").upper()
+    if not icao:
+        return ToolResult('error: get_terrain needs a "station" ICAO id, e.g. "station": "KVBG"')
+    try:
+        lat, lon = awc.station_latlon(icao)
+    except Exception as e:  # noqa: BLE001 -- unknown id becomes feedback, not a crash
+        return ToolResult(f"error: could not resolve a location for {icao} "
+                          f"({type(e).__name__}: {e})")
+    try:
+        p = terrain.sample(lat, lon)
+        png = terrain.relief_map(lat, lon)
+    except Exception as e:  # noqa: BLE001 -- a fetch/render failure becomes feedback
+        return ToolResult(f"error: could not build terrain for {icao} ({type(e).__name__}: {e})")
+    return ToolResult(_fmt_terrain(icao, p), images=[png])
+
+
 def _stamp_fetched(result: ToolResult) -> ToolResult:
     """Append the UTC fetch time to a network receipt, unless the fetch errored. The
     cycle/valid time of model-run products is already on the receipt; this pins the
@@ -1185,6 +1407,10 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
         return _stamp_fetched(_get_point_forecast(args))
     if name == "get_imagery":
         return _stamp_fetched(_get_imagery(args))
+    if name == "get_loop":
+        return _stamp_fetched(_get_loop(args))
+    if name == "get_terrain":
+        return _stamp_fetched(_get_terrain(args))
     con = (
         store.connect(db_path, read_only=True)
         if db_path
@@ -1229,6 +1455,8 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
                 f"Meteogram for {station}, last {hours}h ({len(rows)} obs); image follows."
             )
             return ToolResult(receipt, images=[png], window=(start, end))
+        if name == "get_nearby_obs":
+            return _get_nearby_obs(con, station, args)
         if name == "get_climo":
             return _get_climo(con, args)
         return ToolResult(f"error: unknown tool {name!r}")
