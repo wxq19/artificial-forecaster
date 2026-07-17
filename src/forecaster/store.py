@@ -832,6 +832,28 @@ def human_taf_for_window(con: duckdb.DuckDBPyConnection, station: str,
     return dict(zip(cols, row)) if row else None
 
 
+def archived_human_tafs(con: duckdb.DuckDBPyConnection, *, before: datetime,
+                        station: str | None = None,
+                        routine_only: bool = True) -> list[dict]:
+    """Archived human/official TAFs whose validity has FULLY elapsed (valid_to_utc < before,
+    naive UTC) -- the population for standalone TAFVER difficulty scoring (score_taf.py
+    --archive-difficulty), which scores a human TAF against obs with NO model run involved.
+    routine_only keeps the scheduled-cycle bulletins (one difficulty score per station per
+    cycle), dropping amendments. Returns tafs row dicts, oldest window first."""
+    sql = ("SELECT * FROM tafs WHERE producer_kind IN ('human', 'official') "
+           "AND valid_to_utc < ?")
+    params: list = [_to_naive_utc(before)]
+    if routine_only:
+        sql += " AND bulletin_type = 'routine'"
+    if station is not None:
+        sql += " AND station = ?"
+        params.append(station)
+    sql += " ORDER BY valid_from_utc"
+    cur = con.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
 def insert_evaluation(con: duckdb.DuckDBPyConnection, ev: dict) -> None:
     """Upsert one evaluation-spine row (idempotent replace by evaluation_id). `ev`
     keys are the evaluations columns; missing keys default to NULL."""
@@ -1194,6 +1216,24 @@ def init_results_schema(con: duckdb.DuckDBPyConnection) -> None:
     effect only, like init_scoring_schema."""
     for ddl in _RESULTS_DDL:
         con.execute(ddl)
+
+
+def archive_evaluation_id(taf_id: str) -> str:
+    """Synthetic evaluation_id for standalone archive-difficulty scoring: a human TAF scored
+    with NO model run has no evaluations-spine row, so its result rows key off this instead.
+    Stable per taf_id (reruns stay idempotent via scorer_run_id) and the 'archdiff:' prefix
+    keeps these rows separable from real model-run evaluations in the shared result tables."""
+    return f"archdiff:{taf_id}"
+
+
+def archive_difficulty_scored(con: duckdb.DuckDBPyConnection, taf_id: str) -> bool:
+    """True if a TAFVER difficulty result already exists for this archived TAF -- lets the
+    driver skip re-fetching obs/IEM (the persist itself is idempotent regardless). Assumes
+    init_results_schema has run."""
+    row = con.execute(
+        "SELECT 1 FROM tafver_runs WHERE evaluation_id = ? AND taf_id = ? LIMIT 1",
+        [archive_evaluation_id(taf_id), taf_id]).fetchone()
+    return row is not None
 
 
 def scorer_run_id(evaluation_id: str, taf_id: str | None, subject: str, scorer: str,

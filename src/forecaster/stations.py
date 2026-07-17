@@ -35,6 +35,21 @@ class Station:
     bufkit_proxy: str | None = None     # civil ICAO for model tools if the base has no BUFKIT
 
 
+@dataclass(frozen=True)
+class ArchiveStation:
+    """A human-TAF ARCHIVE-ONLY site: the poller archives its official TAF and the scorer
+    TAFVERs it against obs, but it is NEVER run through the model matrix. Deliberately a
+    SEPARATE type from Station -- the scheduler iterates STATIONS, so an archive site is
+    structurally incapable of entering a billed model run. Archive sites need no cycle /
+    BUFKIT / proxy (they issue no model forecast); `regime` tags the dominant forecast-
+    difficulty class for per-regime/per-hour TAFVER difficulty mining."""
+
+    icao: str
+    name: str
+    branch: str                         # "AF" | "Army"
+    regime: str                         # convective|fog|winter|terrain|tropical|monsoon
+
+
 # 10 military-format, 30h, 8-hourly airfields: CONUS + Alaska + Western Pacific.
 STATIONS: tuple[Station, ...] = (
     Station("KWRI", "McGuire AFB NJ", "conus_ne", "hrrr", (2, 10, 18)),
@@ -63,3 +78,81 @@ def model_station(icao: str) -> str:
     else the station itself. Raises KeyError for an off-roster ICAO."""
     s = BY_ICAO[icao]
     return s.bufkit_proxy or s.icao
+
+
+# Human-TAF archive-only sites (53): confirmed military-format on the AWC feed 2026-07-17
+# (marker QNH____INS + ~30h validity). The poller archives + the scorer TAFVERs these to map
+# forecast difficulty by site and hour; they never enter the billed model matrix. `regime`
+# is the dominant difficulty class. NOT gated on BUFKIT (no model run), so much wider than
+# STATIONS. Excluded as civil-format (no QNH INS): KABQ, LIPA, ETHA. Issued no TAF in the
+# 17Z probe -- re-add + let the poller confirm: KVAD, PAEI, RJSM, PHIK, KGFA, KFSI, KFLV,
+# KDAA, KWSD.
+ARCHIVE_STATIONS: tuple[ArchiveStation, ...] = (
+    # --- Air Force (38) ---
+    ArchiveStation("KWRB", "Robins AFB GA", "AF", "convective"),
+    ArchiveStation("KCBM", "Columbus AFB MS", "AF", "convective"),
+    ArchiveStation("KBIX", "Keesler AFB MS", "AF", "convective"),
+    ArchiveStation("KVPS", "Eglin AFB FL", "AF", "convective"),
+    ArchiveStation("KHRT", "Hurlburt Field FL", "AF", "convective"),
+    ArchiveStation("KPAM", "Tyndall AFB FL", "AF", "convective"),
+    ArchiveStation("KMCF", "MacDill AFB FL", "AF", "convective"),
+    ArchiveStation("KBAD", "Barksdale AFB LA", "AF", "convective"),
+    ArchiveStation("KTIK", "Tinker AFB OK", "AF", "convective"),
+    ArchiveStation("KLTS", "Altus AFB OK", "AF", "convective"),
+    ArchiveStation("KDYS", "Dyess AFB TX", "AF", "convective"),
+    ArchiveStation("KCVS", "Cannon AFB NM", "AF", "convective"),
+    ArchiveStation("KSZL", "Whiteman AFB MO", "AF", "convective"),
+    ArchiveStation("KOFF", "Offutt AFB NE", "AF", "convective"),
+    ArchiveStation("KSKF", "Kelly Field/Lackland TX", "AF", "convective"),
+    ArchiveStation("KRND", "Randolph AFB TX", "AF", "convective"),
+    ArchiveStation("KDLF", "Laughlin AFB TX", "AF", "convective"),
+    ArchiveStation("KLSV", "Nellis AFB NV", "AF", "monsoon"),
+    ArchiveStation("KLUF", "Luke AFB AZ", "AF", "monsoon"),
+    ArchiveStation("KHMN", "Holloman AFB NM", "AF", "monsoon"),
+    ArchiveStation("KBAB", "Beale AFB CA", "AF", "fog"),
+    ArchiveStation("KSUU", "Travis AFB CA", "AF", "fog"),
+    ArchiveStation("KLFI", "Langley AFB VA", "AF", "fog"),
+    ArchiveStation("KDOV", "Dover AFB DE", "AF", "fog"),
+    ArchiveStation("KADW", "JB Andrews MD", "AF", "fog"),
+    ArchiveStation("EGUN", "RAF Mildenhall UK", "AF", "fog"),
+    ArchiveStation("EGUL", "RAF Lakenheath UK", "AF", "fog"),
+    ArchiveStation("ETAR", "Ramstein AB Germany", "AF", "fog"),
+    ArchiveStation("ETAD", "Spangdahlem AB Germany", "AF", "fog"),
+    ArchiveStation("KHIF", "Hill AFB UT", "AF", "winter"),
+    ArchiveStation("KFFO", "Wright-Patterson AFB OH", "AF", "winter"),
+    ArchiveStation("KBLV", "Scott AFB IL", "AF", "winter"),
+    ArchiveStation("KMUO", "Mountain Home AFB ID", "AF", "terrain"),
+    ArchiveStation("KEDW", "Edwards AFB CA", "AF", "terrain"),
+    ArchiveStation("PGUA", "Andersen AFB Guam", "AF", "tropical"),
+    ArchiveStation("RODN", "Kadena AB Japan", "AF", "tropical"),
+    ArchiveStation("RKSO", "Osan AB Korea", "AF", "monsoon"),
+    ArchiveStation("RKJK", "Kunsan AB Korea", "AF", "monsoon"),
+    # --- Army (15) ---
+    ArchiveStation("KLSF", "Lawson AAF, Fort Moore GA", "Army", "convective"),
+    ArchiveStation("KFBG", "Simmons AAF, Fort Liberty NC", "Army", "convective"),
+    ArchiveStation("KOZR", "Cairns AAF, Fort Novosel AL", "Army", "convective"),
+    ArchiveStation("KHOP", "Campbell AAF, Fort Campbell KY", "Army", "convective"),
+    ArchiveStation("KGRK", "Robert Gray AAF, Fort Cavazos TX", "Army", "convective"),
+    ArchiveStation("KFRI", "Marshall AAF, Fort Riley KS", "Army", "convective"),
+    ArchiveStation("KFHU", "Libby AAF, Fort Huachuca AZ", "Army", "monsoon"),
+    ArchiveStation("KGRF", "Gray AAF, JB Lewis-McChord WA", "Army", "fog"),
+    ArchiveStation("KFAF", "Felker AAF, Fort Eustis VA", "Army", "fog"),
+    ArchiveStation("KMUI", "Muir AAF, Fort Indiantown Gap PA", "Army", "winter"),
+    ArchiveStation("KFCS", "Butts AAF, Fort Carson CO", "Army", "terrain"),
+    ArchiveStation("ETIC", "Grafenwoehr AAF Germany", "Army", "terrain"),
+    ArchiveStation("ETOU", "Wiesbaden AAF Germany", "Army", "fog"),
+    ArchiveStation("PHHI", "Wheeler AAF Hawaii", "Army", "tropical"),
+    ArchiveStation("RKSG", "Desiderio AAF, Camp Humphreys Korea", "Army", "monsoon"),
+)
+
+ARCHIVE_BY_ICAO: dict[str, ArchiveStation] = {a.icao: a for a in ARCHIVE_STATIONS}
+
+
+def poll_icaos() -> list[str]:
+    """Every ICAO the human-TAF poller archives: the model roster PLUS the archive-only net.
+    The scheduler still uses icaos()/STATIONS, so archive-only sites are never billed. Roster
+    first, then archive-only; de-duped in case a site is ever on both lists."""
+    seen: dict[str, None] = {}
+    for i in icaos() + [a.icao for a in ARCHIVE_STATIONS]:
+        seen.setdefault(i, None)
+    return list(seen)

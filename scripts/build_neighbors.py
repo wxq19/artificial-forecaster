@@ -1,14 +1,20 @@
 """Regenerate src/forecaster/neighbors.py -- the static nearest-neighbor roster.
 
-For each roster station (stations.STATIONS) this finds the 5 closest OTHER METAR-reporting
-airfields within 150 km and freezes them, mirroring build_radarsites.py. The candidate
-catalog comes from AWC's `stationinfo` bbox product (a STABLE membership list -- every known
-METAR site in the box, not just whoever is reporting right now), so the output is
-deterministic and `--check` can verify reproducibility. Ranking + bearings via geo.py;
-elev_delta (neighbor minus home, meters) comes free from stationinfo `elev`.
+For each roster station (stations.STATIONS) this freezes two things, mirroring
+build_radarsites.py:
+  - NEIGHBORS: the 5 closest OTHER METAR airfields within 150 km -- the FETCHABLE set
+    get_nearby_obs reads obs for (dist_km, bearing, elev_delta, plus lat/lon so the map
+    can place a marker exactly).
+  - AREA_STATIONS: every OTHER box METAR site (nearest first, capped), positions only --
+    map CONTEXT so the model sees the full local network, even though obs are only banked
+    for the fetchable set.
+The candidate catalog comes from AWC's `stationinfo` bbox product (a STABLE membership
+list -- every known METAR site in the box, not just whoever is reporting right now), so the
+output is deterministic and `--check` can verify reproducibility. Ranking + bearings via
+geo.py; elev_delta (neighbor minus home, meters) comes free from stationinfo `elev`.
 
-The tool that reads this (get_nearby_obs) never touches AWC -- neighbor OBS flow only through
-the leakage-safe DB seam (store.copy_obs). This table is pure geography.
+The tools that read this (get_nearby_obs, get_terrain) never touch AWC -- neighbor OBS flow
+only through the leakage-safe DB seam (store.copy_obs), and positions are pure geography.
 
   uv run python scripts/build_neighbors.py            # regenerate the committed table
   uv run python scripts/build_neighbors.py --check     # recompute, diff vs committed, don't write
@@ -19,13 +25,18 @@ from math import cos, radians
 from pathlib import Path
 
 from forecaster import awc
-from forecaster.geo import nearest_n
+from forecaster.geo import haversine_km, nearest_n
 from forecaster.stations import icaos
 
 _OUT = Path(__file__).resolve().parents[1] / "src" / "forecaster" / "neighbors.py"
 _N = 5
 _MAX_KM = 150.0
-_LAT_PAD = 1.5                      # deg; > 150 km / 111 km-per-deg, with margin
+_AREA_MAX = 40                     # cap context sites per station (file size + map clutter)
+_LAT_PAD = 1.5                     # deg; > 150 km / 111 km-per-deg, with margin
+
+# fetchable roster row and context row
+NeighborRow = tuple[str, float, str, int, float, float]
+AreaRow = tuple[str, float, float]
 
 
 def _home_info(icao: str) -> tuple[float, float, int]:
@@ -51,48 +62,81 @@ def _candidates(lat: float, lon: float) -> dict[str, tuple[float, float, int]]:
     return out
 
 
-def build() -> dict[str, list[tuple[str, float, str, int]]]:
-    table: dict[str, list[tuple[str, float, str, int]]] = {}
+def build() -> tuple[dict[str, list[NeighborRow]], dict[str, list[AreaRow]]]:
+    neighbors_t: dict[str, list[NeighborRow]] = {}
+    area_t: dict[str, list[AreaRow]] = {}
     for home in icaos():
         hlat, hlon, helev = _home_info(home)
         cands = _candidates(hlat, hlon)
         cands.pop(home, None)
         catalog = [(icao, la, lo) for icao, (la, lo, _e) in cands.items()]
         ranked = nearest_n(hlat, hlon, catalog, n=_N, max_km=_MAX_KM)
-        table[home] = [
-            (icao, dist, brg, cands[icao][2] - helev) for icao, dist, brg in ranked
+        fetchable = {icao for icao, _d, _b in ranked}
+        neighbors_t[home] = [
+            (icao, dist, brg, cands[icao][2] - helev,
+             round(cands[icao][0], 4), round(cands[icao][1], 4))
+            for icao, dist, brg in ranked
         ]
-        print(f"{home}: {len(table[home])} neighbors "
-              f"({', '.join(f'{i}@{d:.0f}km' for i, d, _b, _e in table[home])})")
-    return table
+        # context = every OTHER box site (not fetchable), nearest first, capped
+        others = sorted(
+            (
+                (round(haversine_km(hlat, hlon, la, lo), 1), icao, round(la, 4), round(lo, 4))
+                for icao, (la, lo, _e) in cands.items() if icao not in fetchable
+            ),
+            key=lambda t: (t[0], t[1]),
+        )
+        area_t[home] = [(icao, la, lo) for _d, icao, la, lo in others[:_AREA_MAX]]
+        print(f"{home}: {len(neighbors_t[home])} fetchable "
+              f"({', '.join(f'{i}@{d:.0f}km' for i, d, _b, _e, _la, _lo in neighbors_t[home])}), "
+              f"{len(area_t[home])} context")
+    return neighbors_t, area_t
 
 
-def render(table: dict[str, list[tuple[str, float, str, int]]]) -> str:
+def render(neighbors_t: dict[str, list[NeighborRow]],
+           area_t: dict[str, list[AreaRow]]) -> str:
     lines = [
         '"""Static nearest-neighbor roster (generated by scripts/build_neighbors.py).',
         "",
-        "For each roster station: the 5 closest OTHER METAR airfields within 150 km, from",
-        "AWC's stationinfo catalog. Pure geography (icao, dist_km, 16-pt bearing FROM the home",
-        "station, elev_delta_m = neighbor minus home). get_nearby_obs uses this to pick which",
-        "stations to read; the OBS themselves come only from the leakage-safe DB seam, never",
-        "a live fetch. Regenerate/verify with build_neighbors.py [--check].",
+        "For each roster station, two frozen sets from AWC's stationinfo catalog:",
+        "  - NEIGHBORS: the 5 closest OTHER METAR airfields within 150 km -- the FETCHABLE set.",
+        "    (icao, dist_km, 16-pt bearing FROM home, elev_delta_m = neighbor minus home, lat, lon).",
+        "    get_nearby_obs reads OBS for these from the leakage-safe DB seam, never a live fetch.",
+        "  - AREA_STATIONS: every OTHER box METAR site (nearest first, capped), positions only --",
+        "    map CONTEXT for get_terrain so the model sees the full local network; NOT fetchable.",
+        "Pure geography. Regenerate/verify with build_neighbors.py [--check].",
         '"""',
         "",
-        "# home_icao -> [(neighbor_icao, dist_km, bearing, elev_delta_m), ...] nearest first",
-        "NEIGHBORS: dict[str, list[tuple[str, float, str, int]]] = {",
+        "# home -> [(neighbor_icao, dist_km, bearing, elev_delta_m, lat, lon), ...] nearest first",
+        "NEIGHBORS: dict[str, list[tuple[str, float, str, int, float, float]]] = {",
     ]
-    for home in table:
+    for home in neighbors_t:
         lines.append(f"    {home!r}: [")
-        for icao, dist, brg, de in table[home]:
-            lines.append(f"        ({icao!r}, {dist}, {brg!r}, {de}),")
+        for icao, dist, brg, de, la, lo in neighbors_t[home]:
+            lines.append(f"        ({icao!r}, {dist}, {brg!r}, {de}, {la}, {lo}),")
+        lines.append("    ],")
+    lines += [
+        "}",
+        "",
+        "# home -> [(icao, lat, lon), ...] -- context box sites for the map (NOT fetchable)",
+        "AREA_STATIONS: dict[str, list[tuple[str, float, float]]] = {",
+    ]
+    for home in area_t:
+        lines.append(f"    {home!r}: [")
+        for icao, la, lo in area_t[home]:
+            lines.append(f"        ({icao!r}, {la}, {lo}),")
         lines.append("    ],")
     lines += [
         "}",
         "",
         "",
-        "def neighbors_of(icao: str) -> list[tuple[str, float, str, int]]:",
-        '    """Nearest-neighbor rows for a station (empty list if none/off-roster)."""',
+        "def neighbors_of(icao: str) -> list[tuple[str, float, str, int, float, float]]:",
+        '    """Fetchable nearest-neighbor rows for a station (empty if none/off-roster)."""',
         "    return NEIGHBORS.get(icao.upper(), [])",
+        "",
+        "",
+        "def area_of(icao: str) -> list[tuple[str, float, float]]:",
+        '    """Context box-station positions for the map (empty if none/off-roster)."""',
+        "    return AREA_STATIONS.get(icao.upper(), [])",
         "",
     ]
     return "\n".join(lines)
@@ -100,8 +144,8 @@ def render(table: dict[str, list[tuple[str, float, str, int]]]) -> str:
 
 def main() -> int:
     check = "--check" in sys.argv[1:]
-    table = build()
-    text = render(table)
+    neighbors_t, area_t = build()
+    text = render(neighbors_t, area_t)
     if check:
         current = _OUT.read_text() if _OUT.exists() else ""
         if current == text:

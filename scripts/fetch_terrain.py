@@ -1,9 +1,11 @@
-"""Prewarm + review the OpenTopoMap relief maps for the roster (or a given station).
+"""Prewarm + review the Esri shaded-relief maps for the roster (or a given station).
 
-Terrain is static and OpenTopoMap is a small volunteer tile server, so we fetch each station's
-tiles ONCE into the permanent cache (data/terrain/otm) and never again. Run this before a
-collection campaign so get_terrain is instant (and polite) at agent runtime. Also writes each
-relief map JPEG to data/charts/temp/ for eyeballing.
+Terrain is static, so we fetch each station's tiles ONCE into the permanent cache
+(data/terrain/esri_relief) and never again. Run this before a collection campaign so
+get_terrain is instant at agent runtime. Renders with the SAME markers + adaptive radius the
+tool uses, so the cache covers exactly the tiles get_terrain will need (sparse stations widen
+the radius) and the review JPEG matches what the model sees. Writes each map to
+data/charts/temp/ for eyeballing.
 
   uv run python scripts/fetch_terrain.py                 # all roster stations
   uv run python scripts/fetch_terrain.py --station KVBG   # one station
@@ -12,7 +14,7 @@ relief map JPEG to data/charts/temp/ for eyeballing.
 import argparse
 from pathlib import Path
 
-from forecaster import awc, stations, terrain
+from forecaster import awc, neighbors, stations, terrain, tools
 
 ap = argparse.ArgumentParser(description=__doc__,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -26,7 +28,10 @@ out.mkdir(parents=True, exist_ok=True)
 for icao in icaos:
     try:
         lat, lon = awc.station_latlon(icao)
-        img = terrain.relief_map(lat, lon, use_cache=True)   # fetch+cache tiles, render JPEG
+        neigh = neighbors.neighbors_of(icao)
+        markers = [(ic, la, lo) for ic, _d, _b, _e, la, lo in neigh]
+        img = terrain.relief_map(lat, lon, markers=markers, context=neighbors.area_of(icao),
+                                 radius_mi=tools._map_radius_mi(neigh), use_cache=True)
         p = out / f"terrain_{icao}.jpg"
         p.write_bytes(img)
         print(f"{icao}: {len(img) // 1024} KB -> {p}")

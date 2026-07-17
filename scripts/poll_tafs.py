@@ -10,7 +10,7 @@ forecast is frozen before its own truth exists.
 The whole pass runs under the single-writer lock so it never collides with the collector
 or the scorer writing the same .duckdb.
 
-  uv run python scripts/poll_tafs.py                 # all roster stations
+  uv run python scripts/poll_tafs.py                 # roster + archive-only sites
   uv run python scripts/poll_tafs.py --stations KWRI KMIB
 """
 
@@ -22,11 +22,12 @@ from forecaster import awc, stations, store
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Archive current official TAFs for the roster.")
-    ap.add_argument("--stations", nargs="*", help="ICAO subset (default: the whole roster)")
+    ap.add_argument("--stations", nargs="*",
+                    help="ICAO subset (default: model roster + archive-only sites)")
     ap.add_argument("--db", default=None, help="benchmark DB path (default: settings.db_path)")
     args = ap.parse_args()
 
-    icaos = [s.upper() for s in args.stations] if args.stations else stations.icaos()
+    icaos = [s.upper() for s in args.stations] if args.stations else stations.poll_icaos()
     now = datetime.now(timezone.utc)
     print(f"[{now:%Y-%m-%dT%H:%MZ}] polling {len(icaos)} station(s) for new TAFs")
 

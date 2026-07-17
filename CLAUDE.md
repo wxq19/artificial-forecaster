@@ -469,6 +469,123 @@ artificial-forecaster/
 
 ## NEXT SESSION -- pick up here (paused 2026-07-16)
 
+### SPATIAL AWARENESS -- built + wired (2026-07-17); PRE-WARM + AVAILABILITY CHECK ahead of v2
+The spatial-awareness pair is built, VLM-verified (Gemma), and wired into the collection agent:
+- `get_terrain` (`terrain.py`) -- static terrain rose + a LABEL-FREE Esri World_Shaded_Relief map
+  (switched off OpenTopoMap: its rasterized town names swamped low-relief fields like KWRI) with the
+  nearby airfields PLOTTED at true lat/lon: blue+labeled = fetchable (obs available), violet = context
+  (orientation only). Map radius ADAPTS to include far-flung neighbors (e.g. PABI's are 60-85 mi out).
+- `get_nearby_obs` (`tools.py`) -- SELECTIVE now: pass `stations=[...]` (chosen off the map) or fall
+  back to nearest-n. Leakage-safe DB read (never live).
+- Roster (`neighbors.py`, regen via `build_neighbors.py`): fetchable-5 now carry lat/lon + an
+  `AREA_STATIONS` context catalog (all box METAR sites, positions only, capped 40) for the map.
+- Collection prompt (`collect.py`) NOW names both tools + a two-step nudge (terrain -> pick upwind
+  neighbors -> regional-vs-local) -- WAS the real gap: tools were in the toolset but unnamed in the
+  prompt, so the model never used them. `awc._get` empty-body fix: a 204/blank response (station not
+  reporting, e.g. KXVW) now returns `[]` not a JSONDecodeError.
+- Verified two-step loop: `scripts/test_terrain_nearby_agent.py` (Gemma read the map, selected a
+  KVGN/KSMX/KTQS/KLPC cross-section, called the marine layer correctly as REGIONAL).
+BEFORE v2 (owner action items, 2026-07-17):
+  1. PRE-WARM the terrain tile cache for the whole roster -- `uv run python scripts/fetch_terrain.py`
+     (now renders with the tool's real markers + adaptive radius, so it caches EXACTLY the tiles
+     get_terrain needs; required for the air-gapped SuperCloud + polite to Esri; drops a review JPEG
+     per station).
+  2. NEIGHBOR-AVAILABILITY CHECK -- audit how many of each station's 5 fetchable neighbors actually
+     report live obs (KXVW/KVBG surfaced that some don't). Tells us where get_nearby_obs will be
+     sparse (inland AK/Japan fields especially); the empty-body fix makes it degrade cleanly, but we
+     want the coverage map before scaling.
+
+### ROUND 2 PREP -- build `scripts/spend_report.py` BEFORE the second experiment round (owner deferred the build 2026-07-17)
+Pure READ-ONLY spend rollup over the `runs` table, which ALREADY persists `prompt_tokens` + `completion_tokens`
++ `model` per run -- apply a per-`(model, provider)` price map (USD/1M input+output) and sum spend by model /
+provider / station / day with a running total; runs RETROACTIVELY over round-1 rows (no schema migration needed to
+report the existing data). Needs the `provider` column that lands with the multi-provider matrix change (provider is
+otherwise only implicit in the base_url); until then key the price map on `model` alone. This is the ACCOUNTING layer.
+The SAFETY complement is separate + simpler: a HARD per-key credit cap at each provider (OpenRouter/DeepInfra support
+per-key hard limits + usage alerts) so a runaway loop or bad model id can't overrun budget -- the round-1 402 halt
+(2026-07-17, Together credits exhausted ~0902Z, 37 runs fatal) was that guardrail firing bluntly.
+WHY NOW: round 2 widens the model+provider spread, so per-cell spend visibility must exist before scaling. Decided
+this session (2026-07-17): Kimi DROPPED from schedule.py MATRIX (worst $/clean-TAF ~16x MiniMax, 42% clean rate;
+revisit with Kimi K3). Cheap serverless VISION+TOOLS candidates surveyed (per-run cost at the measured 140k-in/
+12.5k-out profile): Qwen3-VL-32B @Alibaba ($0.019), Llama-4-Maverick @DigitalOcean ($0.046, the SUPPORTED successor
+to deprecation-flagged Scout), GLM-4.6V @Z.AI ($0.053, chart-optimized), Gemma-4-31B @DeepInfra ($0.023, same weights
+~1/3 the Together price). KEY WORKLOAD FACT: input dominates (140k in vs 12.5k out), so INPUT price sets the ranking
+-- Gemma @Together ($0.067/run) is actually PRICIER than MiniMax M3 @Together ($0.057) despite being "smaller".
+Provider seam options: OpenRouter (one key/one balance, provider-PINNED for reproducibility, ~5% markup) vs direct
+providers (DeepInfra+Alibaba+Z.AI, cheapest but 3 balances to keep funded -- the round-1 outage failure mode). The
+multi-provider matrix change also needs `Cell` to carry an optional `(base_url, key)` override, and `ping_models.py`
+to smoke-test a given base_url+model for the vision AND tool-call path per provider (same weights differ by backend).
+
+### MODEL x PROVIDER x COST REFERENCE (sampled 2026-07-17; RE-VERIFY before committing -- prices move weekly)
+Serverless, OpenAI-compatible, VISION + TOOL-CALLING only (the agent's two hard requirements). Prices USD per 1M
+tokens (input / output). `$/run` = cost at THIS benchmark's measured token profile (140k input + 12.5k output =
+median of 90 clean round-1 runs), UNCACHED list price: `$/run = 0.140*in + 0.0125*out`. Sources: Together account
+catalog + OpenRouter per-provider endpoint API (`/api/v1/models/:slug/endpoints`). Cheapest TOOLS-ENABLED + vision
+route per model (lower is better):
+
+| Model | Cheapest tools+vision route | In | Out | $/run | $/1k runs | Note |
+|---|---|---|---|---|---|---|
+| Qwen3-VL-32B | Alibaba (DashScope) | 0.10 | 0.42 | 0.019 | 19 | MiniMax-tier VLM, cheapest peer, diff lab |
+| Llama-4-Scout | Groq | 0.11 | 0.34 | 0.020 | 20 | DEPRECATION-flagged; Maverick is successor |
+| Qwen3-VL-8B | Alibaba | 0.12 | 0.45 | 0.022 | 22 | small-model floor for a size ladder |
+| Gemma-4-31B | DeepInfra (tools) | 0.13 | 0.38 | 0.023 | 23 | same weights as now, ~1/3 the Together price |
+| Qwen3-VL-30B-A3B | Alibaba | 0.13 | 0.52 | 0.025 | 25 | MoE variant, more active reasoning than 32B |
+| Llama-4-Maverick | DigitalOcean | 0.25 | 0.87 | 0.046 | 46 | SUPPORTED Scout successor; 128-expert MoE |
+| GLM-4.6V | Z.AI (or Novita, tied) | 0.30 | 0.90 | 0.053 | 53 | native tool-call VLM, ChartQAPro-benchmarked |
+| MiniMax M3 | Together / DeepInfra / many | 0.30 | 1.20 | 0.057 | 57 | CURRENT ANCHOR (428B MoE, 67% clean, keep) |
+| Gemma-4-31B | Together (tools endpoint) | 0.39 | 0.97 | 0.067 | 67 | CURRENT route; DeepInfra cheaper for SAME model |
+| Kimi K2.7 | Together | 0.95 | 4.00 | 0.183 | 183 | DROPPED round 2 (worst $/clean, 42% clean) |
+
+PROVIDER ALTERNATIVES (when a model has several routes): MiniMax M3 = 0.30/1.20 on ~every provider (Together,
+DeepInfra, Novita, Minimax-direct, Parasail, AtlasCloud). Gemma-4-31B tools routes, cheapest-first: OpenInference
+0.10/0.35, Venice 0.12/0.36, Chutes 0.12/0.37, DeepInfra 0.13/0.38, SiliconFlow 0.13/0.40, Novita 0.14/0.40, then
+Together 0.39/0.97 (Together ALSO has a 0.28/0.86 Gemma endpoint but it is tools-OFF). Qwen3-VL-30B-A3B: Alibaba
+0.13/0.52, DeepInfra 0.15/0.60, Novita 0.20/0.70. Llama-4-Maverick tools routes: DigitalOcean 0.25/0.87, Parasail
+0.35/1.00, Google/Vertex 0.35/1.15 (Vertex needs GCP service-account auth -> BREAKS the base_url+key seam; avoid).
+Llama-4-Scout tools: Groq 0.11/0.34, Google 0.25/0.70. NOTE both Llama-4 endpoints on DeepInfra are tools-OFF.
+
+TOGETHER serverless (vision+tools) per owner's dashboard 2026-07-17: Inkling (1.00/4.05, 404s -- see ping_models),
+MiniMax M3 (0.30/1.20), Kimi K2.7 (0.95/4.00), Kimi K2.6 (price unconfirmed), Gemma-4-31B (0.39/0.97), Qwen3.5-9B
+(0.17/0.25), Pearl Gemma-4-31B (0.28/0.86). These 7 are the ONLY serverless vision+tools models on the Together
+account -- Qwen3-VL / Llama-4 / GLM-4.6V are NOT available there serverless (dedicated-only or absent), which is
+the reason to add a provider.
+
+CAVEATS baked into these numbers: (a) INPUT dominates this workload (140k in vs 12.5k out) -> input price sets the
+ranking; output rate barely moves the total (this is why Gemma@Together > MiniMax M3 despite Gemma being smaller).
+(b) CACHING narrows the gaps -- each run re-sends its growing context across ~5 steps, so most of the 140k bills at
+the cached-input rate (typically 25-50% of list); absolute costs drop, ordering holds; per-provider cached rates NOT
+yet pulled. (c) TOOL support is PER-ENDPOINT -- some routes are vision-yes/tools-NO (the DeepInfra Llama-4s, the cheap
+Together Gemma tier); only tools-enabled endpoints are tabled above. (d) Same open weights on different backends/
+quantization -> benchmark scores NOT strictly comparable across providers; PIN one provider per model + record it in
+run provenance. Visual version of this table published as an artifact 2026-07-17 (private; re-derive from here if the
+link is lost).
+
+### TAF ARCHIVE EXPANSION -- 53 more AF/Army human-TAF sites for wide TAFVER difficulty-mining (identified 2026-07-17)
+CONCEPT: the human-TAF ARCHIVE net is SEPARATE from the model-run roster. Archiving human TAFs only needs a
+fetchable AWC bulletin (NO BUFKIT gate) and is CHEAP (poll + score vs obs, ZERO LLM cost). So cast a WIDE net,
+compute TAFVER per SITE and per HOUR-OF-DAY (tafamend rule-hours + tafver hourly scores already emit hourly), rank
+difficulty, THEN point the billed model matrix at the hard subset. Archive-only sites NEVER enter the model matrix.
+Confirmed live against AWC 2026-07-17 via the military marker QNH____INS (+ ~30h validity; civil/FAA TAFs lack it).
+53 NEW sites (38 AF, 15 Army) on top of the 10-station roster, grouped by the difficulty regime to mine:
+- CONVECTIVE/severe (TS timing+initiation, the hardest): KWRB KCBM KBIX KVPS KHRT KPAM KMCF KBAD (AF SE/Gulf);
+  KLSF KFBG KOZR KHOP (Army SE/Gulf); KTIK KLTS KDYS KCVS KSZL KOFF KSKF KRND KDLF (AF Plains/S-TX); KFRI KGRK
+  (Army Plains); KLSV KLUF KHMN (AF SW monsoon); KFHU (Army SW monsoon).
+- FOG/marine layer/low cig-vis (category busts): KBAB KSUU (AF CA); EGUN EGUL ETAR (AF Europe); KLFI KDOV KADW
+  (AF coastal); KFAF KGRF (Army).
+- WINTER/northern (frozen precip, rapid transitions): KHIF KFFO KBLV (AF); KMUI (Army); + Offutt/Ft-Riley above.
+- TERRAIN/mountain (upslope): KMUO KEDW (AF); KFCS (Army); ETIC ETOU (Army Europe).
+- TROPICAL/typhoon: PGUA RODN (AF); PHHI (Army). PACIFIC/Asia monsoon: RKSO RKJK (AF); RKSG (Army).
+CIVIL-FORMAT ONLY (co-located civilian bulletin, no QNH INS -- SKIP): KABQ LIPA ETHA.
+NO TAF in the 17Z snapshot -- RE-CHECK (major bases issue TAFs normally; a one-shot probe misses between issuances
+or in reduced-ops; the poller confirms over days like cycle_provisional): KVAD-Moody PAEI-Eielson RJSM-Misawa
+PHIK-Hickam KGFA-Malmstrom KFSI-FtSill KFLV-FtLeavenworth KDAA-FtBelvoir KWSD-WhiteSands.
+IMPLEMENTATION: add an archive-only station list to stations.py (SEPARATE from STATIONS so the scheduler -- which
+iterates STATIONS -- structurally cannot bill them) + `poll_icaos()` = roster + archive; poll_tafs.py iterates
+poll_icaos(); schedule.py UNCHANGED. COMPANION NEEDED for actual difficulty-mining: a scoring pass that scores each
+archived HUMAN TAF standalone vs obs (via `--backfill iem` -- IEM serves military METARs), since archive-only sites
+have NO collect.py evaluation row and today's --pending scorer only scores model-subject evaluations. See the (b)
+poller sketch drafted this session (2026-07-17); NOT yet applied to the files.
+
 ### GO LIVE ON THE PI -- built + deployed + idle; 3 steps to start collecting (2026-07-16)
 The whole M4 automated-collection system is BUILT, COMMITTED + PUSHED, and DEPLOYED to the Pi.
 The Pi is idle and clean (no crons running, not billing). Pure tests green (tafstate 40, runlog 15,

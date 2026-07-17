@@ -1,12 +1,12 @@
-"""End-to-end: the agent reasons over get_terrain (text rose + OpenTopoMap relief map).
+"""End-to-end: the agent reasons over get_terrain (text rose + shaded-relief map).
 
 Drives the get_terrain tool loop: a natural-language question -> the model calls get_terrain
 for a station -> our code classifies the terrain from DEM elevation (Open-Meteo), checks the
-coast (global-land-mask), and stitches an OpenTopoMap relief map (marker + 25/50-mi rings) ->
-the text rose + map image are fed back to the VLM -> the model reads them and reasons about
-terrain-driven weather (upslope fog, downslope drying, cold-air pooling, sea breeze). Exercises
-terrain.py (relief_map + descriptors) and the image-return path. No DB (terrain is static,
-network-only).
+coast (global-land-mask), and stitches an Esri shaded-relief map (station marker, nearby
+airfields, range rings) -> the text rose + map image are fed back to the VLM -> the model
+reads them and reasons about terrain-driven weather (upslope fog, downslope drying, cold-air
+pooling, sea breeze). Exercises terrain.py (relief_map + descriptors) and the image-return
+path. No DB (terrain is static, network-only).
 
 Images the model saw are saved beside the markdown log so the run is reviewable.
 """

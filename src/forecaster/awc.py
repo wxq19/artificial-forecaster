@@ -42,7 +42,11 @@ def _get(product: str, params: dict) -> list[dict]:
     _last_request = time.monotonic()
 
     with urllib.request.urlopen(url, timeout=60) as resp:
-        return json.loads(resp.read().decode())
+        body = resp.read().decode().strip()
+    # AWC returns HTTP 204 / an empty body when a product has no rows for the query (e.g. a
+    # station not currently reporting). That is "no data", not an error -- return an empty list
+    # so callers see zero rows instead of a JSONDecodeError on the empty string.
+    return json.loads(body) if body else []
 
 
 def _ids(stations: str | list[str]) -> str:

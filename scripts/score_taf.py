@@ -26,7 +26,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from forecaster import iem, store, tafamend, tafskill, tafver
+from forecaster import iem, stations, store, tafamend, tafskill, tafver
 from forecaster.config import settings
 from forecaster.tafparse import parse
 from forecaster.tafamend import AmendPolicy, TafAmendScore, score_amend
@@ -455,6 +455,88 @@ def cmd_pending(args) -> int:
     return 1 if failed else 0
 
 
+def _score_archive_one(row: dict, args) -> str:
+    """Difficulty-score one elapsed archived HUMAN TAF standalone (no evaluation spine): score
+    it against obs and persist TAFVER (+ requested scorers) under a synthetic evaluation_id.
+    Returns 'scored' | 'skipped (<why>)'. Runs under one write_lock hold like _score_pending_one
+    -- DuckDB is single-writer, so a difficulty pass briefly queues the poller/collector."""
+    taf_id, station = row["taf_id"], row["station"]
+    vf, vt = row["valid_from_utc"], row["valid_to_utc"]
+    ev_id = store.archive_evaluation_id(taf_id)
+
+    with store.write_lock(args.db):
+        con = store.connect(args.db)
+        try:
+            store.init_results_schema(con)
+            if not args.rescore and store.archive_difficulty_scored(con, taf_id):
+                return "skipped (already scored; --rescore to force)"
+
+            obs = store.scoring_window(con, station, vf, vt)
+            cov = _coverage(obs, vf, vt)
+            if cov["fraction"] < args.min_coverage and args.backfill == "iem":
+                # archive-only sites have NO collect.py dual-write, so truth comes from IEM
+                # (which serves military METARs). Same carry-in/terminator margins as --pending.
+                iem.load(station, vf - timedelta(hours=2), vt + timedelta(hours=1),
+                         db_path=args.db)
+                obs = store.scoring_window(con, station, vf, vt)
+                cov = _coverage(obs, vf, vt)
+            if cov["fraction"] < args.min_coverage and not args.allow_partial:
+                return (f"skipped (coverage {cov['fraction']:.0%} < {args.min_coverage:.0%}; "
+                        "backfill or --allow-partial)")
+
+            out = run(con, taf_id=taf_id, scorers=args.scorers_list,
+                      baselines=args.baselines_list)
+            counts = persist_scores(con, ev_id, out)
+        finally:
+            con.close()
+
+    regime = (stations.ARCHIVE_BY_ICAO[station].regime
+              if station in stations.ARCHIVE_BY_ICAO else "roster")
+    r0 = out["results"][0]
+    head = []
+    if r0["tafver"] is not None:
+        head.append(f"TAFVER={r0['tafver'].combined_percent}")
+    if r0["amend"] is not None:
+        head.append(f"triggers={r0['amend'].trigger_count}")
+    print(f"  {station} {vf:%Y-%m-%dT%H:%MZ} [{regime}] coverage={cov['fraction']:.0%} "
+          f"{' '.join(head)} (new rows {counts})")
+    return "scored"
+
+
+def cmd_archive_difficulty(args) -> int:
+    """Standalone TAFVER difficulty pass over the wide archive net: score every elapsed
+    archived HUMAN routine TAF against obs (no model run), building the per-site/per-hour
+    difficulty map used to pick the hard subset for the model matrix."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    station = args.station.upper() if args.station else None
+    with store.write_lock(args.db):
+        con = store.connect(args.db)
+        try:
+            store.init_scoring_schema(con)
+            store.init_results_schema(con)
+            tafs = store.archived_human_tafs(
+                con, before=now - timedelta(hours=args.grace_hours), station=station)
+        finally:
+            con.close()
+    print(f"[{now:%Y-%m-%dT%H:%MZ}] {len(tafs)} elapsed archived human TAF(s) to difficulty-score"
+          + (f" (station {station})" if station else ""))
+    outcomes: dict[str, int] = {}
+    failed = 0
+    for row in tafs:
+        try:
+            outcome = _score_archive_one(row, args)
+        except Exception as e:  # noqa: BLE001 -- one bad TAF must not kill the pass
+            print(f"  {row['station']} {row.get('taf_id')}: ERROR {type(e).__name__}: {e}")
+            failed += 1
+            continue
+        key = outcome.split(" ")[0]
+        outcomes[key] = outcomes.get(key, 0) + 1
+        if key == "skipped":
+            print(f"  {row['station']} {row['valid_from_utc']:%Y-%m-%dT%H:%MZ}: {outcome}")
+    print(f"done: {outcomes or '{}'}" + (f", {failed} ERROR(s)" if failed else ""))
+    return 1 if failed else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Score a TAF against observed truth.")
     src = ap.add_mutually_exclusive_group(required=True)
@@ -463,6 +545,11 @@ def main() -> int:
     src.add_argument("--taf-file")
     src.add_argument("--pending", action="store_true",
                      help="score all pending evaluations with elapsed windows (persists)")
+    src.add_argument("--archive-difficulty", action="store_true",
+                     help="difficulty-score every elapsed archived human TAF standalone (persists)")
+    ap.add_argument("--station", help="--archive-difficulty: limit to one ICAO")
+    ap.add_argument("--rescore", action="store_true",
+                    help="--archive-difficulty: re-score TAFs that already have a result")
     ap.add_argument("--issue-date", help="issue DATE (YYYY-MM-DD) for --taf-text/--taf-file")
     ap.add_argument("--scorers", default=None,
                     help="default: amend (ad-hoc) / tafver,amend,skill (--pending)")
@@ -479,12 +566,18 @@ def main() -> int:
     ap.add_argument("--db", default=settings.db_path)
     args = ap.parse_args()
 
-    args.scorers_list = (args.scorers or ("tafver,amend,skill" if args.pending
-                                          else "amend")).split(",")
-    args.baselines_list = (args.baselines or ("persistence,human" if args.pending
-                                              else "persistence")).split(",")
+    if args.pending:
+        default_scorers, default_baselines = "tafver,amend,skill", "persistence,human"
+    elif args.archive_difficulty:
+        default_scorers, default_baselines = "tafver,amend", "persistence"
+    else:
+        default_scorers, default_baselines = "amend", "persistence"
+    args.scorers_list = (args.scorers or default_scorers).split(",")
+    args.baselines_list = (args.baselines or default_baselines).split(",")
     if args.pending:
         return cmd_pending(args)
+    if args.archive_difficulty:
+        return cmd_archive_difficulty(args)
 
     raw = None
     if args.taf_text:

@@ -7,9 +7,11 @@ It owns no matplotlib (charts.hillshade draws the relief image from the sampled 
 no SQL/DuckDB.
 
 Three data sources, all PyPI-clean (NO conda / GEOS -- the geospatial C stack stays deferred):
-  - OpenTopoMap tiles -- pre-rendered topographic relief map (shaded relief + elevation color
-    + contours + place names), fetched + stitched into one image. This is the "picture" a
-    forecaster reads; we fetch pixels, we do not draw terrain (charts.py stays matplotlib-only).
+  - Esri World_Shaded_Relief tiles -- pre-rendered LABEL-FREE shaded relief (tan hillshade +
+    blue water, no town/road labels), fetched + stitched into one image. This is the "picture"
+    a forecaster reads; we fetch pixels, we do not draw terrain (charts.py stays matplotlib-only).
+    Chosen over OpenTopoMap because OTM's rasterized place names swamp low-relief stations
+    (e.g. KWRI) -- the shading is what matters for upslope/downslope/valley/coast reasoning.
   - Open-Meteo elevation API -- batched 90 m SRTM/GLO elevation for a radial sampling grid,
     turned into the QUANTITATIVE text "terrain rose" (elevation, relief, upslope/downslope).
   - global-land-mask -- a bundled ~1 km land/OCEAN mask for coastal proximity. LIMITATION:
@@ -54,16 +56,20 @@ _SLOPE_THRESH_M = 50.0
 # Coastline search: denser rings than the elevation profile, out to the sea-breeze range.
 _COAST_RANGES_KM: tuple[float, ...] = tuple(float(k) for k in range(10, 160, 10))
 
-# Relief map (OpenTopoMap tiles). Static + a small volunteer server -> cache permanently and
-# be polite (descriptive UA, throttle). 50-mile radius: a TAF forecaster cares about terrain
-# within ~50 mi; beyond that is context, not a driver. Rings mark 25 and 50 mi.
-_OTM_TILE = "https://a.tile.opentopomap.org/{z}/{x}/{y}.png"
-_OTM_ATTRIB = "(c) OpenTopoMap (CC-BY-SA)"
+# Relief map (Esri World_Shaded_Relief tiles; ArcGIS REST tile order is /{z}/{y}/{x}). Static
+# -> cache permanently and be polite (descriptive UA, throttle). 50-mile default radius: a TAF
+# forecaster cares about terrain within ~50 mi; the caller widens it so far-flung fetchable
+# neighbors still fit. Rings drawn are whichever of _RING_CANDIDATES_MI fall within the radius.
+_TILE_URL = ("https://services.arcgisonline.com/ArcGIS/rest/services/"
+             "World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}")
+_TILE_ATTRIB = "Esri, USGS, NOAA"
+_TILE_CACHE_SUBDIR = "esri_relief"   # data/terrain/<subdir>/z/x/y.png
 _KM_PER_MI = 1.60934
 _MAP_RADIUS_MI = 50.0
-_MAP_RINGS_MI = (25, 50)
+_RING_CANDIDATES_MI = (25, 50, 75, 100, 150)   # rings drawn are those within the map radius
 _MAP_MAX_TILES = 7          # per axis; pick the highest zoom (most detail) that fits this
 _TILE_PX = 256
+_MAP_MAX_PX = 1100          # final JPEG downscaled to this if larger (payload vs legibility)
 
 
 @dataclass
@@ -204,7 +210,7 @@ def sample(lat: float, lon: float, *, use_cache: bool = False) -> TerrainProfile
     )
 
 
-# --- Relief map (OpenTopoMap tiles) -------------------------------------------------------
+# --- Relief map (Esri World_Shaded_Relief tiles) ------------------------------------------
 
 def _tile_km(z: int, lat: float) -> float:
     """Ground width (km) of one Web-Mercator tile at zoom z and latitude lat."""
@@ -231,7 +237,7 @@ def _fetch_tile(z: int, x: int, y: int) -> bytes:
     global _last_request
     if (wait := _MIN_REQUEST_INTERVAL_S - (time.monotonic() - _last_request)) > 0:
         time.sleep(wait)
-    url = _OTM_TILE.format(z=z, x=x, y=y)
+    url = _TILE_URL.format(z=z, x=x, y=y)
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -241,7 +247,7 @@ def _fetch_tile(z: int, x: int, y: int) -> bytes:
 
 
 def _tile_cache(z: int, x: int, y: int) -> Path:
-    return _CACHE_DIR / "otm" / str(z) / str(x) / f"{y}.png"
+    return _CACHE_DIR / _TILE_CACHE_SUBDIR / str(z) / str(x) / f"{y}.png"
 
 
 def _tile_image(z: int, x: int, y: int, use_cache: bool) -> Image.Image:
@@ -257,13 +263,27 @@ def _tile_image(z: int, x: int, y: int, use_cache: bool) -> Image.Image:
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
-def relief_map(lat: float, lon: float, *, use_cache: bool = True) -> bytes:
-    """Stitched OpenTopoMap relief map centered on (lat, lon), cropped to a 100-mile box
-    (50-mi radius), with a station marker and 25/50-mile range rings drawn on. Returns PNG
-    bytes. Tiles are cached permanently under data/terrain/otm (terrain never changes, and the
-    OTM server is a small volunteer project -- fetch once, be polite). Caller cites the
-    attribution in its receipt."""
-    box_km = 2 * _MAP_RADIUS_MI * _KM_PER_MI
+def relief_map(
+    lat: float,
+    lon: float,
+    *,
+    markers: list[tuple[str, float, float]] | None = None,
+    context: list[tuple[str, float, float]] | None = None,
+    radius_mi: float | None = None,
+    use_cache: bool = True,
+) -> bytes:
+    """Stitched Esri World_Shaded_Relief map centered on (lat, lon), with the home station
+    marked and range rings drawn on. Returns JPEG bytes. Optionally plots two tiers of nearby
+    airfields at their true lat/lon: `markers` (fetchable neighbors -- filled blue dot +
+    label) and `context` (other box sites -- small violet dot, orientation only).
+
+    `radius_mi` sets the crop half-width (default 50 mi); the caller widens it so the farthest
+    fetchable neighbor still lands on the map (sparse networks put neighbors 60-85 mi out).
+    Rings are whichever of 25/50/75/100/150 mi fall within the radius. Tiles are cached
+    permanently under data/terrain/<subdir> (terrain never changes -- fetch once, be polite).
+    The Esri attribution is drawn on the image legend."""
+    radius = radius_mi or _MAP_RADIUS_MI
+    box_km = 2 * radius * _KM_PER_MI
     z = _pick_zoom(box_km, lat)
     px_per_km = _TILE_PX / _tile_km(z, lat)
     cx, cy = _deg2tile(lat, lon, z)
@@ -282,27 +302,55 @@ def relief_map(lat: float, lon: float, *, use_cache: bool = True) -> bytes:
     # crop to the exact box centered on the station
     spx, spy = (cx - x0) * _TILE_PX, (cy - y0) * _TILE_PX
     half = box_km * px_per_km / 2
-    crop = canvas.crop((int(spx - half), int(spy - half), int(spx + half), int(spy + half)))
+    ox, oy = int(spx - half), int(spy - half)          # crop origin in canvas pixels
+    crop = canvas.crop((ox, oy, int(spx + half), int(spy + half)))
 
-    # overlays: 25/50-mile range rings + station marker + labels
+    # overlays: range rings + nearby-airfield markers + station marker + labels
     d = ImageDraw.Draw(crop)
     c = crop.size[0] / 2
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+        small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 17)
     except Exception:  # noqa: BLE001 -- default bitmap font if DejaVu is absent
-        font = ImageFont.load_default()
-    for mi in _MAP_RINGS_MI:
+        font = small = ImageFont.load_default()
+    for mi in _RING_CANDIDATES_MI:
+        if mi > radius:
+            continue
         rpx = mi * _KM_PER_MI * px_per_km
         d.ellipse([c - rpx, c - rpx, c + rpx, c + rpx], outline=(20, 20, 20), width=2)
         d.text((c + 3, c - rpx + 2), f"{mi} mi", fill=(20, 20, 20), font=font)
+
+    def _project(mlat: float, mlon: float) -> tuple[float, float]:
+        mx, my = _deg2tile(mlat, mlon, z)
+        return (mx - x0) * _TILE_PX - ox, (my - y0) * _TILE_PX - oy
+
+    # context sites first (small violet dot + white halo, no label) so fetchable markers sit
+    # on top. Violet is essentially absent from the topo raster (roads are orange/yellow,
+    # terrain green/brown, water blue, labels black), and the white halo separates the dot
+    # from whatever it lands on -- so it stays legible even over dense urban tiles.
+    for _icao, mlat, mlon in context or []:
+        px, py = _project(mlat, mlon)
+        if 0 <= px < crop.size[0] and 0 <= py < crop.size[1]:
+            d.ellipse([px - 8, py - 8, px + 8, py + 8], fill=(140, 30, 200),
+                      outline=(255, 255, 255), width=3)
+    # fetchable neighbors: filled blue dot + label (these are what get_nearby_obs can read)
+    for icao, mlat, mlon in markers or []:
+        px, py = _project(mlat, mlon)
+        if 0 <= px < crop.size[0] and 0 <= py < crop.size[1]:
+            d.ellipse([px - 9, py - 9, px + 9, py + 9], fill=(0, 90, 220), outline=(255, 255, 255),
+                      width=3)
+            d.text((px + 11, py - 10), icao, fill=(0, 40, 160), font=small,
+                   stroke_width=3, stroke_fill=(255, 255, 255))
+
     d.line([(c - 12, c), (c + 12, c)], fill=(220, 0, 0), width=4)
     d.line([(c, c - 12), (c, c + 12)], fill=(220, 0, 0), width=4)
-    d.text((6, 6), f"OpenTopoMap relief  {_OTM_ATTRIB}", fill=(0, 0, 0), font=font)
+    d.text((6, 6), f"Shaded relief  (c) {_TILE_ATTRIB}  (blue=obs-available, violet=context)",
+           fill=(0, 0, 0), font=font, stroke_width=2, stroke_fill=(255, 255, 255))
 
     # JPEG, not PNG: a topo raster is ~2 MB as PNG but ~300 KB as JPEG, and the VLM reads it
     # fine (same as the satellite imagery). Downscale very large crops to keep the payload lean.
-    if crop.size[0] > 1100:
-        crop = crop.resize((1100, 1100), Image.LANCZOS)
+    if crop.size[0] > _MAP_MAX_PX:
+        crop = crop.resize((_MAP_MAX_PX, _MAP_MAX_PX), Image.LANCZOS)
     out = io.BytesIO()
     crop.save(out, format="JPEG", quality=85)
     return out.getvalue()

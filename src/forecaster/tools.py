@@ -381,22 +381,30 @@ GET_NEARBY_OBS = {
     "function": {
         "name": "get_nearby_obs",
         "description": (
-            "Return the latest surface observation (METAR) from the nearest airfields "
-            "AROUND this station -- the mesoscale picture for upstream advection, frontal "
-            "position, and whether a restriction (fog, low ceiling, gusts) is regional or "
-            "purely local. Each neighbor is labeled with its distance, compass bearing FROM "
-            "your station, and elevation difference, so you can reason about what is "
-            "upwind/upslope. Neighbors are read from the same observation store as your own "
-            "obs (never live), pre-filtered to before your cutoff. Use it to sanity-check "
-            "your own trend against the surrounding network."
+            "Return the latest surface observation (METAR) from neighbor airfields AROUND "
+            "this station -- the mesoscale picture for upstream advection, frontal position, "
+            "and whether a restriction (fog, low ceiling, gusts) is regional or purely local. "
+            "Each neighbor is labeled with its distance, compass bearing FROM your station, and "
+            "elevation difference, so you can reason about what is upwind/upslope. Best used "
+            "AFTER get_terrain: look at that map, then pass `stations` here to pull obs for the "
+            "specific fields you care about (e.g. the ones upwind or toward a coast); omit it "
+            "to get the nearest few. Neighbors are read from the same observation store as your "
+            "own obs (never live), pre-filtered to before your cutoff."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "station": {"type": "string", "description": "4-letter ICAO, e.g. KWRI"},
+                "stations": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Specific neighbor ICAOs to fetch (from the get_terrain map's "
+                                   "blue dots / fetchable list). Omit to get the nearest n.",
+                },
                 "n": {
                     "type": "integer",
-                    "description": "How many nearest neighbors to return (default 5, max 5)",
+                    "description": "How many nearest neighbors to return when `stations` is "
+                                   "omitted (default 5, max 5)",
                 },
             },
             "required": ["station"],
@@ -413,11 +421,15 @@ GET_TERRAIN = {
             "plus a shaded-relief map image -- station elevation, local relief, the "
             "directions terrain rises (upslope) and falls (downslope), the landform "
             "(valley/basin, ridge/exposed, sloped, flat), and the nearest coast (direction "
-            "and distance). Use it to anticipate terrain-driven weather: upslope fog and "
-            "precipitation, downslope drying/warming, cold-air pooling in valleys, and "
-            "sea-breeze or advection fog near a coast. Geography only -- it never changes "
-            "and is not a forecast; combine it with the obs, trend, and model data. NOTE: "
-            "the coast check sees OCEAN only, so large inland lakes are not flagged."
+            "and distance). The relief map also PLOTS the nearby airfields at their true "
+            "positions: blue dots (with labels) are stations you can pull observations for "
+            "via get_nearby_obs, violet dots are context for orientation. Use this FIRST to "
+            "orient on your surroundings, then decide which neighbor obs to fetch. Anticipate "
+            "terrain-driven weather: upslope fog/precipitation, downslope drying/warming, "
+            "cold-air pooling in valleys, and sea-breeze or advection fog near a coast. "
+            "Geography only -- it never changes and is not a forecast; combine it with the "
+            "obs, trend, and model data. NOTE: the coast check sees OCEAN only, so large "
+            "inland lakes are not flagged."
         ),
         "parameters": {
             "type": "object",
@@ -1291,22 +1303,42 @@ def _get_climo(con, args: dict) -> ToolResult:
 
 
 def _get_nearby_obs(con, station: str, args: dict) -> ToolResult:
-    """Latest ob from each of the nearest neighbor airfields (DB read, leakage-safe -- the
-    per-run DB is already cut off at the issue time). Each row is annotated with distance,
-    bearing FROM the home station, and elevation delta so the model can reason spatially."""
-    n = _int_arg(args.get("n"), 5, lo=1, hi=5)
-    rows = neighbors.neighbors_of(station)[:n]
-    if not rows:
+    """Latest ob from neighbor airfields (DB read, leakage-safe -- the per-run DB is already
+    cut off at the issue time). Each row is annotated with distance, bearing FROM the home
+    station, and elevation delta so the model can reason spatially. By default returns the n
+    nearest; pass `stations` (after reading the get_terrain map) to fetch a chosen subset."""
+    roster = neighbors.neighbors_of(station)
+    if not roster:
         return ToolResult(
             f"(no neighbor stations on file for {station}; the nearest-neighbor roster covers "
             "the benchmark's forecast stations)"
         )
+    by_icao = {row[0]: row for row in roster}
+    requested = args.get("stations")
+    unknown: list[str] = []
+    if requested:
+        if isinstance(requested, str):
+            requested = [requested]
+        rows = []
+        for want in requested:
+            key = str(want).upper()
+            if key in by_icao and key not in {r[0] for r in rows}:
+                rows.append(by_icao[key])
+            elif key not in by_icao:
+                unknown.append(key)
+        header = f"Requested airfields near {station}, latest observation each."
+    else:
+        n = _int_arg(args.get("n"), 5, lo=1, hi=5)
+        rows = roster[:n]
+        header = f"Nearest {len(rows)} airfields to {station}, latest observation each."
     out = [
-        f"Nearest {len(rows)} airfields to {station}, latest observation each. "
-        "Distance/bearing are FROM your station; elev is the neighbor minus your field.",
+        f"{header} Distance/bearing are FROM your station; elev is the neighbor minus your field.",
         "decoded cols: UTC time (ISO) | type | wind | vis | ceiling | present-wx | T/Td(C)",
     ]
-    for icao, dist, brg, de in rows:
+    if unknown:
+        out.append(f"(not in {station}'s fetchable roster, skipped: {', '.join(unknown)}; "
+                   f"fetchable are: {', '.join(by_icao)})")
+    for icao, dist, brg, de, _la, _lo in rows:
         head = f"{icao}  {dist:.0f} km {brg}  {de:+d} m"
         latest = store.latest(con, icao, 1)
         if not latest:
@@ -1327,8 +1359,16 @@ def _dirs(ds: list[str], cap: int = 6) -> str:
     return shown if len(ds) <= cap else f"{shown} (+{len(ds) - cap} more)"
 
 
-def _fmt_terrain(icao: str, p) -> str:
-    """Text 'terrain rose' for a TerrainProfile -- the scannable companion to the hillshade."""
+def _map_radius_mi(neigh: list) -> float:
+    """Map crop radius (mi): 50 by default, widened so the farthest fetchable neighbor still
+    lands on the map (sparse networks -- e.g. PABI -- put neighbors 60-85 mi out)."""
+    farthest_km = max((row[1] for row in neigh), default=0.0)
+    return max(50.0, round(farthest_km / 1.60934 * 1.15) + 0.0)
+
+
+def _fmt_terrain(icao: str, p, neigh: list, n_context: int) -> str:
+    """Text 'terrain rose' + the fetchable-neighbor index -- the scannable companion to the
+    relief map (which plots the same neighbors as blue dots, context sites as violet dots)."""
     reach = max(p.ranges_km)
     lines = [
         f"{icao} terrain (static geography; not a forecast):",
@@ -1344,14 +1384,23 @@ def _fmt_terrain(icao: str, p) -> str:
         lines.append(f"  nearest coast: {p.coast[0]:.0f} km to the {p.coast[1]}")
     else:
         lines.append("  nearest coast: none within 150 km (inland; inland lakes not detected)")
-    lines.append("  topographic relief map (north up; station marked; 25/50 mi range rings) "
+    if neigh:
+        lines.append("  nearby airfields WITH observations (blue dots on map; distance/bearing "
+                     "FROM you, elev delta). Pick from these and call get_nearby_obs:")
+        for ic, dist, brg, de, _la, _lo in neigh:
+            lines.append(f"    {ic}  {dist:.0f} km {brg}  {de:+d} m")
+        if n_context:
+            lines.append(f"  (+{n_context} more airfields drawn in violet for orientation only -- "
+                         "no observations available for those)")
+    lines.append("  shaded-relief map (north up; station marked; range rings labeled in mi) "
                  "follows.")
     return "\n".join(lines)
 
 
 def _get_terrain(args: dict) -> ToolResult:
-    """Static terrain + coastline around a station: text rose + hillshade image (network
-    fetch for elevation, no DB). An unknown ICAO or a fetch failure is feedback, not a crash."""
+    """Static terrain + coastline around a station: text rose + relief map with nearby airfields
+    plotted (network fetch for elevation, no DB). An unknown ICAO or a fetch failure is
+    feedback, not a crash."""
     icao = str(args.get("station") or "").upper()
     if not icao:
         return ToolResult('error: get_terrain needs a "station" ICAO id, e.g. "station": "KVBG"')
@@ -1360,12 +1409,16 @@ def _get_terrain(args: dict) -> ToolResult:
     except Exception as e:  # noqa: BLE001 -- unknown id becomes feedback, not a crash
         return ToolResult(f"error: could not resolve a location for {icao} "
                           f"({type(e).__name__}: {e})")
+    neigh = neighbors.neighbors_of(icao)
+    context = neighbors.area_of(icao)
+    markers = [(ic, la, lo) for ic, _d, _b, _e, la, lo in neigh]
     try:
         p = terrain.sample(lat, lon)
-        png = terrain.relief_map(lat, lon)
+        png = terrain.relief_map(lat, lon, markers=markers, context=context,
+                                 radius_mi=_map_radius_mi(neigh))
     except Exception as e:  # noqa: BLE001 -- a fetch/render failure becomes feedback
         return ToolResult(f"error: could not build terrain for {icao} ({type(e).__name__}: {e})")
-    return ToolResult(_fmt_terrain(icao, p), images=[png])
+    return ToolResult(_fmt_terrain(icao, p, neigh, len(context)), images=[png])
 
 
 def _stamp_fetched(result: ToolResult) -> ToolResult:

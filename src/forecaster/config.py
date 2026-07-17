@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     # the API only when set (best-effort determinism on Together; None = omit the param).
     llm_seed: int | None = 1337
     db_path: str = str(_ROOT / "data" / "forecaster.duckdb")   # the only config the DB seam needs
+    # GRIBStream point-forecast API (gribstream.py seam). Key lives in .env only; the
+    # base_url is the portability seam (per-endpoint, never hardcoded in the client).
+    gribstream_base_url: str = "https://gribstream.com/api/v2"
+    gribstream_api_key: str = ""
     # Climatology period-of-record. end_year is the last COMPLETE year: a historical
     # valid-time run can't absorb post-cutoff obs through the climo product (leakage guard).
     climo_start_year: int = 2006

@@ -45,11 +45,11 @@ class Cell:
     taf_access: bool    # give the model the leakage-safe previous TAF
 
 
-# The benchmark matrix, 6 cells per cycle event (7 once Inkling is added to the control):
-#   3-model CONTROL (worksheet required, temp 0, prior TAF) + MiniMax single-factor
+# The benchmark matrix, 5 cells per cycle event (6 once Inkling is added to the control):
+#   2-model CONTROL (worksheet required, temp 0, prior TAF) + MiniMax single-factor
 #   ablations off that control (temperature, no worksheet, no prior TAF).
 MATRIX: list[Cell] = [
-    Cell("ctl-kimi",    KIMI,    0.0, "required", True),
+    # Cell("ctl-kimi",    KIMI,    0.0, "required", True),    # dropped: worst $/clean TAF (~16x MiniMax), lowest clean rate; revisit with Kimi K3
     Cell("ctl-minimax", MINIMAX, 0.0, "required", True),
     Cell("ctl-gemma",   GEMMA,   0.0, "required", True),
     # Cell("ctl-inkling", INKLING, 0.0, "required", True),   # pending a valid endpoint
@@ -107,25 +107,48 @@ def main() -> int:
     if not stns:
         return 0
 
-    # Build every (station, cell) job for this hour, then run up to max_parallel at once.
-    jobs: list[tuple[str, list[str]]] = []
-    for st in stns:
-        for cell in MATRIX:
-            cmd = [sys.executable, str(_COLLECT), "--station", st.icao, "--model", cell.model,
-                   "--temperature", str(cell.temperature), "--mode", cell.mode,
-                   "--taf-access" if cell.taf_access else "--no-taf-access",
-                   "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
-            if args.db:
-                cmd += ["--db", args.db]
-            jobs.append((f"{st.icao} {cell.label} ({cell.model.split('/')[-1]})", cmd))
+    def _ingest_cmd(st: stations.Station) -> list[str]:
+        cmd = [sys.executable, str(_COLLECT), "--station", st.icao, "--ingest-only",
+               "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
+        return cmd + (["--db", args.db] if args.db else [])
+
+    def _cell_cmd(st: stations.Station, cell: Cell) -> list[str]:
+        cmd = [sys.executable, str(_COLLECT), "--station", st.icao, "--model", cell.model,
+               "--temperature", str(cell.temperature), "--mode", cell.mode,
+               "--taf-access" if cell.taf_access else "--no-taf-access",
+               "--no-ingest",  # obs are pre-banked once per station by the ingest pass below
+               "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
+        return cmd + (["--db", args.db] if args.db else [])
 
     if args.dry_run:
-        for label, _ in jobs:
-            print(f"  DRY-RUN would fire: {label}")
+        for st in stns:
+            print(f"  DRY-RUN would ingest: {st.icao} (once)")
+            for cell in MATRIX:
+                print(f"  DRY-RUN would fire:   {st.icao} {cell.label} ({cell.model.split('/')[-1]})")
         return 0
 
+    # Phase 1 -- ingest each due station's obs ONCE (home + proxy + neighbors) into the
+    # benchmark DB. Sequential: the fetch is quick, it de-dups the AWC calls the cells used
+    # to each repeat, gives every cell of a station the SAME frozen obs snapshot, and keeps
+    # obs fetching off the concurrent cell burst. A station whose ingest fails is skipped --
+    # its cells would have no obs (collect.py --ingest-only already retries the transient AWC
+    # hiccup, so a hard failure here is real).
+    ready: list[stations.Station] = []
+    for st in stns:
+        label, rc, output = _run_one(f"{st.icao} ingest", _ingest_cmd(st))
+        if rc == 0:
+            ready.append(st)
+            print(f"----- {label}: OK -----")
+        else:
+            status = f"FAILED rc={rc}" if rc is not None else "TIMEOUT"
+            tail = "\n".join(output.strip().splitlines()[-6:]) if output.strip() else "(no output)"
+            print(f"----- {label}: {status} -- SKIPPING {st.icao} cells -----\n{tail}\n")
+
+    # Phase 2 -- run the matrix cells (--no-ingest) for the successfully-ingested stations.
+    jobs = [(f"{st.icao} {cell.label} ({cell.model.split('/')[-1]})", _cell_cmd(st, cell))
+            for st in ready for cell in MATRIX]
     parallel = max(1, args.max_parallel)
-    print(f"dispatching {len(jobs)} run(s), up to {parallel} in parallel\n")
+    print(f"\ndispatching {len(jobs)} run(s), up to {parallel} in parallel\n")
     ok = fail = 0
     with ThreadPoolExecutor(max_workers=parallel) as ex:
         futures = [ex.submit(_run_one, label, cmd) for label, cmd in jobs]

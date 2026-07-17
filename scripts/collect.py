@@ -26,6 +26,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -71,10 +72,16 @@ def _system_prompt(max_steps: int, mode: str, taf_access: bool) -> str:
         "You are a USAF weather forecaster issuing terminal aerodrome forecasts under AFMAN "
         "15-124. Tools: query_obs/get_latest_obs (stored METARs), get_trend (meteogram), "
         "get_sounding/get_fcst_sounding (skew-Ts), get_map (synoptic charts), get_point_forecast "
-        "(hourly model point forecast), get_climo (typical conditions), get_imagery (sat/radar),"
+        "(hourly model point forecast), get_climo (typical conditions), get_imagery (sat/radar), "
+        "get_terrain (local terrain + coastline with the nearby airfields plotted on a relief "
+        "map), get_nearby_obs (latest observations from those neighbors),"
         + prev + " check_taf (AFMAN dry-run), and emit_taf (submit the forecast). Each data-tool "
         "receipt begins with an [evidence_id: ev_NNN] you can cite. " + gate + " Think step by step, "
-        "gather what you need, and base the forecast only on tool data. "
+        "gather what you need, and base the forecast only on tool data. Place the field in its "
+        "mesoscale setting: use get_terrain to see the surrounding terrain and airfields, then "
+        "get_nearby_obs for the upwind/relevant neighbors to judge whether a restriction is "
+        "regional or local, what may advect in, and any terrain-driven effect (upslope/downslope, "
+        "sea breeze, valley cold-air pooling). "
         f"You have up to {max_steps} tool-calling turns -- take the time to reason thoroughly."
     )
     if mode != "off":
@@ -93,6 +100,35 @@ def _task_prompt(st: stations.Station, valid_from: datetime) -> str:
     )
 
 
+def _load_metar_retry(icao: str, hours: float, bench_db, tries: int = 3):
+    """awc.load_metar with a short retry: AWC intermittently returns an empty body that
+    trips json.loads (the rc=1 crash). The transient clears in a second or two, so a brief
+    backoff turns a per-cell crash into a reliable single fetch. Raises if all tries fail."""
+    for i in range(tries):
+        try:
+            return awc.load_metar(icao, hours=hours, db_path=bench_db)
+        except Exception:  # noqa: BLE001 -- retry the transient; re-raise on the last attempt
+            if i == tries - 1:
+                raise
+            time.sleep(1.5 * (i + 1))
+
+
+def _ingest_obs(icao: str, model_icao: str, neighbor_icaos: list[str],
+                hours: float, bench_db) -> dict:
+    """Fetch+bank obs for the home station (+ proxy + neighbors) into the benchmark DB, ONCE.
+    insert_obs is idempotent, so the model cells later COPY these banked obs (store.copy_obs)
+    rather than each re-hitting AWC. Returns the obs-feed summary for the run record."""
+    load = _load_metar_retry(icao, hours, bench_db)
+    if model_icao != icao:                  # also bank the proxy's obs for the model tools
+        load = {"base": load, "proxy": _load_metar_retry(model_icao, hours, bench_db)}
+    for nb in neighbor_icaos:
+        try:
+            _load_metar_retry(nb, hours, bench_db)
+        except Exception as e:  # noqa: BLE001 -- a dud neighbor is skipped, not fatal
+            print(f"  neighbor {nb} ingest skipped ({type(e).__name__}: {e})")
+    return load
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Collect one agent TAF run, paired with the human TAF.")
     ap.add_argument("--station", required=True, help="roster ICAO (see forecaster.stations)")
@@ -106,6 +142,13 @@ def main() -> int:
                     help="pre-cutoff obs back-window (24 matches get_trend's default look-back)")
     ap.add_argument("--neighbors", action=argparse.BooleanOptionalAction, default=True,
                     help="also ingest nearby-station obs for get_nearby_obs (spatial awareness)")
+    ap.add_argument("--ingest-only", action="store_true",
+                    help="fetch+bank obs (home+proxy+neighbors) into the benchmark DB and exit -- "
+                         "the scheduler runs this ONCE per station so the matrix cells share one "
+                         "AWC fetch instead of each repeating it")
+    ap.add_argument("--ingest", action=argparse.BooleanOptionalAction, default=True,
+                    help="--no-ingest skips the AWC obs fetch and reads obs already banked by a "
+                         "prior --ingest-only pass (the scheduler uses this for the matrix cells)")
     ap.add_argument("--max-steps", type=int, default=24, help="tool-calling turns (ample by default)")
     ap.add_argument("--max-tokens", type=int, default=16000, help="per-turn completion budget")
     ap.add_argument("--db", default=None, help="benchmark DB path (default: settings.db_path)")
@@ -122,6 +165,23 @@ def main() -> int:
     valid_from = _floor_hour(issue)
     valid_to = valid_from + timedelta(hours=st.taf_hours)
     model_icao = stations.model_station(icao)
+    bench_db = args.db or settings.db_path
+    # Nearest-neighbor airfields for spatial awareness (get_nearby_obs); best-effort per
+    # neighbor so one dud id (no live AWC METAR) never sinks the run. Banked into the
+    # benchmark DB and copied under the SAME cutoff as the home station, so the tool is
+    # leakage-safe by the same SQL guard.
+    neighbor_icaos = ([n[0] for n in neighbors.neighbors_of(icao)]
+                      if args.neighbors else [])
+
+    # --ingest-only: the scheduler runs this ONCE per station so the matrix cells share a
+    # SINGLE AWC fetch (and one frozen obs snapshot) instead of each cell re-hitting AWC.
+    # Bank obs (home + proxy + neighbors) into the benchmark DB and exit; insert_obs is
+    # idempotent, so the cells then COPY these under --no-ingest.
+    if args.ingest_only:
+        with store.write_lock(args.db):
+            load = _ingest_obs(icao, model_icao, neighbor_icaos, args.ingest_hours, bench_db)
+        print(f"[{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}] ingest-only {icao}: {json.dumps(load)}")
+        return 0
 
     short = args.model.split("/")[-1]
     experiment_id = f"{icao}_{issue:%Y%m%dT%H%M}"           # the collection event (all cells share it)
@@ -133,38 +193,23 @@ def main() -> int:
     # the try so the temp dir is cleaned even when a step raises.
     run_dir = tempfile.mkdtemp(prefix="collect_")
     run_db = str(Path(run_dir) / "obs.duckdb")
-    bench_db = args.db or settings.db_path
     cutoff = issue - timedelta(minutes=settings.previous_taf_buffer_min)
     prev_taf = None
     try:
-        # ONE ingest under the lock, serialized against the poller/scorer:
-        #   1. bank the obs into the BENCHMARK DB with NO cutoff -- truth banking (the
-        #      model never reads this DB, so leakage does not apply to it);
-        #   2. copy the pre-cutoff back-window into the per-run DB (cutoff enforced in
-        #      SQL by store.copy_obs) for the model's read tools;
-        #   3. read the leakage-safe context: the CLIMO product and -- if this cell
-        #      grants it -- the latest PRIOR-CYCLE human TAF (issue-time buffer AND
-        #      valid_from strictly before this run's valid_from, so the current cycle's
-        #      bulletin can never qualify however early it posted);
-        #   4. stub the runs row, so a cell killed by the scheduler's timeout still
-        #      leaves a record (persist_run replaces it by run_id on success).
-        # Nearest-neighbor airfields for spatial awareness (get_nearby_obs); best-effort per
-        # neighbor so one dud id (no live AWC METAR) never sinks the run. Banked into the
-        # benchmark DB and copied under the SAME cutoff as the home station, so the tool is
-        # leakage-safe by the same SQL guard.
-        neighbor_icaos = ([n[0] for n in neighbors.neighbors_of(icao)]
-                          if args.neighbors else [])
+        # Under the lock, serialized against the poller/scorer:
+        #   1. bank obs for THIS cell into the BENCHMARK DB unless --no-ingest (the scheduler
+        #      pre-banked them via a single --ingest-only pass, so the cells reuse the same
+        #      frozen snapshot); NO cutoff -- truth banking, the model never reads this DB;
+        #   2. copy the pre-cutoff back-window into the per-run DB (cutoff enforced in SQL by
+        #      store.copy_obs) for the model's read tools;
+        #   3. read the leakage-safe context: the CLIMO product and -- if this cell grants it --
+        #      the latest PRIOR-CYCLE human TAF (issue-time buffer AND valid_from strictly before
+        #      this run's valid_from, so the current cycle's bulletin can never qualify);
+        #   4. stub the runs row, so a cell killed by the scheduler's timeout still leaves a
+        #      record (persist_run replaces it by run_id on success).
         with store.write_lock(args.db):
-            load = awc.load_metar(icao, hours=args.ingest_hours, db_path=bench_db)
-            if model_icao != icao:              # also bank the proxy's obs for the model tools
-                load = {"base": load,
-                        "proxy": awc.load_metar(model_icao, hours=args.ingest_hours,
-                                                db_path=bench_db)}
-            for nb in neighbor_icaos:
-                try:
-                    awc.load_metar(nb, hours=args.ingest_hours, db_path=bench_db)
-                except Exception as e:  # noqa: BLE001 -- a dud neighbor is skipped, not fatal
-                    print(f"  neighbor {nb} ingest skipped ({type(e).__name__}: {e})")
+            load = (_ingest_obs(icao, model_icao, neighbor_icaos, args.ingest_hours, bench_db)
+                    if args.ingest else {"reused_bank": True, "station": icao})
             bcon = store.connect(bench_db)      # RW so a fresh benchmark DB gets its schema
             try:
                 store.init_scoring_schema(bcon)
