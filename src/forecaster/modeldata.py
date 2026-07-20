@@ -29,6 +29,29 @@ from forecaster.config import settings
 
 MODELS = gribstream.MODELS  # ("gfs", "hrrr", "nbm")
 
+# GRIBStream's HRRR and NBM are CONUS-domain; an OCONUS site (Alaska/Japan) gets only all-null
+# rows from them -- which still BILL (credits scale with returned valid_times, not values) and
+# archive as a misleading all-`--` table. GFS is global. So drop the CONUS-only models when no
+# coordinate falls in the contiguous-US box; verified live 2026-07-19 (PAED: GFS 171/171 non-
+# null, HRRR + NBM 0/171).
+_CONUS_BBOX = (24.0, 50.0, -125.0, -66.0)   # lat_min, lat_max, lon_min, lon_max
+_CONUS_ONLY_MODELS = ("hrrr", "nbm")
+
+
+def _in_conus(lat: float, lon: float) -> bool:
+    la0, la1, lo0, lo1 = _CONUS_BBOX
+    return la0 <= lat <= la1 and lo0 <= lon <= lo1
+
+
+def _applicable_models(coords: list, models: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return (kept, dropped): drop the CONUS-only models when NO coordinate is in the
+    contiguous US (an OCONUS request), else keep everything. A mixed CONUS+OCONUS batch keeps
+    all models (the CONUS coords still need them; the OCONUS nulls are the lesser evil)."""
+    if any(_in_conus(c[0], c[1]) for c in coords):
+        return models, ()
+    dropped = tuple(m for m in models if m in _CONUS_ONLY_MODELS)
+    return tuple(m for m in models if m not in _CONUS_ONLY_MODELS), dropped
+
 # Response columns that are NOT requested variables (mirrors gribstream._TS_COLS+_META_COLS).
 _SKIP_COLS = {"forecasted_at", "forecasted_time", "lat", "lon", "name", "member"}
 
@@ -494,22 +517,28 @@ def prefetch_many(
     surface_coords = _dedupe(surf_lists)
     hazard_coords_all = _dedupe(haz_lists) if hazards else []
 
+    # Drop CONUS-only models for a wholly-OCONUS request (they return only billable all-null).
+    models_eff, dropped_models = _applicable_models(surface_coords, models)
+
     # PASS 2: fetch the oriented grid (+ archive the probe columns).
     charged, flattened, inserted, notes = _fetch_and_insert(
-        surface_coords, hazard_coords_all, as_of=as_of, anchor=anchor, models=models,
+        surface_coords, hazard_coords_all, as_of=as_of, anchor=anchor, models=models_eff,
         hours=hours, step_h=step_h, hazards=hazards, hazard_step_h=hazard_step_h,
         back_hours=back_hours, db_path=db_path, use_cache=use_cache, extra_rows=probe_rows)
+    if dropped_models:
+        notes.insert(0, f"{', '.join(dropped_models)} skipped: no coordinate in CONUS "
+                        f"(GFS-only OCONUS; HRRR/NBM are CONUS-domain on GRIBStream)")
 
     return {
         "stations": [s.upper() for s in stations],
         "as_of": as_of,
-        "models": list(models),
+        "models": list(models_eff),
         "flow_relative": bool(flow_relative),
         "oriented_stations": oriented,
         "coords": len(surface_coords),
         "hazard_coords": len(hazard_coords_all),
-        "requests": len(models) * (len(list(_chunk(surface_coords)))
-                                   + (len(list(_chunk(hazard_coords_all))) if hazards else 0))
+        "requests": len(models_eff) * (len(list(_chunk(surface_coords)))
+                                       + (len(list(_chunk(hazard_coords_all))) if hazards else 0))
                     + (len(stations) if flow_relative else 0),   # + steering probes
         "rows_flattened": flattened,
         "rows_inserted": inserted,

@@ -55,10 +55,11 @@ def _git_sha() -> str | None:
         return None
 
 
-def _system_prompt(max_steps: int, mode: str, taf_access: bool) -> str:
+def _system_prompt(max_steps: int, mode: str, taf_access: bool, model_data: bool = False) -> str:
     """The USAF-forecaster system prompt for a COLLECTION run -- the tool list omits
     get_current_taf on purpose (leakage guard); get_previous_taf appears only when this
-    cell grants prior-TAF access."""
+    cell grants prior-TAF access; the get_model_* tools appear only when model_data is on
+    (naming them in the prompt is what makes the model actually call them)."""
     gate = {
         "off": "Reason, then call emit_taf.",
         "advisory": "Fill and submit a worksheet (submit_taf_worksheet) BEFORE emit_taf. Its "
@@ -68,6 +69,10 @@ def _system_prompt(max_steps: int, mode: str, taf_access: bool) -> str:
                     "re-submit, then emit.",
     }[mode]
     prev = (" get_previous_taf (the prior official TAF, for continuity)," if taf_access else "")
+    md = (" get_model_state (hourly NWP surface guidance -- T/Td/wind/MSLP/ceiling from "
+          "GFS/HRRR/NBM), get_hazard_scan (icing + convective/turbulence environment, "
+          "cross-model), get_model_verification (recent model-vs-obs bias), "
+          "get_nearby_model_data (a field at upstream points)," if model_data else "")
     s = (
         "You are a USAF weather forecaster issuing terminal aerodrome forecasts under AFMAN "
         "15-124. Tools: query_obs/get_latest_obs (stored METARs), get_trend (meteogram), "
@@ -75,7 +80,7 @@ def _system_prompt(max_steps: int, mode: str, taf_access: bool) -> str:
         "(hourly model point forecast), get_climo (typical conditions), get_imagery (sat/radar), "
         "get_terrain (local terrain + coastline with the nearby airfields plotted on a relief "
         "map), get_nearby_obs (latest observations from those neighbors),"
-        + prev + " check_taf (AFMAN dry-run), and emit_taf (submit the forecast). Each data-tool "
+        + md + prev + " check_taf (AFMAN dry-run), and emit_taf (submit the forecast). Each data-tool "
         "receipt begins with an [evidence_id: ev_NNN] you can cite. " + gate + " Think step by step, "
         "gather what you need, and base the forecast only on tool data. Place the field in its "
         "mesoscale setting: use get_terrain to see the surrounding terrain and airfields, then "
@@ -84,6 +89,12 @@ def _system_prompt(max_steps: int, mode: str, taf_access: bool) -> str:
         "sea breeze, valley cold-air pooling). "
         f"You have up to {max_steps} tool-calling turns -- take the time to reason thoroughly."
     )
+    if model_data:
+        s += (" Model guidance is available: anchor quantitative trends -- temperature extremes "
+              "(TX/TN), the pressure/QNH trend, wind and gusts -- to get_model_state and "
+              "get_point_forecast rather than extrapolating the last observation, use "
+              "get_hazard_scan to judge convective and icing risk, and get_model_verification "
+              "to weight the model your recent obs say is less biased.")
     if mode != "off":
         s += "\n\n" + wksht.worksheet_guide(settings.evidence_mode)
     return s + "\n\n" + tafgen.emit_taf_guide()
@@ -293,7 +304,8 @@ def _run_and_persist(args, st, icao, issue, valid_from, valid_to,
         toolset.append(GET_PREVIOUS_TAF)
     toolset += ([SUBMIT_WORKSHEET] if args.mode != "off" else []) + [EMIT_TAF]
 
-    messages = [{"role": "system", "content": _system_prompt(args.max_steps, args.mode, args.taf_access)},
+    messages = [{"role": "system", "content": _system_prompt(args.max_steps, args.mode, args.taf_access,
+                                                             args.model_data)},
                 {"role": "user", "content": _task_prompt(st, valid_from)}]
     cfg = AgentConfig(
         model=args.model, toolset=toolset, max_steps=args.max_steps, max_tokens=args.max_tokens,

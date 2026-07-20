@@ -467,7 +467,52 @@ artificial-forecaster/
   with the climo+imagery working-tree changes). Two follow-ups if wanted: a live `required`-mode run, and a
   recent-valid-time run (obs + built climo) to exercise sanity_checks with real observed data.
 
-## NEXT SESSION -- pick up here (paused 2026-07-17)
+## NEXT SESSION -- pick up here (paused 2026-07-19)
+
+### SESSION 2026-07-19 SUMMARY (all UNCOMMITTED in the working tree -- commit as one model-data commit)
+Worked the live-run health check + the GRIBStream credit-gated confirmations + a scheduling redesign.
+Details in the blocks below; the headline items:
+- FIRST BENCHMARK RESULTS pulled (human 85.7 > model 83.1 > persistence 81.1; MiniMax ablations; per-
+  element + by-station gaps) -- see the block just below.
+- GRIBStream confirmations DONE (hazard/model-state/flow-relative/OCONUS/agent-loop) + IFS confirmed
+  reachable (3-hourly grid) -- see the GRIBSTREAM section.
+- FIVE code changes (the working-tree diff): `store.insert_model_data` bulk pandas insert (~1000x),
+  `collect._system_prompt` names the get_model_* tools (the model now calls them), `tools._fmt_hazard_scan`
+  default valid-time fix, `modeldata._applicable_models` OCONUS model-drop, `scripts/probe_ifs.py` 3h-grid
+  fix. Plus the RUN-CADENCE REDESIGN: new `scripts/archive_model_data.py` + `schedule.py` Phase 1b removed
+  + pandas moved to a runtime dep (pyproject/uv.lock). ruff clean; test_modeldata 63/63.
+- UNCOMMITTED: CLAUDE.md, pyproject.toml, uv.lock, scripts/{collect,probe_ifs,schedule}.py,
+  src/forecaster/{modeldata,store,tools}.py, scripts/archive_model_data.py (new). docs/ (gitignored):
+  gribstream_model_data.md + pi_setup_log.md updated. NEXT: commit these (one model-data commit); the
+  model-data tier is still GATED OFF (MODEL_DATA_ENABLED=false) so nothing bills until enabled.
+
+### FIRST BENCHMARK RESULTS -- mid-run health check + scoring signal (2026-07-19, ~3 days into the live Pi run)
+Full collect->score loop VERIFIED HEALTHY on real data (sanity check PASSED). Snapshot the Pi DB via the
+harvest flock pattern and query read-only; ~162 evaluations scored, ~166 pending (not-yet-elapsed windows).
+Headline combined TAFVER (mean over scored evals): HUMAN 85.7% > MODEL 83.1% > PERSISTENCE 81.1% -- the
+canonical human>AI>persistence ordering, a genuine first signal. Fatals: all 45 were the single 2026-07-17
+402 burst; ZERO since (max-parallel 3->2 held). ~66 incomplete (~15%, all no-emit) cluster on heavy issue
+hours (11Z/14Z/03Z/19Z) = cells SIGKILL'd by schedule.py's 30-min timeout when 18 cells fire/hour -- no
+leakage, just lost matrix cells; RAISE the per-cell timeout or spread heavy hours before round 2 for stat power.
+- MiniMax ABLATIONS (4 cells, ~30 scored each; single-point gaps directional not yet significant):
+  control (ws+prior-TAF, t0) 84.4% > nows 83.4 > temp02 83.0 > NOTAF 81.9. PRIOR-TAF ACCESS is the dominant
+  factor (-2.5, drops ~to persistence; wrecks ceiling continuity 86.5->75.7). temp0 beats temp0.2 (-1.4).
+  Worksheet buys only ~1 TAFVER pt but HALVES output tokens (nows 8.7k vs ctl 14.5k) -- cost/benefit Q for
+  round 2 (worksheet's value may be convergence/reliability, not raw score). Factor rank: prior-TAF >> temp ~ worksheet.
+- MODELS (control cell): Gemma 83.3% ~= MiniMax 84.4% at similar cost = efficiency win (weak wind_dir 59.1);
+  Kimi 81.4% but only 40% clean-emit, ~2x tokens, ~12 steps/20 tool-calls = the gather-loop/rumination that
+  got it dropped from round 2 (n=10 scored, soft).
+- PER-ELEMENT (human/model/persist): human wins 5/7, dominates altimeter (99.3) + present_weather (31.6 vs
+  22.1, +9.5 = where forecaster judgment separates, though hard for all). MODEL BEATS human on VISIBILITY
+  (+5.8) and ties gusts (persistence wins gusts 89.1 -- dry-ridge gusts persist). present_weather is the
+  universal weak spot (~14-32%). Human has MOST busts / LOWEST in-spec (5.89 / 63.3%) yet highest TAFVER =
+  aggressive-but-accurate vs persistence's do-nothing (persistence 2.26 trig / 70.9% in-spec).
+- BY-STATION human-model gap: human leads 7/10 (widest KWRI +6.3, PAED +5.8, KDMA +5.0); MODEL BEATS human at
+  KMIB (-3.1, solid 18/18), PABI (-4.8 coastal AK), KRCA (-3.0 thin n=5). Persistence reframes difficulty:
+  at KWRI/KSSC/KFTK persistence >= human (low-skill stable regimes); at RJTY/PABI/KVBG persistence far below
+  (72-74%) = high-value maritime/AK sites where the model is already competitive-to-better. That
+  human-vs-model-vs-persistence per-station spread is the difficulty-mining signal for round-2 target picks.
+  Watch thin pairings (KFTK/KVBG/KRCA human n=5-6). Queries: scratchpad this session; re-derive via harvest snapshot.
 
 ### GRIBSTREAM MODEL-DATA SUBSYSTEM -- BUILT this session; credit-gated confirmations remain
 The whole model-data subsystem is CODE-COMPLETE, offline-tested (`scripts/test_modeldata.py` 63/63),
@@ -487,21 +532,66 @@ tree with the climo/imagery/worksheet/scoring/spatial work).
   get_nearby_model_data render; and `get_model_verification` end-to-end using the cached archive + FREE
   AWC obs (all 3 models matched 4 real hours; surfaced the GFS 12Z warm/dry bias). Offline tests cover
   archive, formatters, collect copy path, grid/flow/batch/IFS, steering math + copy-reproducibility.
-- PICK UP (credit-gated CONFIRMATIONS when the API resets, low risk -- code is done):
-  1. Live with-HAZARDS prefetch (~1000 cr): `prefetch_model_data.py --station KWRI` -> confirm
-     get_hazard_scan on REAL pressure levels (icing/turbulence).
-  2. Full agent-loop run `collect.py --station KWRI --model google/gemma-4-31B-it --mode required
-     --model-data` (needs LLM credits) -> does the model CALL the get_model_* tools + fold them in.
-  3. OCONUS degrade (few cr): PAED/PABI/RJTY -> GFS+NBM + an HRRR "unavailable" note (both failure
-     modes already handled).
-  4. IFS: run `scripts/probe_ifs.py` (names VERIFIED from gribstream.com/models/ifsoper), handle the
-     `tcc` 0-1 FRACTION (state formatter needs *100 for IFS), then add `ifsoper` to `gribstream.MODELS`
-     + flip `modeldata._IFS_ENABLED`.
-  5. Flow-relative live confirm: run a prefetch with `MODEL_DATA_FLOW_RELATIVE=true` -> steering probe
-     works, oriented upstream points appear, copy reproduces the bearing.
+- CONFIRMATIONS DONE (2026-07-19; all against a scratch DB, KWRI archive cached from killed runs
+  so most reruns cost 0 credits; PAED charged 494):
+  1. HAZARD scan -- CONFIRMED. get_hazard_scan renders real pressure-level icing (T/RH/CLW x GFS+HRRR)
+     + turbulence (CAPE/CIN/omega/shear/SRH). BUG FOUND+FIXED: default valid-time picked the surface
+     6h back-tail (04Z, no hazard data) -> empty render; now filters to hazard-bearing entries
+     (cape/t650) before the default pick (`tools._fmt_hazard_scan`).
+  2. AGENT-LOOP -- CONFIRMED w/ FIX. First run: Gemma emitted a clean TAF but called NONE of the
+     get_model_* tools (used get_point_forecast instead). ROOT CAUSE: `collect._system_prompt` never
+     NAMED the model-data tools (same failure as spatial-awareness). FIXED: prompt now names the four
+     get_model_* tools + a "anchor TX/TN, QNH trend, gusts to model guidance; use hazard_scan for
+     convective/icing; use model_verification to weight the less-biased model" nudge, gated on
+     --model-data. RE-RUN CONFIRMED: same KWRI cached archive, Gemma went 0/4 -> called get_model_state
+     (converged clean, 5 steps); did not call hazard_scan (reasonable for a dry-ridge KWRI). Prompt-
+     naming is what makes the model use the tier.
+  3. OCONUS degrade -- CONFIRMED w/ FIX. PAED: GFS 171/171 non-null; HRRR AND NBM 0/171 (GRIBStream's
+     NBM is CONUS-only too, NOT "GFS+NBM" as the doc assumed). Degrade was clean (renders `--`) but
+     SILENT + BILLED (494 cr, ~2/3 on all-null HRRR/NBM). FIXED: `modeldata._applicable_models` drops
+     the CONUS-only models (hrrr,nbm) when no coord is in the CONUS bbox, with a note -> OCONUS
+     stations fetch GFS-only (saves ~2/3 credits). Mixed CONUS+OCONUS batches keep all models.
+  4. IFS -- CONFIRMED reachable (2026-07-19, after checking gribstream.com/models/ifsoper). The earlier
+     "no data" was NOT availability: IFS steps are 3-HOURLY (0-144h every 3h), so my probe's off-grid
+     valid times (19Z/04Z) returned 0 rows. On the 00/03/.../21Z grid all 11 vars return finite (KMSP,
+     run 18Z, 11 cr); slug `ifsoper` + names `2t/2d/10u/10v/msl/tcc @ sfc`, `t/r/u/v/w @ 'pl <hPa>'` all
+     correct; tcc is a 0-1 FRACTION (0.609). `scripts/probe_ifs.py` FIXED to snap to the 3h grid. STILL
+     DISABLED -- enabling still needs: (a) a PER-MODEL time grid (IFS on 3h/6h, not the 2h surface grid,
+     or it bills null rows at non-aligned even hours -- same waste class as OCONUS), (b) tcc *100 in the
+     state formatter, (c) add `ifsoper` to `gribstream.MODELS` + flip `modeldata._IFS_ENABLED`. IFS is
+     GLOBAL so it is correctly NOT in _CONUS_ONLY_MODELS (kept OCONUS, unlike HRRR/NBM).
+  5. Flow-relative -- CONFIRMED. Steering probe computed westerly; 6 oriented upstream points
+     (u251/u281/u311 @ radii 20/30) archived beside the 12x3 base grid.
+  PERF FIX (found via the slow prefetch): `store.insert_model_data` did per-row INSERT ON CONFLICT
+  (~13ms/row, 96s for 7182 rows, minutes for a full cycle -- CPU-bound, bad on the Pi). FIXED: register
+  the batch as a pandas DataFrame + one set-based `INSERT ... SELECT ... ON CONFLICT` (~0.10s; full 48k-
+  row KWRI prefetch 9min+ -> 5.45s, ~1000x). pandas moved dev-group -> runtime dep in pyproject (uv
+  sync'd); executemany fallback if pandas missing. test_modeldata 63/63, ruff clean.
+  STILL TO DO:
   6. Cost/budget guard, then `MODEL_DATA_ENABLED=true` on the Pi (SEPARATE credit line from the LLM
-     providers; ~500 cr/station surface / ~1000 with hazards; batching lowers multi-station cycles).
-  7. COMMIT the subsystem (ideally its own commit) once blessed.
+     providers; ~500 cr/station surface / ~1000 with hazards; OCONUS now GFS-only ~1/3; batching lowers
+     multi-station cycles).
+  7. COMMIT the subsystem + these fixes (ideally its own commit) once blessed.
+
+- RUN-CADENCE REDESIGN (2026-07-19, IMPLEMENTED -- decouples model-data pull from forecast time).
+  OLD: schedule.py Phase 1b prefetched per CYCLE-EVENT (as_of=issue), ~18/day; each event anchored
+  its valid-time grid on its own issue time, so forecasts using the SAME run re-fetched on offset
+  grids (full credits each, cache can't dedupe). NEW: pull on the MODEL-RUN cadence -- ONE batched
+  pull of the WHOLE roster (~420 coords, free <=500 => ~1 chunk) captures each model's freshest run;
+  forecasts just COPY the archive (0 cr). WHY it works with no data-layer change: `_pivot_series`
+  already keeps the LATEST run per valid_time, and copy_model_data reads by coord -- so a multi-run
+  archive serves "latest run <= issue" automatically (leakage-safe live; a historical-replay run<=issue
+  filter in copy_model_data is a deferred follow-up). CHANGES: new `scripts/archive_model_data.py`
+  (batched all-roster pull, 48h, gated on MODEL_DATA_ENABLED unless --force; ~1551 cr/fire batched =>
+  ~6k/day at 4x); schedule.py Phase 1b REMOVED (cells still get --model-data and copy); Pi cron adds
+  `archive_model_data.py` at 05/11/17/23Z + `--model-data` on the scheduler (docs/pi_setup_log.md).
+  Verified: schedule --dry-run shows no prefetch line; archive --dry-run ~1551 cr; gated no-op; live
+  KWRI-only run archived 42k rows (charged 1077 -- a fresh run, not my cache). ruff clean.
+  ** FLAG FOR v2 DISCUSSION (owner will decide before implementing v2): HRRR + NBM update HOURLY but
+  this job snapshots them only ~4x/day, so a forecast can read an HRRR/NBM run up to ~6h old -- fine
+  for GFS/IFS (native 4x/day), a real value loss for the rapid-refresh models. Options: separate
+  higher-frequency HRRR/NBM archival job, drop them from the batched roster pull and fetch at forecast
+  time, or accept the staleness. NOT decided -- revisit before enabling v2. ** [[gribstream-seam]]
 - DEFERRED (only if a run shows the need): multi-DIRECTION upstream extension for an evolving flow
   (fan far points along initial AND later inflow bearings -- NOT a forecast-mean, which is unsound
   across a regime change); IFS hazard bundle (icing t/r + shear u/v/w at `pl` levels); input-pinning

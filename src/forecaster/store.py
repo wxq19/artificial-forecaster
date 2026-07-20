@@ -574,24 +574,41 @@ def insert_model_data(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
     if not rows:
         return 0
     before = con.execute("SELECT count(*) FROM model_data").fetchone()[0]
-    for r in rows:
-        con.execute(
-            "INSERT INTO model_data VALUES ($model, $run, $valid_time, $lat, $lon, "
-            "$loc_id, $variable, $value, $member, $as_of, $fetched_at) "
-            "ON CONFLICT DO NOTHING",
-            {
-                "model": r["model"],
-                "run": _to_naive_utc(r["run"]) if r.get("run") else None,
-                "valid_time": _to_naive_utc(r["valid_time"]),
-                "lat": _round_ll(r["lat"]),
-                "lon": _round_ll(r["lon"]),
-                "loc_id": r.get("loc_id"),
-                "variable": r["variable"],
-                "value": r.get("value"),
-                "member": int(r.get("member") or 0),
-                "as_of": _to_naive_utc(r["as_of"]) if r.get("as_of") else None,
-                "fetched_at": _to_naive_utc(r["fetched_at"]) if r.get("fetched_at") else None,
-            },
+    # The long-format archive is model x run x valid_time x coord x variable, so a cycle carries
+    # tens of thousands of rows. A per-row (or even executemany) INSERT ... ON CONFLICT runs one
+    # statement per row -- ~13 ms each, minutes total, CPU-bound on the Pi. DuckDB is columnar:
+    # register the batch as ONE relation and do a single set-based INSERT ... SELECT (measured
+    # ~1000x faster). Fall back to executemany if pandas is unavailable (correctness unchanged).
+    cols = ("model", "run", "valid_time", "lat", "lon", "loc_id",
+            "variable", "value", "member", "as_of", "fetched_at")
+    tuples = [
+        (
+            r["model"],
+            _to_naive_utc(r["run"]) if r.get("run") else None,
+            _to_naive_utc(r["valid_time"]),
+            _round_ll(r["lat"]),
+            _round_ll(r["lon"]),
+            r.get("loc_id"),
+            r["variable"],
+            r.get("value"),
+            int(r.get("member") or 0),
+            _to_naive_utc(r["as_of"]) if r.get("as_of") else None,
+            _to_naive_utc(r["fetched_at"]) if r.get("fetched_at") else None,
+        )
+        for r in rows
+    ]
+    try:
+        import pandas as pd
+
+        con.register("_md_incoming", pd.DataFrame(tuples, columns=cols))
+        try:
+            con.execute("INSERT INTO model_data SELECT * FROM _md_incoming ON CONFLICT DO NOTHING")
+        finally:
+            con.unregister("_md_incoming")
+    except ImportError:
+        con.executemany(
+            "INSERT INTO model_data VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            tuples,
         )
     return con.execute("SELECT count(*) FROM model_data").fetchone()[0] - before
 

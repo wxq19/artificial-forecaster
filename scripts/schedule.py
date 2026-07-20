@@ -26,8 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from forecaster import modeldata, stations
-from forecaster.config import settings
+from forecaster import stations
 
 KIMI = "moonshotai/Kimi-K2.7-Code"
 MINIMAX = "MiniMaxAI/MiniMax-M3"
@@ -115,19 +114,18 @@ def main() -> int:
     if not stns:
         return 0
 
-    # Whether the model-data tier is on for this dispatch: explicit --model-data wins, else
-    # the collector's settings default. Model-data prefetch is done ONCE, BATCHED, in-process
-    # (below) -- not per ingest subprocess -- so the union of due stations' neighborhoods is
-    # one set of <=500-coord requests instead of N.
-    model_data_on = args.model_data if args.model_data is not None else settings.model_data_enabled
-
+    # Model-data is NOT prefetched at forecast time anymore -- it is archived on the MODEL-RUN
+    # cadence by scripts/archive_model_data.py (~4x/day, ONE batched pull of the whole roster
+    # for the freshest runs). The cells just COPY that archive (collect.py copy_model_data, 0
+    # credits), so forecast timing is decoupled from data availability. _md_flag toggles the copy.
     def _md_flag() -> list[str]:
         # None -> inherit collect's settings default; True/False -> force it for this dispatch.
         return [] if args.model_data is None else (
             ["--model-data"] if args.model_data else ["--no-model-data"])
 
     def _ingest_cmd(st: stations.Station) -> list[str]:
-        # Obs banking only -- prefetch is batched in-process, so tell the subprocess NOT to.
+        # Obs banking only -- model-data is archived separately (archive_model_data.py), so the
+        # ingest subprocess never prefetches.
         cmd = [sys.executable, str(_COLLECT), "--station", st.icao, "--ingest-only",
                "--no-model-data", "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
         return cmd + (["--db", args.db] if args.db else [])
@@ -143,8 +141,6 @@ def main() -> int:
     if args.dry_run:
         for st in stns:
             print(f"  DRY-RUN would ingest: {st.icao} (once)")
-        if model_data_on:
-            print(f"  DRY-RUN would prefetch model-data (batched): {', '.join(s.icao for s in stns)}")
         for st in stns:
             for cell in MATRIX:
                 print(f"  DRY-RUN would fire:   {st.icao} {cell.label} ({cell.model.split('/')[-1]})")
@@ -167,22 +163,10 @@ def main() -> int:
             tail = "\n".join(output.strip().splitlines()[-6:]) if output.strip() else "(no output)"
             print(f"----- {label}: {status} -- SKIPPING {st.icao} cells -----\n{tail}\n")
 
-    # Phase 1b -- ONE batched model-data prefetch for all ingested stations (they share this
-    # cycle's issue time). Points are free <=500, so the union costs ~1 request/model instead
-    # of N. A failure here is non-fatal: the cells with --model-data just copy an empty archive
-    # and the get_model_* tools return "not pre-fetched" feedback.
-    if model_data_on and ready:
-        try:
-            md = modeldata.prefetch_many([st.icao for st in ready], as_of=issue, db_path=args.db)
-            print(f"----- model-data prefetch: {md['rows_inserted']} rows across "
-                  f"{md['coords']} coords in {md['requests']} request(s), "
-                  f"{md['credits_charged']} credits -----"
-                  + (f"\n  notes: {md['notes']}" if md["notes"] else ""))
-        except Exception as e:  # noqa: BLE001 -- prefetch failure must not abort the cells
-            print(f"----- model-data prefetch FAILED ({type(e).__name__}: {e}) -- "
-                  "cells will find an empty archive -----")
-
     # Phase 2 -- run the matrix cells (--no-ingest) for the successfully-ingested stations.
+    # (Model-data is NOT prefetched here -- archive_model_data.py keeps the archive fresh on the
+    # run cadence; --model-data cells copy from it. If it is stale/empty the get_model_* tools
+    # just return "not pre-fetched" feedback, which is non-fatal.)
     jobs = [(f"{st.icao} {cell.label} ({cell.model.split('/')[-1]})", _cell_cmd(st, cell))
             for st in ready for cell in MATRIX]
     parallel = max(1, args.max_parallel)

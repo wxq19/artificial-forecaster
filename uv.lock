@@ -113,6 +113,7 @@ dependencies = [
     { name = "metar-taf-parser-mivek" },
     { name = "metpy" },
     { name = "openai" },
+    { name = "pandas" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
 ]
@@ -120,7 +121,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "notebook" },
-    { name = "pandas" },
     { name = "ruff" },
 ]
 
@@ -134,6 +134,7 @@ requires-dist = [
     { name = "metar-taf-parser-mivek", specifier = ">=1.13.1" },
     { name = "metpy", specifier = ">=1.7.1" },
     { name = "openai", specifier = ">=2.43.0" },
+    { name = "pandas", specifier = ">=3.0.3" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
 ]
@@ -141,7 +142,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "notebook", specifier = ">=7.6.0" },
-    { name = "pandas", specifier = ">=3.0.3" },
     { name = "ruff", specifier = ">=0.15.18" },
 ]
 

@@ -13,13 +13,13 @@ dependencies = [
     "metar-taf-parser-mivek>=1.13.1",
     "metpy>=1.7.1",
     "openai>=2.43.0",
+    "pandas>=3.0.3",
     "pydantic-settings>=2.14.2",
     "python-dotenv>=1.2.2",
 ]
 [dependency-groups]
 dev = [
     "notebook>=7.6.0",
-    "pandas>=3.0.3",
     "ruff>=0.15.18",
 ]
 [tool.hatch.build.targets.wheel]

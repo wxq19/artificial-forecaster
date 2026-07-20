@@ -1733,7 +1733,14 @@ def _fmt_hazard_scan(con, station: str, loc: tuple, want) -> str:
     for model in ("gfs", "hrrr"):
         rows = store.model_data_series(con, model, lat, lon, start=_WIDE_START, end=_WIDE_END)
         piv[model] = _pivot_series(rows)
-    ref = _pick_valid_time(piv["gfs"] or piv["hrrr"], want)
+    base = piv["gfs"] or piv["hrrr"]
+    # The series carries the surface 6h back-tail too, whose early entries hold no pressure-
+    # level vars. When no valid time is asked, default to the earliest HAZARD-bearing entry
+    # (cape/t650 present), not the earliest overall -- else the scan lands on the back-tail and
+    # renders empty.
+    if want is None:
+        base = [e for e in base if e[2].get("cape") is not None or e[2].get("t650") is not None] or base
+    ref = _pick_valid_time(base, want)
     if ref is None:
         return (f"(no pressure-level hazard data pre-fetched for {loc_id} -- prefetch runs with "
                 f"hazards enabled for the site + grid only). {_md_locations_hint(con)}")

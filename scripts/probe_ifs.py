@@ -25,7 +25,11 @@ PRESSURE = [gribstream.Var("t", "pl 500", "t500"), gribstream.Var("r", "pl 500",
 
 def main() -> None:
     lat, lon = awc.station_latlon(STATION)
-    anchor = modeldata._utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=3)
+    # IFS steps are 3-HOURLY (0-144h every 3h; gribstream.com/models/ifsoper), so the valid time
+    # MUST land on the 00/03/06/.../21Z grid or the request returns 0 rows -- snap DOWN to the 3h
+    # grid, then step out ~6 h so a posted run (00/06/12/18Z, several-hour lag) covers it.
+    now = modeldata._utcnow().replace(minute=0, second=0, microsecond=0)
+    anchor = now - timedelta(hours=now.hour % 3) + timedelta(hours=6)
     print(f"probing IFS (ifsoper) at {STATION} valid {anchor:%Y-%m-%dT%HZ}")
     charged = 0
     for label, vs in [("surface", SURFACE), ("pressure", PRESSURE)]:
