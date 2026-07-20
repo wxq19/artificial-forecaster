@@ -649,8 +649,9 @@ SUBMIT_WORKSHEET = {
             "Submit your pre-forecast reasoning WORKSHEET before emit_taf: a single "
             "structured object capturing the data you reviewed, the current state, the "
             "drivers, hazards, a forecast timeline, your sanity checks (cross-check each "
-            "TX/TN against the observed diurnal temperature range, and state the ONE "
-            "hPa->inHg conversion you use everywhere), the TAF strategy, uncertainty, and "
+            "TX/TN against the observed diurnal temperature range, and take any hPa->inHg "
+            "pressure value from the inHg column the model tools already print rather than "
+            "converting it by hand), the TAF strategy, uncertainty, and "
             "a final assessment. It returns a completeness check -- correct any findings "
             "and re-submit until clean, THEN emit the TAF from your timeline and strategy. "
             "Fill it ONCE as a single call (reason across your earlier tool calls first)."
@@ -1287,8 +1288,11 @@ def _fmt_point(pf, n: int) -> str:
     out = [
         f"{pf.model.upper()} point forecast for {pf.station} -- run {pf.run:%Y-%m-%dT%H:%MZ}, "
         f"{len(rows)} hourly steps (source: {pf.url}). Raw model surface fields; each row is "
-        "one forecast hour -- read a column down to see a variable's trend.",
-        (f"{'Valid (UTC)':<18}{'T C':>5}{'Td C':>6}{'Wind kt':>10}{'MSLP':>7}"
+        "one forecast hour -- read a column down to see a variable's trend. MSLP is given in "
+        "both hPa and inHg (same value, converted for you -- do not re-derive it); it is "
+        "sea-level pressure, so use it for the QNH TREND, not as the QNH value at an "
+        "elevated field.",
+        (f"{'Valid (UTC)':<18}{'T C':>5}{'Td C':>6}{'Wind kt':>10}{'MSLP':>7}{'inHg':>7}"
          f"{'Cld L/M/H %':>14}{'P01 mm':>8}"),
     ]
     def _d(v, fmt: str = "{:.0f}") -> str:
@@ -1302,7 +1306,8 @@ def _fmt_point(pf, n: int) -> str:
         cloud = "--" if any(c is None for c in trip) else "/".join(f"{c:.0f}" for c in trip)
         out.append(
             f"{vt:<18}{_d(r['t2m_c']):>5}{_d(r['td2m_c']):>6}{wind:>10}"
-            f"{_d(r['mslp_hpa']):>7}{cloud:>14}{_d(r['p01_mm'], '{:.1f}'):>8}"
+            f"{_d(r['mslp_hpa']):>7}{_inhg_md(r['mslp_hpa']):>7}"
+            f"{cloud:>14}{_d(r['p01_mm'], '{:.1f}'):>8}"
         )
     return "\n".join(out)
 
@@ -1590,6 +1595,15 @@ def _ms2kt(ms):
     return None if ms is None else ms * 1.94384
 
 
+def _inhg_md(hpa):
+    """Mean sea-level pressure rendered in inches of mercury, so the model never has to do
+    the hPa->inHg arithmetic by hand (it did it inconsistently for the SAME value in round 1).
+    NOT the altimeter setting: QNH is reduced from STATION pressure by the standard
+    atmosphere, MSLP by the actual temperature profile, so the two diverge as field
+    elevation rises. A conversion aid and a trend, not a QNH value to copy."""
+    return "--" if hpa is None else f"{hpa / 33.8638866667:.2f}"
+
+
 def _vis_sm_md(m):
     if m is None:
         return "--"
@@ -1673,7 +1687,7 @@ def _fmt_model_state(con, station: str, loc: tuple, models: list[str], hours: in
             f"{model.upper()} surface forecast for {loc_id} -- run "
             f"{run:%Y-%m-%dT%HZ}" if run else f"{model.upper()} surface forecast for {loc_id}",
             f"{'Valid (Z)':<15}{'T C':>5}{'Td C':>6}{'Wind':>8}{'Gst':>5}"
-            f"{'MSLP':>7}{'Cld%':>6}{'Vis':>6}{'Ceil ft':>9}",
+            f"{'MSLP':>7}{'inHg':>7}{'Cld%':>6}{'Vis':>6}{'Ceil ft':>9}",
         ]
         gusts = []
         for vt, _r, vm in series:
@@ -1688,6 +1702,7 @@ def _fmt_model_state(con, station: str, loc: tuple, models: list[str], hours: in
                 f"{_wind_cell_md(vm, model):>8}"
                 f"{('%5.0f' % gk) if gk is not None else '   --'}"
                 f"{('%7.0f' % (mslp / 100)) if mslp is not None else '     --'}"
+                f"{_inhg_md(None if mslp is None else mslp / 100):>7}"
                 f"{('%6.0f' % cld) if cld is not None else '    --'}"
                 f"{_vis_sm_md(vm.get('vis')):>6}"
                 f"{_ceil_ft_md(vm.get('ceil')):>9}"
@@ -1698,7 +1713,10 @@ def _fmt_model_state(con, station: str, loc: tuple, models: list[str], hours: in
         return (f"(no model data pre-fetched for {loc_id}). {_md_locations_hint(con)}")
     synopsis = "  ".join(f"{m.upper()} peak gust {v:.0f}kt" if v else f"{m.upper()} gust --"
                          for m, v in peaks.items())
-    return "\n\n".join(blocks) + f"\n\nCROSS-MODEL: {synopsis}"
+    return ("\n\n".join(blocks) + f"\n\nCROSS-MODEL: {synopsis}"
+            + "\nMSLP is shown in hPa and inHg (same value, converted for you -- do not "
+              "re-derive it). It is sea-level pressure: use it for the QNH TREND, not as "
+              "the QNH value at an elevated field.")
 
 
 def _get_model_state(con, station: str, args: dict) -> ToolResult:

@@ -182,8 +182,9 @@ SAT_REGIONS: dict[str, SatRegion] = {
     ]
 }
 
-# CONUS extent for the fallback when a station sits in no named sector; the GOES coverage
-# bound rejects OCONUS points (no GOES East/West view -> Meteosat/Himawari, deferred).
+# CONUS extent for the fallback when a station sits in no named sector. These GOES bounds
+# are only the LAST-RESORT fallback: the Himawari and Meteosat sectors in SAT_REGIONS are
+# matched by bbox first, so an OCONUS point normally resolves before reaching here.
 _CONUS_BBOX = (-125.0, 24.0, -66.0, 50.0)
 _GOES_LON = (-180.0, -8.0)     # Western Hemisphere incl. the Pacific; excludes EU/ME/Asia
 _GOES_LAT = (-60.0, 70.0)
@@ -244,8 +245,11 @@ def _in_bbox(bbox: tuple[float, float, float, float], lat: float, lon: float) ->
 def satellite_region_for_latlon(lat: float, lon: float) -> str | None:
     """Best default satellite region for a point, tightest useful view first: the named
     SECTOR whose bbox contains it (nearest sector center wins on overlap), else CONUS
-    (bird by longitude), else full disk. None if the point is outside the GOES East/West
-    footprint (OCONUS -> Meteosat/Himawari, a deferred fast-follow)."""
+    (bird by longitude), else full disk. OCONUS IS COVERED: the Himawari (W Pacific/E Asia)
+    and Meteosat (Europe/Middle East/Africa) sectors are matched by bbox in the same first
+    pass as the GOES sectors, so Japan/Korea/Okinawa, Guam, Europe and the Gulf all resolve.
+    None only for a point in no sector AND outside the GOES footprint -- i.e. a genuine gap
+    (e.g. the Indian Ocean / central Asia), not an OCONUS-is-unsupported signal."""
     hits = [r for r in SAT_REGIONS.values() if r.bbox and _in_bbox(r.bbox, lat, lon)]
     if hits:
         def _center_km(r: SatRegion) -> float:

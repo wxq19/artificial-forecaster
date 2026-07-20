@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1117,17 +1118,41 @@ def insert_evaluation(con: duckdb.DuckDBPyConnection, ev: dict) -> None:
     )
 
 
-def pending_evaluations(con: duckdb.DuckDBPyConnection,
-                        before: datetime | None = None) -> list[dict]:
-    """Pending evaluation rows whose validity window has fully ELAPSED (valid_to <=
-    `before`, default now) -- the work list for score_taf.py --pending. Oldest first,
-    so a backlog scores in collection order."""
+def evaluations_by_status(con: duckdb.DuckDBPyConnection,
+                          statuses: Sequence[str],
+                          before: datetime | None = None) -> list[dict]:
+    """Evaluation rows in any of `statuses` whose validity window has fully ELAPSED
+    (valid_to <= `before`, default now). Oldest first, so a backlog processes in
+    collection order. `statuses=('pending',)` is the routine work list; the scored /
+    partial statuses are the RESCORE work list (re-running a finished evaluation at a
+    newer scorer_version -- the result tables are append-only, so v1 rows survive)."""
     cutoff = _to_naive_utc(before) if before else datetime.now(timezone.utc).replace(tzinfo=None)
+    placeholders = ", ".join("?" for _ in statuses)
     cur = con.execute(
-        "SELECT * FROM evaluations WHERE status = 'pending' AND valid_to <= ? "
-        "ORDER BY valid_to, evaluation_id", [cutoff])
+        f"SELECT * FROM evaluations WHERE status IN ({placeholders}) AND valid_to <= ? "
+        "ORDER BY valid_to, evaluation_id", [*statuses, cutoff])
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def pending_evaluations(con: duckdb.DuckDBPyConnection,
+                        before: datetime | None = None) -> list[dict]:
+    """Pending evaluation rows whose validity window has fully ELAPSED -- the routine
+    work list for score_taf.py --pending."""
+    return evaluations_by_status(con, ("pending",), before=before)
+
+
+def evaluation_scored_at_version(con: duckdb.DuckDBPyConnection, evaluation_id: str,
+                                 table: str, scorer_version: str) -> bool:
+    """True if this evaluation already has a result row in `table` (a *_runs table) at
+    `scorer_version` -- lets a rescore pass skip evaluations that are already current
+    instead of re-deriving them. Assumes init_results_schema has run."""
+    if table not in _SCORER_RUN_TABLES:
+        raise ValueError(f"unknown scorer runs table: {table}")
+    row = con.execute(
+        f"SELECT 1 FROM {table} WHERE evaluation_id = ? AND scorer_version = ? LIMIT 1",
+        [evaluation_id, scorer_version]).fetchone()
+    return row is not None
 
 
 def finalize_evaluation(con: duckdb.DuckDBPyConnection, evaluation_id: str, *,
@@ -1315,6 +1340,10 @@ def scoring_window(
 # ---------------------------------------------------------------------------
 
 SCORING_SCHEMA_VERSION = "1"    # bump when any result-table shape changes
+
+# The three per-scorer provenance tables. Named here so callers can ask "is this
+# evaluation already scored at version X?" without composing SQL of their own.
+_SCORER_RUN_TABLES = ("tafver_runs", "tafamend_runs", "tafskill_runs")
 
 # Provenance columns shared by all three *_runs tables.
 _SCORER_RUN_COLS = """
@@ -1666,6 +1695,154 @@ def insert_tafskill_result(con: duckdb.DuckDBPyConnection, meta: dict, score: di
     except Exception:
         con.execute("ROLLBACK")
         raise
+
+
+# --- cross-evaluation readers (scripts/results_report.py). Two invariants hold across
+# --- all of them, and both are load-bearing:
+# ---
+# --- 1. Keyed on scorer_version. The result tables are append-only, so a rescored DB
+# ---    holds v1 AND v2 rows for the same evaluation; an unfiltered read silently pools
+# ---    two scorer versions. Callers pass the version they mean.
+# ---
+# --- 2. INNER join to `evaluations`. `subject='subject'` means "the forecast under
+# ---    test", which is NOT always the agent: score_taf.py --archive-difficulty scores
+# ---    archived HUMAN TAFs standalone under the same subject label, with no evaluation
+# ---    row (producer_kind='human' distinguishes them). The inner join is what keeps
+# ---    difficulty-mining rows out of model results -- do not relax it to a LEFT JOIN.
+
+def scorer_versions(con: duckdb.DuckDBPyConnection) -> list[str]:
+    """Distinct tafver scorer_versions present, ascending -- so a reader can default to
+    the newest instead of silently pooling an unrescored mix."""
+    rows = con.execute(
+        "SELECT DISTINCT scorer_version FROM tafver_runs WHERE scorer_version IS NOT NULL"
+    ).fetchall()
+    return sorted((str(r[0]) for r in rows), key=lambda s: (len(s), s))
+
+
+def evaluation_points(con: duckdb.DuckDBPyConnection, *,
+                      scorer_version: str | None = None) -> list[dict]:
+    """Pooled TAFVER points per (evaluation, subject), with the evaluation's station
+    and window. One row per subject per evaluation; the caller sums earned/available
+    across rows to pool (never averages the per-row percentages)."""
+    sql = ("SELECT tr.evaluation_id, e.station, e.valid_from, e.valid_to, tr.subject, "
+           "SUM(h.points_earned) AS earned, SUM(h.points_available) AS available "
+           "FROM tafver_hourly h JOIN tafver_runs tr USING (scorer_run_id) "
+           "JOIN evaluations e ON e.evaluation_id = tr.evaluation_id "
+           "WHERE h.status = 'scored'")
+    params: list = []
+    if scorer_version is not None:
+        sql += " AND tr.scorer_version = ?"
+        params.append(scorer_version)
+    cur = con.execute(sql + " GROUP BY 1,2,3,4,5", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def element_points(con: duckdb.DuckDBPyConnection, *,
+                   scorer_version: str | None = None) -> list[dict]:
+    """Pooled TAFVER points per (station, subject, element) across evaluations."""
+    sql = ("SELECT tr.evaluation_id, e.station, tr.subject, h.element, "
+           "SUM(h.points_earned) AS earned, SUM(h.points_available) AS available "
+           "FROM tafver_hourly h JOIN tafver_runs tr USING (scorer_run_id) "
+           "JOIN evaluations e ON e.evaluation_id = tr.evaluation_id "
+           "WHERE h.status = 'scored'")
+    params: list = []
+    if scorer_version is not None:
+        sql += " AND tr.scorer_version = ?"
+        params.append(scorer_version)
+    cur = con.execute(sql + " GROUP BY 1,2,3,4", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def element_errors(con: duckdb.DuckDBPyConnection, *, scorer_version: str | None = None,
+                   grain: str = "hour") -> list[dict]:
+    """Signed/absolute element errors per (station, subject, element) from the skill
+    scorer, WITH the scored/unavailable split. The unavailable count matters: ceiling,
+    visibility and gust are only comparable on hours where BOTH forecast and observation
+    carried a finite value, so a bias figure without its coverage is misleading."""
+    sql = ("SELECT r.evaluation_id, e.station, r.subject, w.element, "
+           "SUM(CASE WHEN w.status = 'scored' THEN 1 ELSE 0 END) AS n_scored, "
+           "SUM(CASE WHEN w.status <> 'scored' THEN 1 ELSE 0 END) AS n_unavailable, "
+           "AVG(CASE WHEN w.status = 'scored' THEN w.signed_error END) AS bias, "
+           "AVG(CASE WHEN w.status = 'scored' THEN w.abs_error END) AS mae "
+           "FROM tafskill_element_rows w JOIN tafskill_runs r USING (scorer_run_id) "
+           "JOIN evaluations e ON e.evaluation_id = r.evaluation_id "
+           "WHERE w.grain = ?")
+    params: list = [grain]
+    if scorer_version is not None:
+        sql += " AND r.scorer_version = ?"
+        params.append(scorer_version)
+    cur = con.execute(sql + " GROUP BY 1,2,3,4", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def lead_points(con: duckdb.DuckDBPyConnection, *,
+                scorer_version: str | None = None) -> list[dict]:
+    """Pooled TAFVER points per (subject, element, lead_hr), carrying the verifying
+    hour-of-day and the producing run's matrix cell.
+
+    `obs_hour` is what makes the lead-time read defensible: with fixed issue cycles a
+    given lead can land on the same clock hour every time, which would alias diurnal
+    behaviour into an apparent lead effect. Keeping the hour lets the report show that
+    each lead bin spans the whole day instead of assuming it.
+
+    `config_id` is the cell of the run that produced the evaluation's subject TAF; it is
+    only meaningful on subject rows (a human TAF has no matrix cell). `evaluation_id` is
+    kept on every row so a caller can restrict to a subset (e.g. the human-paired one)
+    without the aggregate silently covering evaluations the subset excluded."""
+    sql = ("SELECT tr.evaluation_id, tr.subject, h.element, h.lead_hr, "
+           "CAST(EXTRACT(hour FROM h.interval_start) AS INTEGER) AS obs_hour, "
+           "r.config_id, e.station, "
+           "SUM(h.points_earned) AS earned, SUM(h.points_available) AS available "
+           "FROM tafver_hourly h JOIN tafver_runs tr USING (scorer_run_id) "
+           "JOIN evaluations e ON e.evaluation_id = tr.evaluation_id "
+           "LEFT JOIN runs r ON e.taf_id = r.taf_id "
+           "WHERE h.status = 'scored' AND h.lead_hr IS NOT NULL")
+    params: list = []
+    if scorer_version is not None:
+        sql += " AND tr.scorer_version = ?"
+        params.append(scorer_version)
+    cur = con.execute(sql + " GROUP BY 1,2,3,4,5,6,7", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def lead_errors(con: duckdb.DuckDBPyConnection, *, scorer_version: str | None = None,
+                grain: str = "hour") -> list[dict]:
+    """Signed/absolute element errors per (subject, element, lead_hr) -- the
+    un-thresholded companion to lead_points, where a TAFVER MOP's tolerance band would
+    otherwise hide a steadily growing error."""
+    sql = ("SELECT r.evaluation_id, r.subject, w.element, w.lead_hr, "
+           "COUNT(*) AS n_scored, AVG(w.signed_error) AS bias, AVG(w.abs_error) AS mae "
+           "FROM tafskill_element_rows w JOIN tafskill_runs r USING (scorer_run_id) "
+           "JOIN evaluations e ON e.evaluation_id = r.evaluation_id "
+           "WHERE w.status = 'scored' AND w.lead_hr IS NOT NULL AND w.grain = ?")
+    params: list = [grain]
+    if scorer_version is not None:
+        sql += " AND r.scorer_version = ?"
+        params.append(scorer_version)
+    cur = con.execute(sql + " GROUP BY 1,2,3,4", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def run_evaluations(con: duckdb.DuckDBPyConnection) -> list[dict]:
+    """Every scored evaluation joined to the run that produced its TAF (via taf_id),
+    carrying the run's orchestration provenance (steps, tool calls, tools_used_json,
+    stop_reason, convergence, tokens). The join is taf_id because `evaluations` has no
+    run_id: a run's emitted TAF is the link between the two."""
+    cur = con.execute(
+        "SELECT e.evaluation_id, e.station, e.valid_from, e.valid_to, e.status, "
+        "r.run_id, r.experiment_id, r.model, r.config_id, r.temperature, "
+        "r.worksheet_mode, r.toolset_hash, r.n_steps, r.n_tool_calls, r.tools_used_json, "
+        "r.stop_reason, r.convergence, r.taf_clean, r.prompt_tokens, r.completion_tokens "
+        "FROM evaluations e JOIN runs r ON e.taf_id = r.taf_id "
+        "WHERE e.status = 'scored' ORDER BY e.valid_from"
+    )
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 # --- batch aggregators (sec 11): SUM tall rows across runs; scoring math beyond

@@ -30,7 +30,7 @@ from datetime import datetime, time, timedelta
 from pydantic import BaseModel
 
 from forecaster.metar import CloudLayer, _parse_vis
-from forecaster.tafparse import TafGroup, TafObs, WindOverride
+from forecaster.tafparse import TafGroup, TafObs, TafTemp, WindOverride
 
 
 def stable_hash(payload) -> str:
@@ -221,6 +221,176 @@ def persistence_taf(ob: dict, valid_from: datetime, valid_to: datetime) -> TafOb
         qnh_inhg=ob.get("altimeter_inhg"), prevailing=g, groups=[],
         max_temp=None, min_temp=None,
         raw=f"PERSISTENCE {ob['station']} from ob @ {ob.get('obs_time')}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Climatology baseline. The THIRD naive floor beside persistence: what the season
+# usually does at this station-hour, with no knowledge of the current state at all.
+# Built from the climo_* PRODUCT rows (store.climo_hours / climo_month) -- this module
+# stays pure, so the caller does the reading.
+#
+# POLICY (owner-decided 2026-07-20), deliberately uncommitted rather than tuned:
+#  - ceiling/vis: the p50 of the stored exceedance ladder. At most roster stations
+#    every pct_lt is under 50%, so this resolves to unrestricted -- which is the honest
+#    climatological median AND costs nothing, since TAFVER scores cig/vis by CATEGORY
+#    and the top bands (>=2000 ft, >=3.0 SM) sit above the ladder's coarsest rungs.
+#  - wind direction: ALWAYS the modal sector's mid-bearing, never VRB. VRB would make
+#    tafver._score_wind_dir return `unavailable` and drop the hour from the
+#    sum(earned)/sum(available) denominator -- a scoring opt-out the human and the model
+#    do not get, so the baseline would stop being comparable. Where the mode is weak
+#    (KMIB July ~13%, barely over the 6.25% uniform-random share) the resulting flap is
+#    a real finding about climatology, not a defect to smooth away. A resultant
+#    vector-mean direction is the better statistic and rides the next climo rebuild.
+#  - gust / weather: included only when they are the MEDIAN condition (>=50%), same p50
+#    rule -- so in practice neither appears.
+# ---------------------------------------------------------------------------
+
+# 16-point compass sector -> mid-bearing on the AFMAN nearest-10 grid (north = 360).
+_SECTOR_DEG = {
+    "N": 360, "NNE": 20, "NE": 50, "ENE": 70, "E": 90, "ESE": 110,
+    "SE": 140, "SSE": 160, "S": 180, "SSW": 200, "SW": 230, "WSW": 250,
+    "W": 270, "WNW": 290, "NW": 320, "NNW": 340,
+}
+
+# Cumulative exceedance ladders as stored, worst -> best. (threshold, column).
+_CIG_LADDER = [(200, "pct_cig_lt_200"), (500, "pct_cig_lt_500"), (1000, "pct_cig_lt_1000"),
+               (1500, "pct_cig_lt_1500"), (3000, "pct_cig_lt_3000")]
+_VIS_LADDER = [(0.5, "pct_vis_lt_half"), (1.0, "pct_vis_lt_1"), (2.0, "pct_vis_lt_2"),
+               (3.0, "pct_vis_lt_3"), (5.0, "pct_vis_lt_5")]
+
+
+def _ladder_percentile(row: dict, ladder, pct: float = 50.0) -> float | None:
+    """Invert a cumulative exceedance ladder to a value at `pct`. Linear interpolation
+    between the two bracketing rungs; None means the percentile lies ABOVE the ladder's
+    top rung, i.e. unrestricted. NULL rungs are skipped, not treated as zero."""
+    prev_t, prev_p = 0.0, 0.0
+    for thr, col in ladder:
+        p = row.get(col)
+        if p is None:
+            continue
+        if p >= pct:
+            span = p - prev_p
+            frac = 0.0 if span <= 0 else (pct - prev_p) / span
+            return prev_t + frac * (thr - prev_t)
+        prev_t, prev_p = float(thr), float(p)
+    return None
+
+
+def _climo_state(row: dict, monthly: dict) -> State:
+    """One climo_hourly row -> the typical State for that station-month-hour."""
+    s = State()
+
+    speed = row.get("wind_mean_kt")
+    if speed is not None:
+        s.wind_speed = int(round(speed))
+        s.wind_speed_status = SPD_NUMERIC
+        deg = _SECTOR_DEG.get(row.get("dir_mode_sector") or "")
+        if deg is not None:
+            s.wind_dir, s.wind_dir_status = deg, DIR_NUMERIC
+
+    gust_pct, gust_p90 = row.get("gust_pct"), row.get("gust_p90_kt")
+    if gust_pct is not None and gust_pct >= 50.0 and gust_p90:
+        s.wind_gust, s.gust_status = int(round(gust_p90)), GUST_PRESENT
+    else:
+        s.gust_status = GUST_KNOWN_ABSENT
+
+    cig = _ladder_percentile(row, _CIG_LADDER)
+    if cig is None:
+        s.ceiling_status = CEIL_KNOWN_UNLIMITED
+    else:
+        s.ceiling_ft = max(100, int(round(cig / 100.0)) * 100)
+        s.ceiling_status = CEIL_KNOWN_NUMERIC
+
+    vis = _ladder_percentile(row, _VIS_LADDER)
+    if vis is None:
+        s.vis_status = VIS_KNOWN_UNLIMITED
+    else:
+        # Convert through the Table 8.1 lookup seam, never a raw multiply.
+        sm = round(vis, 2)
+        _, s.vis_m, _ = _parse_vis(f"{sm}SM")
+        s.vis_sm, s.vis_status = sm, VIS_KNOWN_NUMERIC
+
+    # No phenomenon is ever the median condition (roster July TS/fog are low single
+    # digits), so the p50 rule yields "no significant weather" -- stated, not unknown.
+    s.weather, s.weather_status = [], WX_KNOWN
+
+    alt = (monthly or {}).get("alt_mean")
+    if alt is not None:
+        s.qnh_inhg, s.qnh_status = round(alt, 2), QNH_KNOWN
+    return s
+
+
+def _same_state(a: State, b: State) -> bool:
+    """Equality on the elements a TAF group actually encodes (ignores provenance)."""
+    keys = ("wind_dir", "wind_dir_status", "wind_speed", "wind_speed_status",
+            "wind_gust", "gust_status", "vis_sm", "vis_status",
+            "ceiling_ft", "ceiling_status", "qnh_inhg", "qnh_status")
+    return all(getattr(a, k) == getattr(b, k) for k in keys) and a.weather == b.weather
+
+
+def _temp_extreme_hour(hourly: list[dict], valid_from: datetime, valid_to: datetime,
+                       warmest: bool) -> datetime | None:
+    """The climatologically warmest/coolest UTC hour, resolved to the first occurrence
+    inside the TX/TN window [valid_from, valid_to - 6h] (tafgen's uniform temp window)."""
+    rows = [r for r in hourly if r.get("temp_mean_c") is not None]
+    if not rows:
+        return None
+    pick = (max if warmest else min)(rows, key=lambda r: r["temp_mean_c"])
+    end = valid_to - timedelta(hours=6)
+    t = valid_from
+    while t <= end:
+        if t.hour == pick["hour_utc"]:
+            return t
+        t += timedelta(hours=1)
+    return None
+
+
+def climatology_taf(station: str, hourly: list[dict], monthly: dict,
+                    valid_from: datetime, valid_to: datetime) -> TafObs:
+    """The CLIMATOLOGY baseline: a TAF built only from station-month-hour climatology,
+    with zero knowledge of current conditions. `hourly` is store.climo_hours(station,
+    month) and `monthly` is store.climo_month(station, month). Consecutive hours whose
+    typical state is identical collapse into one group: the first becomes the prevailing
+    period, each later change an FM group."""
+    by_hour = {r["hour_utc"]: r for r in hourly if r.get("hour_utc") is not None}
+    if not by_hour:
+        raise ValueError(f"no climo_hourly rows for {station}; build climo for this month first")
+
+    segments: list[tuple[datetime, State]] = []
+    t = valid_from
+    while t < valid_to:
+        row = by_hour.get(t.hour)
+        if row is not None:
+            state = _climo_state(row, monthly)
+            if not segments or not _same_state(segments[-1][1], state):
+                segments.append((t, state))
+        t += timedelta(hours=1)
+    if not segments:
+        raise ValueError(f"climo for {station} covers no hour of {valid_from}..{valid_to}")
+
+    prevailing = _state_to_group(segments[0][1], change_type=None, probability=None,
+                                 start=valid_from, end=valid_to)
+    groups = [_state_to_group(s, change_type="FM", probability=None, start=start, end=None)
+              for start, s in segments[1:]]
+
+    def _temp(warmest: bool) -> TafTemp | None:
+        value = (monthly or {}).get("tx_mean" if warmest else "tn_mean")
+        at = _temp_extreme_hour(hourly, valid_from, valid_to, warmest)
+        if value is None or at is None:
+            return None
+        return TafTemp(temp_c=int(round(value)), day=at.day, hour=at.hour)
+
+    return TafObs(
+        station=station, issue_day=valid_from.day,
+        issue_time=time(valid_from.hour, valid_from.minute),
+        valid_from_day=valid_from.day, valid_from_hour=valid_from.hour,
+        valid_to_day=valid_to.day, valid_to_hour=valid_to.hour,
+        amendment=False, corrected=False, nil=False, canceled=False,
+        qnh_inhg=(monthly or {}).get("alt_mean"), prevailing=prevailing, groups=groups,
+        max_temp=_temp(True), min_temp=_temp(False),
+        raw=(f"CLIMATOLOGY {station} month={(monthly or {}).get('month')} "
+             f"por={(monthly or {}).get('por_start_year')}-{(monthly or {}).get('por_end_year')}"),
     )
 
 

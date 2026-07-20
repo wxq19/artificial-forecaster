@@ -19,6 +19,7 @@ Usage:
   uv run python scripts/score_taf.py --taf-text 'TAF KBLV ...' --issue-date 2026-07-09 \\
       --scorers amend --baselines persistence
   uv run python scripts/score_taf.py --pending --backfill iem
+  uv run python scripts/score_taf.py --pending --rescore --backfill iem   # whole round -> current version
 """
 
 import argparse
@@ -34,7 +35,7 @@ from forecaster.tafskill import SkillPolicy, TafSkillScore, score_skill, skill_d
 from forecaster.tafver import TafverPolicy, TafverScore, obs_hash, score_tafver
 from forecaster.tafstate import (
     TruthPolicy, absolute_validity, composite_taf, default_profile, parse_wind_after,
-    persistence_taf, stable_hash,
+    climatology_taf, persistence_taf, stable_hash,
 )
 
 
@@ -153,6 +154,14 @@ def run(
                                      anchor=anchor["obs_time"]))
         else:
             results.append({"name": "persistence", **unavailable})
+    if "climo" in baselines:
+        try:
+            month = _climo_month(con, station, vf)
+            ctaf = climatology_taf(station, store.climo_hours(con, station, month),
+                                   store.climo_month(con, station, month), vf, vt)
+            results.append(score_one("climo", ctaf))
+        except Exception as e:  # noqa: BLE001 -- an unbuilt month is reported, not fatal
+            results.append({"name": "climo", **unavailable, "error": f"{type(e).__name__}: {e}"})
 
     report = _markdown(station, vf, vt, canonical, obs, results)
     return {"station": station, "valid_from": vf, "valid_to": vt, "canonical": canonical,
@@ -328,12 +337,25 @@ def _coverage(obs: list[dict], vf: datetime, vt: datetime) -> dict:
                               for h in missing]}
 
 
+def _climo_month(con, station: str, valid_from: datetime) -> int:
+    """The climo month to read for a window starting at `valid_from`. climo month
+    membership is LOCAL (climo.py), so convert through the station's fixed standard
+    offset rather than reading the UTC month -- for PAED (-9) a 01Z 1 August window is
+    still July locally."""
+    meta = store.climo_meta(con, station) or {}
+    off = meta.get("utc_offset_hours_std")
+    local = valid_from + timedelta(hours=off) if off is not None else valid_from
+    return local.month
+
+
 def _producer_meta(con, r: dict) -> dict:
     """producer_kind/name for one result entry: read from the archived TAF row when the
-    entry has one; the synthetic persistence baseline has neither."""
+    entry has one; the synthetic persistence/climo baselines have neither."""
     if r["name"] == "persistence":
         return {"producer_kind": "baseline",
                 "producer_name": f"persistence-{PERSISTENCE_MAX_AGE_MIN}min"}
+    if r["name"] == "climo":
+        return {"producer_kind": "baseline", "producer_name": "climatology-p50"}
     if r["name"] == "human_composite":      # synthetic routine+amendments effective forecast
         return {"producer_kind": "human", "producer_name": "composite"}
     if r.get("taf_id"):
@@ -457,19 +479,74 @@ def _score_pending_one(ev: dict, args) -> str:
     return status
 
 
+# scorer name (as passed to --scorers) -> (module owning SCORER_VERSION, result runs
+# table). The VERSION is read off the module at call time, never cached here, so the
+# scorer module stays its single source of truth.
+_SCORER_MODULES = {
+    "tafver": (tafver, "tafver_runs"),
+    "amend": (tafamend, "tafamend_runs"),
+    "skill": (tafskill, "tafskill_runs"),
+}
+
+
+def _target_versions(scorers: list[str]) -> dict[str, str]:
+    """Current scorer_version per requested scorer -- what a rescore pass targets."""
+    return {n: _SCORER_MODULES[n][0].SCORER_VERSION
+            for n in scorers if n in _SCORER_MODULES}
+
+
+def _already_current(con, evaluation_id: str, scorers: list[str]) -> bool:
+    """True if EVERY requested scorer already has a result row for this evaluation at
+    its CURRENT version -- so a rescore pass can skip it instead of re-deriving truth.
+    Any scorer behind its version (or absent) makes the whole evaluation due."""
+    for name in scorers:
+        entry = _SCORER_MODULES.get(name)
+        if entry is None:
+            continue
+        mod, table = entry
+        if not store.evaluation_scored_at_version(con, evaluation_id, table,
+                                                  mod.SCORER_VERSION):
+            return False
+    return True
+
+
 def cmd_pending(args) -> int:
     """The post-validity pass: score every pending evaluation whose window has been
-    fully elapsed for at least --grace-hours (lets the trailing obs settle)."""
+    fully elapsed for at least --grace-hours (lets the trailing obs settle).
+
+    With --rescore the work list WIDENS to already-finished (scored/partial)
+    evaluations as well, so a whole round can be brought onto a newer scorer_version
+    uniformly. This is safe by construction: the result tables are append-only and
+    keyed on scorer_version, so a rescore ADDS v2 rows and leaves the v1 rows intact
+    for comparison. The evaluation spine row IS re-stamped (status/scored_at/obs_hash/
+    coverage), because it reflects the most recent scoring pass. Evaluations already
+    current at every requested scorer's version are skipped, making the pass re-runnable."""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    statuses = ("pending", "scored", "partial") if args.rescore else ("pending",)
     with store.write_lock(args.db):
         con = store.connect(args.db)
         try:
             store.init_scoring_schema(con)
             store.init_results_schema(con)
-            pend = store.pending_evaluations(con, before=now - timedelta(hours=args.grace_hours))
+            pend = store.evaluations_by_status(
+                con, statuses, before=now - timedelta(hours=args.grace_hours))
+            if args.rescore:
+                due, current = [], 0
+                for ev in pend:
+                    if ev["status"] != "pending" and _already_current(
+                            con, ev["evaluation_id"], args.scorers_list):
+                        current += 1
+                    else:
+                        due.append(ev)
+                pend = due
+                versions = ", ".join(f"{n}=v{v}"
+                                     for n, v in _target_versions(args.scorers_list).items())
+                print(f"rescore: target versions {versions}; "
+                      f"{current} evaluation(s) already current, skipped")
         finally:
             con.close()
-    print(f"[{now:%Y-%m-%dT%H:%MZ}] {len(pend)} pending evaluation(s) with elapsed windows")
+    label = "evaluation(s) to (re)score" if args.rescore else "pending evaluation(s)"
+    print(f"[{now:%Y-%m-%dT%H:%MZ}] {len(pend)} {label} with elapsed windows")
     outcomes: dict[str, int] = {}
     failed = 0
     for ev in pend:
@@ -581,12 +658,15 @@ def main() -> int:
                      help="difficulty-score every elapsed archived human TAF standalone (persists)")
     ap.add_argument("--station", help="--archive-difficulty: limit to one ICAO")
     ap.add_argument("--rescore", action="store_true",
-                    help="--archive-difficulty: re-score TAFs that already have a result")
+                    help="re-score subjects that already have a result: with "
+                         "--archive-difficulty, archived human TAFs; with --pending, "
+                         "finished (scored/partial) evaluations, so a whole round can be "
+                         "brought onto the current scorer_version (append-only; v1 rows kept)")
     ap.add_argument("--issue-date", help="issue DATE (YYYY-MM-DD) for --taf-text/--taf-file")
     ap.add_argument("--scorers", default=None,
                     help="default: amend (ad-hoc) / tafver,amend,skill (--pending)")
     ap.add_argument("--baselines", default=None,
-                    help="default: persistence (ad-hoc) / persistence,human (--pending)")
+                    help="default: persistence (ad-hoc) / persistence,climo,human (--pending)")
     ap.add_argument("--backfill", choices=["iem"],
                     help="--pending: backfill missing truth obs from this source")
     ap.add_argument("--allow-partial", action="store_true",
@@ -599,7 +679,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.pending:
-        default_scorers, default_baselines = "tafver,amend,skill", "persistence,human"
+        default_scorers, default_baselines = "tafver,amend,skill", "persistence,climo,human"
     elif args.archive_difficulty:
         default_scorers, default_baselines = "tafver,amend", "persistence"
     else:

@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))   # import the sibling 
 
 from score_taf import _coverage, cmd_pending, persist_scores, run as score_run  # noqa: E402
 
-from forecaster import store  # noqa: E402
+from forecaster import store, tafamend, tafskill, tafver  # noqa: E402
 from forecaster.metar import parse as metar_parse  # noqa: E402
 from forecaster.tafarchive import build_taf_row  # noqa: E402
 
@@ -44,7 +44,7 @@ def check(label, cond, detail=""):
 
 def mk_args(**over):
     a = argparse.Namespace(db=DB, backfill=None, allow_partial=False,
-                           grace_hours=0.0, min_coverage=0.9,
+                           grace_hours=0.0, min_coverage=0.9, rescore=False,
                            scorers_list=["tafver", "amend", "skill"],
                            baselines_list=["persistence", "human"])
     for k, v in over.items():
@@ -198,6 +198,55 @@ def main() -> int:
     check("partial coverage manifest records the gap",
           json.loads(evs["coverage_manifest_json"])["fraction"] < 0.9)
     check("ev_future still pending after both passes",
+          store.evaluation(con, "ev_future")["status"] == "pending")
+    con.close()
+
+    # --- rescore: a finished evaluation is invisible WITHOUT --rescore ---
+    con = store.connect(DB, read_only=True)
+    v1_runs = table_count(con, "tafver_runs")
+    v1_hourly = table_count(con, "tafver_hourly")
+    scored_at_1 = store.evaluation(con, "ev_full")["scored_at"]
+    con.close()
+    rc = cmd_pending(mk_args())
+    con = store.connect(DB, read_only=True)
+    check("plain --pending never reselects a scored evaluation",
+          rc == 0 and table_count(con, "tafver_runs") == v1_runs,
+          f"rc={rc} runs {table_count(con, 'tafver_runs')} vs {v1_runs}")
+    con.close()
+
+    # --- rescore at the SAME version: everything current -> zero new rows ---
+    rc = cmd_pending(mk_args(rescore=True, allow_partial=True))
+    con = store.connect(DB, read_only=True)
+    check("--rescore at the current version is a no-op (re-runnable)",
+          rc == 0 and table_count(con, "tafver_runs") == v1_runs,
+          f"rc={rc} runs {table_count(con, 'tafver_runs')} vs {v1_runs}")
+    con.close()
+
+    # --- rescore after a VERSION BUMP: new rows appended, old rows preserved ---
+    old_versions = (tafver.SCORER_VERSION, tafamend.SCORER_VERSION, tafskill.SCORER_VERSION)
+    tafver.SCORER_VERSION = tafamend.SCORER_VERSION = tafskill.SCORER_VERSION = "test-next"
+    try:
+        rc = cmd_pending(mk_args(rescore=True, allow_partial=True))
+    finally:
+        tafver.SCORER_VERSION, tafamend.SCORER_VERSION, tafskill.SCORER_VERSION = old_versions
+
+    con = store.connect(DB, read_only=True)
+    kept = con.execute("SELECT count(*) FROM tafver_runs WHERE scorer_version = ?",
+                       [old_versions[0]]).fetchone()[0]
+    added = con.execute("SELECT count(*) FROM tafver_runs WHERE scorer_version = 'test-next'"
+                        ).fetchone()[0]
+    check("rescore after a version bump appends new runs",
+          rc == 0 and added == v1_runs, f"rc={rc} added={added} expected={v1_runs}")
+    check("rescore PRESERVES the old-version rows (append-only archive)",
+          kept == v1_runs, f"kept={kept} expected={v1_runs}")
+    check("rescore appends tall rows too (both versions retained)",
+          table_count(con, "tafver_hourly") == v1_hourly * 2,
+          f"{table_count(con, 'tafver_hourly')} vs {v1_hourly * 2}")
+    check("both versions are separable by scorer_version for comparison",
+          len(con.execute("SELECT DISTINCT scorer_version FROM tafver_runs").fetchall()) == 2)
+    check("rescore re-stamps the evaluation spine (scored_at advances)",
+          store.evaluation(con, "ev_full")["scored_at"] >= scored_at_1)
+    check("ev_future never selected by a rescore pass either",
           store.evaluation(con, "ev_future")["status"] == "pending")
     con.close()
 
