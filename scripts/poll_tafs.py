@@ -62,7 +62,9 @@ def main() -> int:
                 else:
                     print(f"  {icao}: no change ({len(rows)} current)")
                 for raw, err in errors:
-                    print(f"    ! parse error: {err} :: {raw[:60]}")
+                    # full bulletin, not a prefix: the malformation is usually in a LATE
+                    # change group, and a truncated log line cannot be diagnosed later.
+                    print(f"    ! {err}\n      {raw.strip()}")
         finally:
             con.close()
 

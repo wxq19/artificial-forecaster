@@ -184,11 +184,18 @@ def fetch_taf_rows(
     rows: list[dict] = []
     for issue, raw in fetch_taf(station):
         try:
+            # quarantine: a malformed human bulletin is still archived (raw + header
+            # window), because losing it loses both a scoring baseline and the evidence
+            # that a human made a coding error at all.
             row = build_taf_row(raw, issue_ref=issue, producer_kind=producer_kind,
-                                producer_name=producer_name, source=source, canonical=canonical)
-        except Exception as e:  # noqa: BLE001 -- a bad bulletin is logged & skipped, not fatal
+                                producer_name=producer_name, source=source,
+                                canonical=canonical, on_parse_error="quarantine")
+        except Exception as e:  # noqa: BLE001 -- header unreadable too: log & skip, not fatal
             parse_errors.append((raw, str(e)))
             continue
+        if row["parse_status"] != "ok":
+            parse_errors.append((raw, f"{row['parse_status']}: "
+                                      f"{row['parse_error'] or row['repairs_json']}"))
         rows.append(row)
     return rows, parse_errors
 

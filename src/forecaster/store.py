@@ -927,7 +927,10 @@ CREATE TABLE IF NOT EXISTS tafs (
     source                    VARCHAR,              -- worksheet|awc_snapshot|import|baseline_synth
     canonical                 BOOLEAN,              -- False for unprovable post-hoc imports
     raw_taf                   VARCHAR   NOT NULL,    -- exact received bulletin, byte-for-byte
-    parse_body                VARCHAR,              -- remark-stripped text fed to tafparse (audit)
+    parse_body                VARCHAR,              -- remark-stripped/repaired text fed to tafparse
+    parse_status              VARCHAR,              -- ok|repaired|failed (failed = quarantined)
+    parse_error               VARCHAR,              -- exception text when parse_status='failed'
+    repairs_json              JSON,                 -- [[before, after], ...] validity repairs
     taf_product_json          JSON,                 -- TafProduct JSON for artificial TAFs (lossless)
     construction_json         JSON,                 -- synthetic-baseline construction inputs
     worksheet_id              VARCHAR,
@@ -964,6 +967,8 @@ CREATE TABLE IF NOT EXISTS evaluations (
 # Columns added after the evaluations table first shipped (CREATE TABLE IF NOT
 # EXISTS never adds columns to an existing table; bring older DBs forward).
 _EVALUATIONS_MIGRATIONS = (("taf_id", "VARCHAR"), ("scored_at", "TIMESTAMP"))
+_TAFS_MIGRATIONS = (("parse_status", "VARCHAR"), ("parse_error", "VARCHAR"),
+                    ("repairs_json", "JSON"))
 
 
 def init_scoring_schema(con: duckdb.DuckDBPyConnection) -> None:
@@ -974,6 +979,8 @@ def init_scoring_schema(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(_EVALUATIONS_DDL)
     for col, typ in _EVALUATIONS_MIGRATIONS:
         con.execute(f"ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS {col} {typ}")
+    for col, typ in _TAFS_MIGRATIONS:
+        con.execute(f"ALTER TABLE tafs ADD COLUMN IF NOT EXISTS {col} {typ}")
 
 
 def insert_taf(con: duckdb.DuckDBPyConnection, taf: dict) -> bool:
@@ -984,7 +991,8 @@ def insert_taf(con: duckdb.DuckDBPyConnection, taf: dict) -> bool:
     cols = [
         "taf_id", "station", "issue_time_utc", "valid_from_utc", "valid_to_utc",
         "original_cycle_start_utc", "bulletin_type", "producer_kind", "producer_name",
-        "source", "canonical", "raw_taf", "parse_body", "taf_product_json",
+        "source", "canonical", "raw_taf", "parse_body", "parse_status",
+        "parse_error", "repairs_json", "taf_product_json",
         "construction_json", "worksheet_id", "experiment_id", "run_id",
         "parent_taf_id", "supersedes_taf_id", "content_sha256", "archived_at",
     ]
@@ -1247,6 +1255,20 @@ def run(con: duckdb.DuckDBPyConnection, run_id: str) -> dict | None:
     cols = [d[0] for d in cur.description]
     row = cur.fetchone()
     return dict(zip(cols, row)) if row else None
+
+
+def all_runs(con: duckdb.DuckDBPyConnection, producer_kind: str | None = "artificial") -> list[dict]:
+    """Every run-provenance row (optionally filtered by producer_kind), oldest first --
+    the reader behind read-only rollups like scripts/spend_report.py. JSON columns come
+    back as strings, like run()."""
+    sql = "SELECT * FROM runs"
+    params: list = []
+    if producer_kind is not None:
+        sql += " WHERE producer_kind = ?"
+        params.append(producer_kind)
+    cur = con.execute(sql + " ORDER BY created_at", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def _deserialize_obs(rows: list[dict]) -> list[dict]:

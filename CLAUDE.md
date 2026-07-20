@@ -13,6 +13,21 @@ I am learning this codebase deeply and intentionally. Default to **advisor, not 
 - When you do show code, keep it small and explain *why*, so I understand it, not just copy it.
 - `README.md` is MY personal context/tracker. Do not edit, overwrite, or restructure it.
 
+### VERSION CONTROL IS MINE — HARD RULE, NO EXCEPTIONS
+**NEVER run a git or GitHub command that changes state. I am the ONLY one who commits.**
+- FORBIDDEN, always, even when I asked for the underlying work and even when tests pass:
+  `git commit`, `git push`, `git merge`, `git rebase`, `git reset`, `git tag`,
+  `git checkout`/`switch`/`restore` that discards work, `git stash`, `git branch -d`,
+  and every `gh` write (PR create/merge, release, issue edit).
+- ALLOWED: read-only inspection — `git status`, `git log`, `git diff`, `git show`,
+  `git fetch`, `git rev-parse`, `gh` read commands.
+- Finishing a task means leaving the work **in the working tree, uncommitted**, and
+  telling me what changed. Do not stage it, do not commit it "for review", do not offer
+  to commit as a follow-up. A green test suite is NOT authorization to commit.
+- Deploying to the Pi is a git action too: **do not `git pull` on the Pi.** Tell me what
+  needs deploying and I will pull.
+- If you think something should be committed, say so in one sentence and stop.
+
 ## What this project is
 Testing whether a multi-modal LLM (VLM) can replicate a human Air Force weather
 forecaster. An agentic VLM ingests forecasting data (METARs, TAFs, NWP GRIB files,

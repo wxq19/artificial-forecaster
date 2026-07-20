@@ -14,6 +14,7 @@ exact from raw here, like METAR pressure) and NSW (survives in the raw line).
 
 import re
 from datetime import datetime, time
+from itertools import combinations
 
 from pydantic import BaseModel
 from metar_taf_parser.parser.parser import TAFParser
@@ -216,6 +217,7 @@ class TafObs(BaseModel):
     min_temp: TafTemp | None   # TN
     wind_overrides: list[WindOverride] = []   # 'WND ... AFT DDHH' remarks (set at score time)
     raw: str                   # original line, untouched
+    repairs: list[tuple[str, str]] = []       # (before, after) validity-token repairs applied
 
 
 def _weather(conditions) -> list[str]:
@@ -391,7 +393,93 @@ def _recover_hazards(chunk: str, g: TafGroup) -> None:
     ]
 
 
+# --- malformed-validity repair -------------------------------------------------------
+# Human-typed bulletins carry the occasional fat-finger validity token (observed live:
+# 'BECMG 2100/21001', one digit too many). The library fails its validity regex, never
+# assigns the trend's _validity, then raises AttributeError deep in the group walk -- so
+# ONE stray keystroke loses the whole bulletin. Repair it here, in the same spirit as the
+# QNH/NSW/VCSH recovery below: read what the grammar unambiguously implies, never guess.
+_PERIOD_TOK = re.compile(r"(?<![\d/])(\d{3,6})/(\d{3,6})(?![\d/])")
+
+
+def _tok_ordinal(tok: str) -> int | None:
+    """A DDHH validity token as a sortable ordinal, or None if it is not a legal DDHH."""
+    if len(tok) != 4 or not tok.isdigit():
+        return None
+    day, hour = int(tok[:2]), int(tok[2:])
+    if not (1 <= day <= 31 and 0 <= hour <= 24):
+        return None
+    return day * 100 + hour
+
+
+def _repair_tok(tok: str, lo: int, hi: int) -> str | None:
+    """The unique legal DDHH reading of an over-long token, or None when zero or several
+    readings survive. Candidates are every way of deleting the surplus digits; a survivor
+    must be a legal DDHH inside [lo, hi]. Ambiguity always returns None -- a TAF we cannot
+    read with certainty is quarantined, never guessed at."""
+    surplus = len(tok) - 4
+    if surplus <= 0:
+        return None
+    survivors = set()
+    for drop in combinations(range(len(tok)), surplus):
+        cand = "".join(c for i, c in enumerate(tok) if i not in drop)
+        ordv = _tok_ordinal(cand)
+        if ordv is not None and lo <= ordv <= hi:
+            survivors.add(cand)
+    return survivors.pop() if len(survivors) == 1 else None
+
+
+def repair_validity(raw: str) -> tuple[str, list[tuple[str, str]]]:
+    """Repair over-long change-group validity tokens ('2100/21001' -> '2100/2101') when
+    the TAF's own validity window admits exactly one reading. Returns (text, repairs);
+    an empty repair list means nothing was, or could be, fixed -- callers then quarantine
+    the bulletin rather than dropping it.
+
+    Deliberately conservative: the header token is never rewritten (it is what bounds
+    everything else), and a bulletin whose validity wraps past the month end is skipped
+    outright, since the naive DDHH ordinal cannot order it."""
+    head = _PERIOD_TOK.search(raw)
+    if head is None:
+        return raw, []
+    lo, hi = _tok_ordinal(head.group(1)), _tok_ordinal(head.group(2))
+    if lo is None or hi is None or lo > hi:
+        return raw, []                  # malformed or month-wrapping header: do not guess
+
+    repairs: list[tuple[str, str]] = []
+
+    def _fix(m: re.Match) -> str:
+        if m.start() == head.start():   # the header bounds the repair; it is not a target
+            return m.group(0)
+        a, b = m.group(1), m.group(2)
+        na = a if _tok_ordinal(a) is not None else (_repair_tok(a, lo, hi) or a)
+        start_ord = _tok_ordinal(na)
+        nb = b if _tok_ordinal(b) is not None else (
+            _repair_tok(b, (start_ord + 1) if start_ord is not None else lo, hi) or b)
+        if (na, nb) != (a, b):
+            repairs.append((m.group(0), f"{na}/{nb}"))
+        return f"{na}/{nb}"
+
+    return _PERIOD_TOK.sub(_fix, raw), repairs
+
+
 def parse(line: str) -> TafObs:
+    """Parse a TAF. A bulletin that fails on a malformed validity token is retried ONCE
+    against repair_validity(); the returned TafObs keeps the ORIGINAL raw line and lists
+    what was repaired, so the archive stays byte-exact and the repair is auditable."""
+    raw = line.strip().rstrip("=").strip()
+    try:
+        return _parse_strict(raw)
+    except Exception:
+        repaired, repairs = repair_validity(raw)
+        if not repairs:
+            raise
+        obs = _parse_strict(repaired)
+        obs.raw = raw                   # the archive keeps what the forecaster actually sent
+        obs.repairs = repairs
+        return obs
+
+
+def _parse_strict(line: str) -> TafObs:
     raw = line.strip().rstrip("=").strip()
     t = _PARSER.parse(raw)                          # library handles the 'TAF [AMD|COR]' prefix
 
