@@ -35,12 +35,17 @@ from .config import settings
 # POST {base_url}/{model}/timeseries. gfs+hrrr overlap the BUFKIT set; nbm is the govt
 # multi-model BLEND (a consensus BASELINE, not raw-model spread).
 #   MODELS       = the DEFAULT prefetch set (what modeldata pulls unless told otherwise).
-#   VALID_MODELS = everything the API accepts, INCLUDING ifsoper (ECMWF IFS). IFS is kept
-#     OUT of MODELS on purpose -- its GRIB variable names on GRIBStream are unverified
-#     (scripts/probe_ifs.py), so it is fetchable (for the probe / opt-in) but never pulled
-#     by default until the names are confirmed. Add it to MODELS once probed.
-MODELS = ("gfs", "hrrr", "nbm")
-VALID_MODELS = ("gfs", "hrrr", "nbm", "ifsoper")
+#   VALID_MODELS = everything the API accepts (currently the same set).
+# ifsoper (ECMWF IFS) was enabled 2026-07-23: names verified 2026-07-19 (scripts/probe_ifs.py),
+# tcc fraction->percent handled at ingest (modeldata._normalize), and off-grid valid times are
+# not billed (gribstream.com pricing), so an hourly request simply returns IFS's native 3-hourly
+# subset -- the "needs its own time grid before enabling" concern was a no-op. IFS is GLOBAL, so
+# it is the only extra model that reaches the OCONUS sites where HRRR/NBM do not.
+MODELS = ("gfs", "hrrr", "nbm", "ifsoper")
+# gefsatmos (GEFS 0.25deg, 31 members, 3-hourly to 240h) is a member-billed ENSEMBLE, kept
+# out of MODELS so the deterministic surface archive never pulls it by accident; it is fetched
+# only by modeldata.prefetch_ensemble and rendered as probabilities, not raw state.
+VALID_MODELS = ("gfs", "hrrr", "nbm", "ifsoper", "gefsatmos")
 
 # Local pull ARCHIVE: every response is cached to disk keyed by a stable hash of the
 # request, so a repeat pull of the same slice (e.g. the 6 matrix cells at one station/
@@ -89,17 +94,19 @@ class TimeSeries:
     @property
     def credits(self) -> int:
         """Best-effort credit estimate for what came back, per the API formula
-            distinct_valid_times * variables * ceil(coordinates / 500).
+            distinct_valid_times * variables * ceil(coordinates / 500) * members.
         Coordinates sit INSIDE ceil(/500), so 1 point and 500 points cost the same -- the
-        multi-coordinate batching lever. Charged on RETURNED rows, so a 0-row window costs
-        nothing. (The old single-point estimate `rows * vars` overcounted an N-coord pull
-        by N, since rows = times * coords.)"""
+        multi-coordinate batching lever. MEMBERS, by contrast, multiply LINEARLY (verified
+        2026-07-23: a 31-member point pull billed 31, not 1 -- there is no member bundling),
+        so an ensemble costs member-count times a deterministic pull. Charged on RETURNED
+        rows, so a 0-row window costs nothing."""
         n_vars = max(len(self.columns) - len(_TS_COLS) - len(_META_COLS), 0)
         if not self.rows or not n_vars:
             return 0
         n_times = len({r["forecasted_time"] for r in self.rows if r.get("forecasted_time")})
         n_coords = len({(r.get("lat"), r.get("lon")) for r in self.rows}) or 1
-        return n_times * n_vars * math.ceil(n_coords / 500)
+        n_members = len({r.get("member") for r in self.rows}) or 1
+        return n_times * n_vars * math.ceil(n_coords / 500) * n_members
 
     @property
     def charged(self) -> int:
@@ -205,6 +212,7 @@ def fetch_points(
     as_of: datetime | None = None,
     min_lead: str | None = None,
     max_lead: str | None = None,
+    members: list[int] | None = None,
     use_cache: bool = True,
 ) -> TimeSeries:
     """Fetch a MULTI-coordinate forecast time series in ONE request -- the batching lever.
@@ -245,6 +253,10 @@ def fetch_points(
         body["minLeadTime"] = min_lead
     if max_lead is not None:
         body["maxLeadTime"] = max_lead
+    if members is not None:
+        # Ensemble members (gefsatmos/ifsenfo/...). Default [0] = control only. Each member
+        # multiplies the bill (see TimeSeries.credits), so the caller picks the count.
+        body["members"] = list(members)
 
     cache_file = _cache_file(model, body)
     cached = use_cache and cache_file.exists()
@@ -274,6 +286,7 @@ def fetch_timeseries(
     as_of: datetime | None = None,
     min_lead: str | None = None,
     max_lead: str | None = None,
+    members: list[int] | None = None,
     use_cache: bool = True,
 ) -> TimeSeries:
     """Fetch a SINGLE-point forecast time series -- a thin wrapper over `fetch_points`.
@@ -294,5 +307,5 @@ def fetch_timeseries(
     return fetch_points(
         model, [(lat, lon, name)], variables,
         from_time=from_time, until_time=until_time, times=times,
-        as_of=as_of, min_lead=min_lead, max_lead=max_lead, use_cache=use_cache,
+        as_of=as_of, min_lead=min_lead, max_lead=max_lead, members=members, use_cache=use_cache,
     )

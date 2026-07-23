@@ -4,7 +4,9 @@ The model can only emit a tool CALL (structured JSON like
 {"name": "query_obs", "station": "KORD", ...}); it never sees SQL or a
 connection. This module validates the call and runs it against a READ-ONLY
 DuckDB connection, so a hallucinated tool call physically cannot write or delete.
-Only read tools are registered here — that's the menu the model is limited to.
+Registered here: the read tools plus the output sinks (emit_taf,
+submit_taf_worksheet, check_taf) — that's the menu the model is limited to.
+The read-only-connection guarantee above covers every DB tool.
 Results come back as compact text the VLM can reason over.
 """
 
@@ -16,7 +18,7 @@ from pydantic import ValidationError
 
 from forecaster import (
     awc, charts, fcstsounding, imagery, modeldata, neighbors, soundings, store, tafgen,
-    tafparse, terrain, worksheet, wxmaps,
+    tafparse, tafstate, terrain, worksheet, wxmaps,
 )
 from forecaster.config import settings
 from forecaster.tafgen import TafProduct
@@ -519,7 +521,7 @@ GET_MODEL_STATE = {
                     "Optional pre-fetched point to read instead of the station (a neighbor "
                     "ICAO or grid id); defaults to the station.")},
                 "model": {"type": "string", "enum": list(modeldata.MODELS),
-                          "description": "Optional single model; default shows all three."},
+                          "description": "Optional single model; default shows every archived model."},
                 "hours": {"type": "integer", "description": "Optional cap on forecast hours shown (1-48)."},
             },
             "required": ["station"],
@@ -548,7 +550,8 @@ GET_HAZARD_SCAN = {
                     "Hazards are pre-fetched for the site + grid only, not neighbor airfields.")},
                 "valid_time": {"type": "string", "description": (
                     "Optional ISO valid time, e.g. 2026-07-17T21:00Z; snaps to the nearest "
-                    "stored step. Defaults to the earliest forecast hour.")},
+                    "stored step. Defaults to the earliest forecast hour with hazard-level "
+                    "data.")},
             },
             "required": ["station"],
         },
@@ -560,18 +563,22 @@ GET_MODEL_VERIFICATION = {
     "function": {
         "name": "get_model_verification",
         "description": (
-            "How the archived model runs scored against OBSERVED METARs at the recent forecast "
-            "hours leading up to your issue time -- per-hour forecast-vs-observed T/Td plus a "
-            "mean bias per model. Exposes a run's warm/cold or dry/moist bias so you can weight "
-            "the raw model output. Reads obs already in the store (leakage-safe), so it only "
-            "covers hours at or before your issue time."
+            "How the recent model RUNS scored against OBSERVED METARs in the hours leading up "
+            "to your issue time. One block per field (temperature, dewpoint, altimeter, wind "
+            "direction, wind speed, gust): rows are valid hours, columns are successive model "
+            "runs, so you can read across a row to see whether the fresher run was closer. "
+            "Each run gets a mean signed error (a bias to subtract) and a typical error size "
+            "(how far off to expect any single hour). Use it to weight raw model output -- "
+            "e.g. to back off a gust or temperature the model has been consistently missing. "
+            "Reads obs already in the store (leakage-safe), so it only covers hours at or "
+            "before your issue time."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
                 "model": {"type": "string", "enum": list(modeldata.MODELS),
-                          "description": "Optional single model; default shows all three."},
+                          "description": "Optional single model; default shows every archived model."},
             },
             "required": ["station"],
         },
@@ -606,10 +613,33 @@ GET_NEARBY_MODEL_DATA = {
     },
 }
 
+GET_ENSEMBLE_PROB = {
+    "type": "function",
+    "function": {
+        "name": "get_ensemble_prob",
+        "description": (
+            "GEFS ENSEMBLE probabilities for your station -- how the 31-member spread turns into "
+            "the CHANCE of each condition per hour. Ceiling and visibility are given as the "
+            "percent of members in each TAFVER category; wind speed and gust as the percent of "
+            "members at or above 15/25/35/45 kt; temperature and dewpoint as the p10/p50/p90 "
+            "spread. Use it to judge CONFIDENCE, not a single value -- e.g. whether a restriction "
+            "or a gust is likely enough to put in the prevailing group or belongs in a TEMPO/PROB. "
+            "Only available where a GEFS ensemble was pre-fetched."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
+            },
+            "required": ["station"],
+        },
+    },
+}
+
 TOOLS = [QUERY_OBS, GET_LATEST, GET_TREND, GET_SOUNDING, GET_MAP, GET_FCST_SOUNDING,
          GET_POINT_FORECAST, GET_CLIMO, GET_IMAGERY, GET_LOOP, GET_NEARBY_OBS, GET_TERRAIN,
          GET_MODEL_STATE, GET_HAZARD_SCAN, GET_MODEL_VERIFICATION, GET_NEARBY_MODEL_DATA,
-         GET_CURRENT_TAF, CHECK_TAF]
+         GET_ENSEMBLE_PROB, GET_CURRENT_TAF, CHECK_TAF]
 
 # The OUTPUT tool: the model emits its forecast as the fields of a TafProduct, and
 # our code renders + checks it. The parameter schema IS the pydantic model's JSON
@@ -631,7 +661,7 @@ EMIT_TAF = {
             "max (TX) and min (TN) temperature, each as "
             '{"temp_c": <Celsius>, "day": <1-31>, "hour": <0-23 UTC>}. For clear skies '
             "pass an EMPTY clouds list (it renders SKC); SKC/CLR are not valid cloud "
-            "cover values. Base the forecast only on the observations and trend provided."
+            "cover values. Base the forecast only on tool-provided data."
         ),
         "parameters": TafProduct.model_json_schema(),
     },
@@ -1842,56 +1872,433 @@ def _get_hazard_scan(con, station: str, args: dict) -> ToolResult:
     return ToolResult(_fmt_hazard_scan(con, station, loc, want))
 
 
-_VER_ALIASES = ("t2m", "td2m", "u10", "v10", "wind", "wdir")
+# --- GEFS ensemble probability product --------------------------------------------------
+_WIND_THRESHOLDS = (15, 25, 35, 45)   # kt exceedance rungs for wind speed AND gust
+_ENS_ALIASES = ("t2m", "td2m", "u10", "v10", "gust", "vis", "ceil")
+
+
+def _pivot_by_member(rows: list[dict]) -> dict:
+    """Tall GEFS rows -> {valid_time: {member: {alias: value}}} for the LATEST run only.
+    Each member is a full forecast; the reader turns the spread across members at one hour
+    into a probability."""
+    latest: dict = {}
+    for r in rows:
+        vt = r["valid_time"]
+        run = r.get("run")
+        if run is not None and (vt not in latest or run > latest[vt]):
+            latest[vt] = run
+    out: dict = {}
+    for r in rows:
+        vt = r["valid_time"]
+        if r.get("run") != latest.get(vt):
+            continue
+        out.setdefault(vt, {}).setdefault(r.get("member", 0), {})[r["variable"]] = r["value"]
+    return out
+
+
+def _pct(vals: list[float], q: float) -> float | None:
+    """Linear-interpolated percentile of a value list (q in 0..100)."""
+    xs = sorted(v for v in vals if v is not None)
+    if not xs:
+        return None
+    if len(xs) == 1:
+        return xs[0]
+    k = (len(xs) - 1) * q / 100.0
+    lo = int(k)
+    frac = k - lo
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * frac
+
+
+def _member_ceiling_cat(m, profile) -> str | None:
+    """One member's ceiling (meters, GFS-style HGT@cloud ceiling) -> TAFVER band id."""
+    if m is None or m > 15000:               # fill / no ceiling -> unlimited (top band)
+        return tafstate.tafver_ceiling_category(None, tafstate.CEIL_KNOWN_UNLIMITED, profile)
+    return tafstate.tafver_ceiling_category(m * 3.28084, tafstate.CEIL_KNOWN_NUMERIC, profile)
+
+
+def _member_vis_cat(m, profile) -> str | None:
+    """One member's visibility (meters) -> TAFVER band id (statute-mile ladder)."""
+    if m is None:
+        return None
+    sm = m / 1609.34
+    if sm >= 6.0:                            # >=6 SM is reported unlimited (P6SM)
+        return tafstate.tafver_visibility_category(None, None, tafstate.VIS_KNOWN_UNLIMITED, profile)
+    return tafstate.tafver_visibility_category(sm, None, tafstate.VIS_KNOWN_NUMERIC, profile)
+
+
+def _cat_prob_row(members: dict, classify, band_ids: list[str]) -> tuple[dict, int]:
+    """Fraction of members whose value falls in each band. Returns (per-band fraction, n
+    members that classified) -- a member with a missing/unknown value is left out of n."""
+    counts = {b: 0 for b in band_ids}
+    n = 0
+    for vm in members.values():
+        cid = classify(vm)
+        if cid is None:
+            continue
+        n += 1
+        counts[cid] = counts.get(cid, 0) + 1
+    return ({b: (counts[b] / n if n else None) for b in band_ids}, n)
+
+
+def _exceed_prob(members: dict, value_fn, thresholds) -> tuple[dict, int]:
+    """Fraction of members whose derived value is >= each threshold."""
+    vals = [value_fn(vm) for vm in members.values()]
+    vals = [v for v in vals if v is not None]
+    n = len(vals)
+    return ({t: (sum(1 for v in vals if v >= t) / n if n else None) for t in thresholds}, n)
+
+
+def _pp(p) -> str:
+    """A probability 0..1 as a 2-wide percent cell; blank when undefined."""
+    return " --" if p is None else f"{round(p * 100):3d}"
+
+
+def _fmt_ensemble_prob(con, station: str) -> str:
+    lat, lon, _ = _resolve_md_location(con, station, None) or (None, None, None)
+    if lat is None:
+        return f"error: {station} has no pre-fetched GEFS ensemble. {_md_locations_hint(con)}"
+    rows = store.model_data_series(con, modeldata.GEFS_MODEL, lat, lon, start=_WIDE_START,
+                                   end=_WIDE_END, variables=list(_ENS_ALIASES))
+    by_vt = _pivot_by_member(rows)
+    if not by_vt:
+        return (f"error: no GEFS ensemble archived for {station}. A deterministic model may be "
+                f"present, but the ensemble product needs a prefetch_ensemble pull.")
+    profile = tafstate.default_profile(station)
+    cig_bands = [b.id for b in profile.tafver_ceiling_bands]
+    vis_bands = [b.id for b in profile.tafver_vis_bands]
+    cig_lbl = {"A": "<2", "B": "2-7", "C": "7-10", "D": "10-20", "E": ">=20"}   # hundreds ft
+    vis_lbl = {"A": "<0.5", "B": ".5-2", "C": "2-3", "D": "2-3", "E": ">=3"}    # statute miles
+    hours = sorted(by_vt)
+    n_members = max((len(m) for m in by_vt.values()), default=0)
+    out = [
+        f"GEFS ensemble probabilities for {station} -- {n_members} members, run "
+        f"{max((r.get('run') for r in rows if r.get('run')), default='?')}. Each cell is the "
+        "PERCENT of members meeting the condition at that hour; read a column down to see when "
+        "a risk grows.",
+        "CEILING and VISIBILITY use the TAFVER category bands (ceiling in hundreds of feet, "
+        "vis in statute miles); the percentages across a row sum to ~100 (every member lands "
+        "in one band). WIND and GUST are EXCEEDANCE: percent of members at or above each knot "
+        "threshold, so they do not sum to 100.",
+        "T/Td show the ensemble spread as p10/p50/p90 (C): the median with a 10th-90th "
+        "percentile band. A wide band = low confidence.",
+        "",
+        "Ceiling category (hundreds ft): " + "  ".join(f"{b}={cig_lbl[b]}" for b in cig_bands),
+        "Visibility category (SM):       " + "  ".join(f"{b}={vis_lbl[b]}" for b in vis_bands),
+        "",
+    ]
+    # Ceiling block
+    out.append("CEILING -- % of members in each category")
+    out.append("  Valid" + "".join(f"{b:>6}" for b in cig_bands) + "    n")
+    for vt in hours:
+        probs, n = _cat_prob_row(by_vt[vt], lambda vm: _member_ceiling_cat(vm.get("ceil"), profile),
+                                 cig_bands)
+        out.append(f"  {vt:%d/%HZ}" + "".join(f"{_pp(probs[b]):>6}" for b in cig_bands) + f"{n:>5}")
+    out.append("")
+    # Visibility block
+    out.append("VISIBILITY -- % of members in each category")
+    out.append("  Valid" + "".join(f"{b:>6}" for b in vis_bands) + "    n")
+    for vt in hours:
+        probs, n = _cat_prob_row(by_vt[vt], lambda vm: _member_vis_cat(vm.get("vis"), profile),
+                                 vis_bands)
+        out.append(f"  {vt:%d/%HZ}" + "".join(f"{_pp(probs[b]):>6}" for b in vis_bands) + f"{n:>5}")
+    out.append("")
+    # Wind + gust exceedance
+    for label, fn in (("WIND SPEED", lambda vm: _ens_wind_kt(vm)),
+                      ("WIND GUST", lambda vm: _ms2kt(vm.get("gust")))):
+        out.append(f"{label} -- % of members >= threshold (kt)")
+        out.append("  Valid" + "".join(f"{f'>={t}':>6}" for t in _WIND_THRESHOLDS) + "    n")
+        for vt in hours:
+            probs, n = _exceed_prob(by_vt[vt], fn, _WIND_THRESHOLDS)
+            out.append(f"  {vt:%d/%HZ}"
+                       + "".join(f"{_pp(probs[t]):>6}" for t in _WIND_THRESHOLDS) + f"{n:>5}")
+        out.append("")
+    # Temperature / dewpoint percentiles
+    out.append("TEMPERATURE / DEWPOINT -- ensemble p10/p50/p90 (C)")
+    out.append(f"  {'Valid':<8}{'T p10/p50/p90':>18}{'Td p10/p50/p90':>20}")
+    for vt in hours:
+        ts = [_k2c(vm.get("t2m")) for vm in by_vt[vt].values()]
+        ds = [_k2c(vm.get("td2m")) for vm in by_vt[vt].values()]
+        out.append(f"  {vt:%d/%HZ}   "
+                   f"{_tri(ts):>15}{_tri(ds):>20}")
+    return "\n".join(out)
+
+
+def _ens_wind_kt(vm: dict):
+    u, v = vm.get("u10"), vm.get("v10")
+    if u is None or v is None:
+        return None
+    return _ms2kt(math.hypot(u, v))
+
+
+def _tri(vals: list) -> str:
+    p10, p50, p90 = _pct(vals, 10), _pct(vals, 50), _pct(vals, 90)
+    if p50 is None:
+        return "--"
+    return f"{p10:.0f}/{p50:.0f}/{p90:.0f}"
+
+
+def _get_ensemble_prob(con, station: str, args: dict) -> ToolResult:
+    return ToolResult(_fmt_ensemble_prob(con, station))
+
+
+_VER_ALIASES = ("t2m", "td2m", "u10", "v10", "wind", "wdir", "gust", "mslp")
+
+# How many model runs to show per model, newest first. Several runs is the POINT of this
+# view -- seeing the same hour forecast by successive runs is how the reader learns that
+# the fresher run is closer, without being told so in the prompt.
+_VER_MAX_RUNS = 3
+
+
+def _pivot_by_run(rows: list[dict]) -> dict:
+    """Tall model_data rows -> {run: {valid_time: {alias: value}}}.
+
+    Unlike _pivot_series (which collapses to the LATEST run per valid time, right for a
+    'what does guidance say now' view) this keeps every run separate, so the same valid
+    hour can be shown as forecast by successive runs."""
+    out: dict = {}
+    for r in rows:
+        if r["run"] is None:
+            continue
+        out.setdefault(r["run"], {}).setdefault(r["valid_time"], {})[r["variable"]] = r["value"]
+    return out
+
+
+def _obs_by_hour(con, station: str, lo: datetime, hi: datetime) -> dict:
+    """Observations keyed to the hour they describe. A :55 report describes the top of the
+    NEXT hour, so it is snapped forward. When several reports land in one hour, the routine
+    METAR wins and a SPECI is used only if there is no routine one -- SPECIs are issued
+    BECAUSE conditions changed, so letting an arbitrary one win would make the comparison
+    depend on which report happened to be read last."""
+    best: dict = {}
+    for o in store.window(con, station, lo - timedelta(hours=1), hi + timedelta(hours=1)):
+        key = (o["obs_time"] + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
+        cur = best.get(key)
+        if cur is None or (cur.get("report_type") != "METAR" and o.get("report_type") == "METAR"):
+            best[key] = o
+    return best
+
+
+def _ms2kt(v):
+    return None if v is None else v * 1.94384
+
+
+def _pa2inhg(v):
+    return None if v is None else v / 3386.389
+
+
+def _fcst_wind(vm: dict) -> tuple:
+    """(direction, speed kt) from whichever wind form the model carries -- GFS/HRRR give
+    u/v components, NBM gives speed + direction directly."""
+    if vm.get("wind") is not None or vm.get("wdir") is not None:
+        return vm.get("wdir"), _ms2kt(vm.get("wind"))
+    u, v = vm.get("u10"), vm.get("v10")
+    if u is None or v is None:
+        return None, None
+    return math.degrees(math.atan2(-u, -v)) % 360, _ms2kt(math.hypot(u, v))
+
+
+def _deg_err(f, o):
+    return None if f is None or o is None else (f - o + 180) % 360 - 180
+
+
+def _fo(f, o, n=0):
+    """'forecast/observed' as one cell, so the reader sees the values, not just the error."""
+    fs = "--" if f is None else f"{f:.{n}f}"
+    os_ = "--" if o is None else f"{o:.{n}f}"
+    return f"{fs}/{os_}"
+
+
+def _es(v, n=1):
+    return "--" if v is None else f"{v:+.{n}f}"
+
+
+# One block per FIELD, rows = valid hour, columns = model run. The earlier layout gave each
+# run its own block, which reads fine but cannot answer the question the tool exists to
+# answer -- "is the fresher run closer?" needs the SAME hour on ONE line across runs.
+# (label, observed getter, forecast getter, value decimals, error decimals, circular)
+_VER_FIELDS = (
+    ("TEMPERATURE (C)", lambda o: o.get("temp_c"),
+     lambda vm, d, s: _k2c(vm.get("t2m")), 0, 1, False),
+    ("DEWPOINT (C)", lambda o: o.get("dewpoint_c"),
+     lambda vm, d, s: _k2c(vm.get("td2m")), 0, 1, False),
+    ("ALTIMETER / MSLP (inHg)", lambda o: o.get("altimeter_inhg"),
+     lambda vm, d, s: _pa2inhg(vm.get("mslp")), 2, 2, False),
+    ("WIND DIRECTION (deg)", lambda o: o.get("wind_dir_deg"),
+     lambda vm, d, s: d, 0, 0, True),
+    ("WIND SPEED (kt)", lambda o: o.get("wind_speed"),
+     lambda vm, d, s: s, 0, 1, False),
+    # A report with no gust group means no gusts occurred -- a real value (0), not missing
+    # data -- so a model forecasting gusts that never happened shows its error, not a blank.
+    ("WIND GUST (kt)", lambda o: o.get("wind_gust") or 0,
+     lambda vm, d, s: _ms2kt(vm.get("gust")), 0, 1, False),
+)
+
+
+def _fmt_field_block(label: str, hours: list, runs: list, by_run: dict, obs: dict,
+                     obs_get, fcst_get, vdp: int, edp: int, circular: bool) -> str:
+    """One field's hour x run table plus the two summary lines per run."""
+    w = 14
+    head = [f"{label} -- forecast (error vs observed)",
+            f"  {'Valid':<7}{'obs':>7}  " + "".join(f"{f'{r:%HZ} run':>{w}}" for r in runs)]
+    acc: dict = {r: [] for r in runs}
+    body = []
+    for vt in hours:
+        o = obs_get(obs[vt])
+        cells = []
+        for r in runs:
+            vm = by_run[r].get(vt)
+            if vm is None:
+                cells.append(f"{'--':>{w}}")
+                continue
+            d, s = _fcst_wind(vm)
+            f = fcst_get(vm, d, s)
+            if f is None:
+                cells.append(f"{'--':>{w}}")
+                continue
+            err = _deg_err(f, o) if circular else (None if o is None else f - o)
+            if err is not None:
+                acc[r].append(err)
+            cells.append(f"{f'{f:.{vdp}f} ({err:+.{edp}f})' if err is not None else f'{f:.{vdp}f}':>{w}}")
+        stamp = f"{vt:%d/%H}Z"
+        body.append(f"  {stamp:<7}{'--' if o is None else f'{o:.{vdp}f}':>7}  " + "".join(cells))
+    means = "".join(
+        f"{('--' if not acc[r] else f'{sum(acc[r]) / len(acc[r]):+.{edp}f}'):>{w}}" for r in runs)
+    typ = "".join(
+        f"{('--' if not acc[r] else f'{sum(abs(v) for v in acc[r]) / len(acc[r]):.{edp}f}'):>{w}}"
+        for r in runs)
+    counts = "".join(f"{f'n={len(acc[r])}':>{w}}" for r in runs)
+    return "\n".join(head + body + [
+        f"  {'mean err':<7}{'':>7}  " + means,
+        f"  {'typical':<7}{'':>7}  " + typ,
+        f"  {'hours':<7}{'':>7}  " + counts,
+    ])
+
+
+def _fmt_model_verification_by_hour(con, station: str, models: list[str]) -> str:
+    """Hour x run verification: every field, every hour, one column per model run."""
+    lat, lon, _ = _resolve_md_location(con, station, None) or (None, None, None)
+    if lat is None:
+        return f"error: {station} is not a pre-fetched model-data location. {_md_locations_hint(con)}"
+    out = [
+        f"Model-vs-obs verification for {station}. Each block is one field: rows are valid "
+        "hours, columns are MODEL RUNS. A cell is the run's forecast with its error vs the "
+        "observed report in brackets; error is forecast minus observed.",
+        "Read ACROSS a row to see whether the fresher run was closer for that hour. A run "
+        "cannot forecast hours before it started, so older runs fill more of the table.",
+        "Two summary lines per run: 'mean err' is the average SIGNED error -- a bias you can "
+        "correct by subtracting it. 'typical' is the average error SIZE, which is how far off "
+        "to expect any single hour to be. When mean err is small but typical is large the "
+        "errors are cancelling, not absent: there is no bias to correct and the field is "
+        "simply unreliable. Judge reliability by 'typical', correct bias by 'mean err'.",
+        "Negative T/Td = model too cold/dry. QNH compares model MSLP against the observed "
+        "altimeter setting: close, but not the same quantity, so read a small steady offset "
+        "with care.",
+        "",
+    ]
+    matched_any = False
+    for model in models:
+        rows = store.model_data_series(con, model, lat, lon, start=_WIDE_START, end=_WIDE_END,
+                                       variables=list(_VER_ALIASES))
+        by_run = _pivot_by_run(rows)
+        if not by_run:
+            continue
+        runs = sorted(by_run, reverse=True)[:_VER_MAX_RUNS]
+        all_vt = [vt for r in runs for vt in by_run[r]]
+        if not all_vt:
+            continue
+        obs = _obs_by_hour(con, station, min(all_vt), max(all_vt))
+        hours = sorted({vt for r in runs for vt in by_run[r] if vt in obs})
+        if not hours:
+            continue
+        matched_any = True
+        out.append(f"=== {model.upper()} -- runs "
+                   + ", ".join(f"{r:%Y-%m-%dT%HZ}" for r in runs)
+                   + f" -- {len(hours)} verified hours ===")
+        out.append("")
+        for label, obs_get, fcst_get, vdp, edp, circ in _VER_FIELDS:
+            out.append(_fmt_field_block(label, hours, runs, by_run, obs,
+                                        obs_get, fcst_get, vdp, edp, circ))
+            out.append("")
+    if not matched_any:
+        out.append("(no observed reports overlap the archived forecast valid times yet -- "
+                   "verification needs obs at the pre-issue forecast hours in the store)")
+    return "\n".join(out)
 
 
 def _fmt_model_verification(con, station: str, models: list[str]) -> str:
     lat, lon, _ = _resolve_md_location(con, station, None) or (None, None, None)
     if lat is None:
         return f"error: {station} is not a pre-fetched model-data location. {_md_locations_hint(con)}"
-    # obs truth from the DB (leakage-safe: the per-run DB is cut off at issue time). Keyed by
-    # nearest whole hour so a :53 METAR aligns to the top-of-hour model step.
+    # obs truth from the DB (leakage-safe: the per-run DB is cut off at issue time).
     out = [f"Model-vs-obs verification for {station} -- archived forecast (from runs <= issue) "
-           "vs observed METARs at the matching hours. Positive T/Td error = model too warm/moist.",
+           "vs observed reports at the matching hours. Each cell is forecast/observed; err is "
+           "forecast minus observed.",
+           "Negative T/Td = model too cold/dry. Positive QNH = model pressure too high. "
+           "dir/spd/gust are the 10 m wind in degrees and knots.",
+           "A run cannot forecast hours before it started, so later runs begin later. Compare "
+           "the SAME hour across runs to see whether the fresher run is closer.",
+           "QNH compares model mean-sea-level pressure against the observed altimeter setting: "
+           "close, but not the same quantity, so read a small steady offset with care.",
            ""]
     matched_any = False
     for model in models:
         rows = store.model_data_series(con, model, lat, lon, start=_WIDE_START, end=_WIDE_END,
                                        variables=list(_VER_ALIASES))
-        series = _pivot_series(rows)
-        if not series:
+        by_run = _pivot_by_run(rows)
+        if not by_run:
             continue
-        lo, hi = series[0][0], series[-1][0]
-        obs = {}
-        for o in store.window(con, station, lo - timedelta(hours=1), hi + timedelta(hours=1)):
-            key = (o["obs_time"] + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
-            obs[key] = o
-        run = next((r for _, r, _ in series if r), None)
-        header = f"{model.upper()} (run {run:%Y-%m-%dT%HZ}):" if run else f"{model.upper()}:"
-        block = [header, f"  {'Valid (Z)':<15}{'T f/o':>11}{'Terr':>6}{'Td f/o':>11}{'Tderr':>7}"]
-        terrs = []
-        for vt, _r, vm in series:
-            o = obs.get(vt)
-            if o is None:
+        all_vt = [vt for r in by_run.values() for vt in r]
+        obs = _obs_by_hour(con, station, min(all_vt), max(all_vt))
+        for run in sorted(by_run, reverse=True)[:_VER_MAX_RUNS]:
+            hours = sorted(vt for vt in by_run[run] if vt in obs)
+            if not hours:
                 continue
-            tf, tdf = _k2c(vm.get("t2m")), _k2c(vm.get("td2m"))
-            to, tdo = o.get("temp_c"), o.get("dewpoint_c")
-            te = f"{tf - to:+.1f}" if tf is not None and to is not None else "--"
-            tde = f"{tdf - tdo:+.1f}" if tdf is not None and tdo is not None else "--"
-            if tf is not None and to is not None:
-                terrs.append(tf - to)
-            tfo = f"{tf:.0f}/{to}" if tf is not None and to is not None else "--"
-            tdfo = f"{tdf:.0f}/{tdo}" if tdf is not None and tdo is not None else "--"
-            block.append(f"  {vt:%Y-%m-%dT%HZ}{tfo:>11}{te:>6}{tdfo:>11}{tde:>7}")
-        if len(block) == 2:
-            continue   # no overlapping obs for this model
-        matched_any = True
-        if terrs:
-            block.append(f"  -> mean T bias {sum(terrs) / len(terrs):+.1f}C over {len(terrs)} hrs")
-        out.append("\n".join(block))
-        out.append("")
+            block = [f"{model.upper()} run {run:%Y-%m-%dT%HZ}:",
+                     f"  {'Valid':<7}{'T f/o':>8}{'err':>6}{'Td f/o':>8}{'err':>6}"
+                     f"{'QNH f/o':>14}{'err':>7}{'dir f/o':>10}{'err':>6}"
+                     f"{'spd f/o':>9}{'err':>6}{'gust f/o':>10}{'err':>6}"]
+            acc: dict = {}
+            for vt in hours:
+                vm, o = by_run[run][vt], obs[vt]
+                tf, tdf = _k2c(vm.get("t2m")), _k2c(vm.get("td2m"))
+                qf = _pa2inhg(vm.get("mslp"))
+                df, sf = _fcst_wind(vm)
+                gf = _ms2kt(vm.get("gust"))
+                to, tdo, qo = o.get("temp_c"), o.get("dewpoint_c"), o.get("altimeter_inhg")
+                do, so = o.get("wind_dir_deg"), o.get("wind_speed")
+                # A report with no gust group means no gusts occurred, which is a real
+                # value (0), not missing data -- otherwise a model forecasting gusts that
+                # never happened would show a blank instead of its error.
+                go = o.get("wind_gust") or 0
+                sub = lambda f, ob: None if f is None or ob is None else f - ob  # noqa: E731
+                errs = {"T": sub(tf, to), "Td": sub(tdf, tdo), "QNH": sub(qf, qo),
+                        "dir": _deg_err(df, do), "spd": sub(sf, so), "gust": sub(gf, go)}
+                for k, v in errs.items():
+                    if v is not None:
+                        acc.setdefault(k, []).append(v)
+                block.append(
+                    f"  {vt:%H}Z{'':<4}{_fo(tf, to):>8}{_es(errs['T']):>6}"
+                    f"{_fo(tdf, tdo):>8}{_es(errs['Td']):>6}"
+                    f"{_fo(qf, qo, 2):>14}{_es(errs['QNH'], 2):>7}"
+                    f"{_fo(df, do):>10}{_es(errs['dir'], 0):>6}"
+                    f"{_fo(sf, so):>9}{_es(errs['spd']):>6}"
+                    f"{_fo(gf, go):>10}{_es(errs['gust']):>6}")
+            matched_any = True
+            mean = {k: sum(v) / len(v) for k, v in acc.items()}
+            # Direction errors cancel: +40 one hour and -40 the next average to zero while
+            # every hour was badly wrong. Report the typical SIZE of the miss beside it.
+            typ = (sum(abs(v) for v in acc["dir"]) / len(acc["dir"])) if acc.get("dir") else None
+            block.append(
+                f"  mean err over {len(hours)} hrs:  T {_es(mean.get('T'))}C   "
+                f"Td {_es(mean.get('Td'))}C   QNH {_es(mean.get('QNH'), 2)}inHg   "
+                f"dir {_es(mean.get('dir'), 0)}deg (typically "
+                f"{'--' if typ is None else f'{typ:.0f}'}deg off)   "
+                f"spd {_es(mean.get('spd'))}kt   gust {_es(mean.get('gust'))}kt")
+            out.append("\n".join(block))
+            out.append("")
     if not matched_any:
-        out.append("(no observed METARs overlap the archived forecast valid times yet -- "
+        out.append("(no observed reports overlap the archived forecast valid times yet -- "
                    "verification needs obs at the pre-issue forecast hours in the store)")
     return "\n".join(out)
 
@@ -1899,7 +2306,7 @@ def _fmt_model_verification(con, station: str, models: list[str]) -> str:
 def _get_model_verification(con, station: str, args: dict) -> ToolResult:
     model = args.get("model")
     models = [str(model).lower()] if model else list(modeldata.MODELS)
-    return ToolResult(_fmt_model_verification(con, station, models))
+    return ToolResult(_fmt_model_verification_by_hour(con, station, models))
 
 
 # Human-readable unit hints for the spatial field tool's common aliases.
@@ -2052,6 +2459,8 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
             return _get_model_verification(con, station, args)
         if name == "get_nearby_model_data":
             return _get_nearby_model_data(con, station, args)
+        if name == "get_ensemble_prob":
+            return _get_ensemble_prob(con, station, args)
         return ToolResult(f"error: unknown tool {name!r}")
     except Exception as e:  # noqa: BLE001 -- any read-tool failure becomes feedback, not a dead loop
         return ToolResult(f"error: {name} failed ({type(e).__name__}: {e})")

@@ -290,9 +290,10 @@ class GuidanceEntry(BaseModel):
 
 
 class ModelRunVerification(BaseModel):
-    """Advisory until get_model_run_verification exists (Milestone 2): the object must
-    be PRESENT but fields may be 'unknown'; the model is not gated on it. The one
-    supportable check today is a cold-start disagreement (freshest guidance vs latest ob)."""
+    """Advisory: fields may be 'unknown' when the model-data tier (and its
+    get_model_verification tool) is not granted; the object must be PRESENT but the
+    model is not gated on it. The one always-supportable check is a cold-start
+    disagreement (freshest guidance vs latest ob)."""
 
     guidance_sources_reviewed: list[str] = []
     initialization_assessment: str | None = None     # the supportable cold-start check
@@ -515,7 +516,7 @@ def validate(
     # present, but fields may be 'unknown'. Prefixed so a driver gate can exclude it.
     if ws.model_run_verification is None:
         out.append(f"{MODEL_RUN_VERIFICATION_PREFIX}: object should be present (fields may be "
-                   "'unknown' until get_model_run_verification exists)")
+                   "'unknown' when the get_model_* guidance tools are not granted)")
 
     return out
 
@@ -666,7 +667,7 @@ def _example_worksheet() -> TafWorksheet:
         model_run_verification=ModelRunVerification(
             guidance_sources_reviewed=["GFS point forecast (KLAS proxy)"],
             initialization_assessment="GFS f000 ~matches the latest KLAS ob (T, wind); init looks good",
-            recent_verification_assessment="unknown -- get_model_run_verification not yet available",
+            recent_verification_assessment="unknown -- get_model_verification not granted this run",
             guidance_blend_strategy="lean on obs+climo for the diurnal cycle; GFS for the trend",
             guidance_entries=[
                 GuidanceEntry(source="GFS (KLAS)", forecast_hour_or_window="f000-f030",

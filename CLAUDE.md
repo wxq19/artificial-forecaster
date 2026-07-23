@@ -102,17 +102,32 @@ artificial-forecaster/
 │   ├── store.py          # the ONLY file that touches DuckDB (seam)
 │   ├── iem.py            # historical METAR ingestion (IEM)
 │   ├── wxcodes.py        # present-weather classify + deterministic severity rule
-│   ├── charts.py         # the ONLY file that imports matplotlib/metpy (meteogram/wx_timeline/skewt)
+│   ├── charts.py         # the ONLY file that imports matplotlib/metpy (meteogram/wx_timeline/skewt/filmstrip/loop_mp4)
 │   ├── soundings.py      # live skew-T image client (SPC/Wyoming); fetch pixels, don't draw (seam)
 │   ├── wxmaps.py         # live synoptic map client (WPC/OPC/SPC-meso/TT GFS); fetch charts (seam)
 │   ├── fcstsounding.py   # model BUFKIT forecast-sounding fetch+parse (rendered by charts.skewt) (seam)
 │   ├── climo.py          # station-climatology builder (scratch-DB ingest; NO SQL) -> store.rebuild_climo
 │   ├── imagery.py        # live satellite (NESDIS/STAR) + radar (IEM radmap.php) image client (seam)
 │   ├── radarsites.py     # WSR-88D site table (nearest-radar lookup; regen via scripts/build_radarsites.py)
-│   └── tools.py          # agent read tools + emit_taf OUTPUT tool + loop plumbing (-> agent.py later)
+│   ├── terrain.py        # static terrain/coastline client (shaded-relief map + terrain rose) (seam)
+│   ├── geo.py            # shared spatial primitives (great-circle distance/bearing/nearest-N); stdlib only
+│   ├── neighbors.py      # static nearest-neighbor roster (regen via scripts/build_neighbors.py)
+│   ├── gribstream.py     # GRIBStream point-forecast client -- model time-series fetch (seam)
+│   ├── modeldata.py      # GRIBStream ORCHESTRATOR (prefetch -> store archive; no SQL/network of its own)
+│   ├── worksheet.py      # typed TafWorksheet pre-emit reasoning artifact + validate() + guide (seam)
+│   ├── tafstate.py       # SHARED scoring primitives (absolutizer, truth views, baselines); PURE
+│   ├── tafver.py         # scorer 1 -- TAFVER (ACCI15-120 Att 7 percent-correct); PURE
+│   ├── tafamend.py       # scorer 2 -- amendment-implied busts (DAFI 15-129 rules); PURE
+│   ├── tafskill.py       # scorer 3 -- skill (element error / event contingency / MACE); PURE
+│   ├── tafarchive.py     # raw TAF bulletin -> immutable `tafs` archive row (pure; no DB)
+│   ├── stations.py       # roster of military aerodromes + their issue cycles (+ archive-only list)
+│   ├── runlog.py         # freeze an agent RunResult as durable provenance (runs row + transcript)
+│   ├── agent.py          # the agent LOOP -- the ONLY file driving the model's tool-calling turns
+│   └── tools.py          # agent read tools + OUTPUT sinks (emit_taf/submit_taf_worksheet/check_taf)
 ├── scripts/              # dev + end-to-end test drivers (markdown logs -> logs/)
 ├── docs/                 # references (FMH-1 wx table, AFMAN 15-124, AFH 15-101)
-├── data/                 # GITIGNORED: forecaster.duckdb, charts/temp/, soundings/, maps/, fcstsoundings/ (throwaway)
+├── data/                 # GITIGNORED throwaway/cache: forecaster.duckdb, charts/, soundings/, imagery/,
+│                         #   terrain/, gribstream/, metars/ -- PLUS benchmark/ + runs/ (the harvest)
 └── logs/                 # run transcripts (markdown)
 ```
 
@@ -190,7 +205,7 @@ artificial-forecaster/
   `stop`, not `length` — so it's not a token cap). Mitigated by a "state it ONCE and stop"
   instruction in the prompt (8340→5050 completion tok, content populated, answer still right).
   NOT eliminated — mitigated by the harness guard below.
-- HARNESS GUARD (DONE): `tools.final_answer(msg, finish_reason)` recovers a correct answer
+- HARNESS GUARD (DONE): `agent.final_answer(msg, finish_reason)` recovers a correct answer
   stranded in the `reasoning` field (content empty + reasoning present + finish_reason `stop`)
   instead of logging blank — the rumination case above. Wired into the drivers.
 - THIRD tool = a METEOGRAM image (the architecture keystone): `get_trend` renders a 5-panel
@@ -231,7 +246,8 @@ artificial-forecaster/
     contract again. (b) a mid-conversation `role:system` message → Together 400; inject notes as
     `role:user`. Finding: Fixes 1+2 are robust enough the model self-aligns even when coerced toward
     absolute dates (chains get_latest to anchor, or copies the echoed window); Fix 3 is the backstop.
-    All loop plumbing (final_answer, tool_messages, window_conflict) → migrate to a future `agent.py`.
+    All loop plumbing (final_answer, tool_messages, window_conflict) SINCE MIGRATED to `agent.py`
+    (it no longer lives in tools.py).
 - AWC LIVE client + TAF PARSE SEAM (this session). `src/forecaster/awc.py` — live aviationweather.gov
   client (seam like `iem.py`, no SQL/duckdb of its own). `fetch_metar`/`fetch_taf` use format=json so every
   report arrives with an AUTHORITATIVE epoch/ISO timestamp (and, for METARs, metarType=METAR/SPECI — no
@@ -289,7 +305,7 @@ artificial-forecaster/
   have the wrong span; `TafProduct.amend(orig, at=...)` clips validity + drops expired groups (1.3.2.1.2.1).
   Pydantic guardrails reject IMPOSSIBLE values at construction (station 4-letter, change in FM/BECMG/TEMPO,
   wind_dir 0-360, cover FEW/SCT/BKN/OVC); validate() catches well-formed-but-rule-breaking values. Three layers:
-  guardrails -> validate() -> roundtrip(). Self-test `scripts/test_tafgen.py` (no model/network): 8/8, byte-exact
+  guardrails -> validate() -> roundtrip(). Self-test `scripts/test_tafgen.py` (no model/network): 9/9, byte-exact
   figures + a negative case + an amend() carry-forward case.
 - emit_taf OUTPUT TOOL (`tools.py`, step 6 DONE): the model's first OUTPUT tool. Parameter schema IS
   `TafProduct.model_json_schema()` (the one class is tool contract AND validator). `_emit_taf` builds the product
@@ -367,7 +383,8 @@ artificial-forecaster/
   T2MS/TD2M/UWND/VWND/PMSL/LCLD/MCLD/HCLD/P01M + valid datetime). The tool renders a TEXT table (`tools._fmt_point`):
   rows = forecast hours, cols = variables (wind shown as dir/speed, everything else raw native units), default 48h.
   NO derived fields (RH/heat-index/gen-wx/ceiling/vis/gust/probabilities) -- DEFERRED per decision; v1 is raw
-  model surface data. Modeled on `docs/TarpViewer-GenWx.csv`. TOOLS now 7. Verified (KLSV not in BUFKIT -> use
+  model surface data. **SINCE AMENDED: ONE derived column was added later -- MSLP in inHg, with a receipt
+  note telling the model not to re-derive it (the round-1 hand-conversion slip). Everything else stays raw.** Modeled on `docs/TarpViewer-GenWx.csv`. TOOLS now 7. Verified (KLSV not in BUFKIT -> use
   KLAS). Spike `scripts/test_bufkit_point.py` writes the full transposed CSV for review.
 - FULL-AGENT TAF TEST (`scripts/test_taf_agent.py`, this session): first end-to-end exercise of the WHOLE tool
   suite -- each of 4 models (Gemma/Qwen/Kimi/MiniMax) given all 7 read/data tools + emit_taf and asked to build a
@@ -417,7 +434,21 @@ artificial-forecaster/
   matches their bboxes in the SAME first pass as the GOES sectors, so every roster + archive site
   resolves: Japan/Korea/Okinawa -> himawari_japan, Guam -> himawari_full_disk, Europe -> europe,
   Al Udeid -> middle_east, Alaska/Hawaii/CONUS -> GOES. RADAR is still US-only (IEM radmap) and
-  degrades honestly OCONUS. Deferred: loops, advanced products, OCONUS radar.
+  degrades honestly OCONUS. Deferred: advanced products, OCONUS radar.
+  SATELLITE LOOPS SHIPPED (`get_loop`): fetches N recent frames (`imagery.py` frame fetching) and
+  returns a LABELED FILMSTRIP image (`charts.filmstrip`) plus an optional mp4 (`charts.loop_mp4`,
+  carried on `ToolResult.videos`) for video-capable models; GOES/Himawari wide-area, Meteosat
+  station-centered. It is in the DEFAULT `TOOLS` and `collect.py` drops only get_current_taf (+ the
+  model-data tools when off), so round-1 collection agents HAD get_loop.
+  **MEASURED 2026-07-22: get_loop was called ZERO times across all 592 round-1 `runs` rows** (read-only
+  `tools_used_json` rollup). So it does NOT contaminate any round-1 tool-use statistic -- but that is
+  itself a finding: an available tool no model ever selected, in a suite where get_map was chosen in
+  67.9% of runs. Round-1 tool selection by run share: get_latest_obs / get_trend / get_climo 73.6%
+  (exactly one call per run each), get_point_forecast 73.1%, emit_taf 71.1%, get_map 67.9%,
+  get_previous_taf 59.0%, submit_taf_worksheet 58.1%, get_fcst_sounding 44.8%, get_imagery 38.7%,
+  check_taf 14.4%, query_obs 6.4%, get_sounding 0.8%, get_loop 0.0%. The two never-to-rarely-used
+  IMAGE tools (get_sounding, get_loop) are a round-2 question: drop them, or find out whether the
+  models can tell what they are for from the descriptions.
 
 - CLIMATOLOGY TOOL (`climo.py` + `store` climo_* tables + `get_climo`, this session): a station-climatology
   lookup so a forecast anchors to what is TYPICAL, not just the last 24h of obs.
@@ -474,7 +505,7 @@ artificial-forecaster/
   `evidence_ids=` so the sink RESOLVES evidence_refs (not just presence). Persistence in `store.py`:
   `taf_worksheets` + `taf_worksheet_evidence` (all worksheet SQL here; `init_worksheet_schema` +
   `insert_worksheet` one-txn idempotent replace + readers). Driver `scripts/test_worksheet_agent.py` owns the
-  agent-loop plumbing (migrates to a future agent.py): EVIDENCE THREADING (each data-tool receipt tagged
+  agent-loop plumbing (SINCE MIGRATED to agent.py, incl. the evidence threading): EVIDENCE THREADING (each data-tool receipt tagged
   `[evidence_id: ev_NNN]`, the id set passed to the sink), the MODE GATE (required refuses emit_taf until a
   worksheet passes), and persistence of the final worksheet+evidence+TAF. Self-test `scripts/test_worksheet.py`
   (no model/network): 19/19 -- guardrail rejects, enum coercion, empty-worksheet section coverage, MRV/blocking
@@ -490,7 +521,220 @@ artificial-forecaster/
   with the climo+imagery working-tree changes). Two follow-ups if wanted: a live `required`-mode run, and a
   recent-valid-time run (obs + built climo) to exercise sanity_checks with real observed data.
 
-## NEXT SESSION -- pick up here (paused 2026-07-20)
+## NEXT SESSION -- pick up here (paused 2026-07-23)
+
+### SESSION 2026-07-23 -- verification hourly rebuild, IFS + GEFS enabled, cross-model consensus experiment
+All UNCOMMITTED in the working tree. Files touched: CLAUDE.md, src/forecaster/{gribstream,
+modeldata,tools}.py, scripts/{collect,test_modeldata}.py; NEW scripts/{test_model_verification,
+consensus_experiment}.py. Non-code outputs under data/consensus_experiment/ + logs/ (gitignored).
+Self-tests: test_modeldata 76/76, ruff clean throughout.
+
+**0. ROUND 1 FULLY SCORED (rescore done, 414 evals at v2).** Harvested a fresh Pi snapshot,
+ran `score_taf.py --pending --rescore` (rebuilt the v2 rows + climo baseline the 07-22 laptop
+had that the Pi never carried -- the harvest overwrote them; pure recomputation, no data lost).
+Pooled TAFVER: **human 86.43 > human_composite 85.32 > model 83.51 > persistence 81.73 > climo
+78.47**; paired gaps model-human -2.02, model-persistence +2.09, model-climo +5.02, ALL resolved
+at >=2 SE. This RESOLVES the +1.53-vs-+2.43 label item: persistence now pairs on all 414, so the
+margin is simply **+2.09 over all scored evals** -- no subset caveat to write. GUST is the model's
+WORST element (persistence 87.2 beats model 80.7) -- the through-line for everything below.
+Pi is healthy (7d up, poller + 2 scorers cronned, 3 bulletins/cycle, on 50823b1 = 1 behind me,
+NO LONGER on orphaned c213d05). One KVBG eval stuck at 87% coverage (needs --allow-partial).
+
+**1. get_model_verification REBUILT to hourly multi-run overlap (M2 answer).** The old view
+gave each RUN its own block but NO valid hour was ever covered by >1 run, so "is the fresher run
+closer?" was unanswerable -- ROOT CAUSE: one request with asOf returns the FRESHEST run per valid
+time, so every hour carries exactly one run. FIX = `modeldata.prefetch_verification`: ONE request
+PER RUN (asOf pinned inside each run's window), hourly grid, newest 3 runs. New renderer = block
+per FIELD (T/Td/QNH/dir/spd/gust), rows=hour, cols=run, so you read ACROSS a row. Two summary
+lines: mean err (bias to subtract) + typical (error size); small-mean/large-typical = cancelling,
+not absent. Comprehension test `scripts/test_model_verification.py` (logs the DATA passed in +
+an independently-computed reference): MiniMax read it correctly (picked the least-biased run for
+temp, applied a gust-bias correction) -- 2/3 questions; the 3rd (act on typical not mean for a
+cancelling field) it got RIGHT once the header spelled it out. Confirms **GFS over-forecasts gusts
++8 to +12 kt** at KWRI across all 3 runs (obs gust 0 every hour). Stale tool description fixed.
+
+**2. HRRR verification HOURLY fix.** The verification runs were spaced 6h for ALL models, and a
+fixed `run+6h-1min` asOf pin selected the WRONG run for hourly models (targeting HRRR 06Z at
+asOf=11:59 returned the 11Z run). Added `_MODEL_CYCLE_H` (gfs/ifs 6, hrrr/nbm 1) + `_ver_spacing_h`
+(hourly models -> 3h, so 3 distinct recent runs each with real coverage); `verification_runs`
+snaps the newest run to a real cycle. HRRR went from 4 verified hours (mostly n=1) to 7 (n=1/3/7),
+freshness signal now legible. `prefetch_verification` return is now a per-MODEL run dict.
+
+**3. IFS ENABLED (ifsoper in default MODELS).** tcc is a 0-1 FRACTION vs GFS/NBM percent ->
+scaled at ingest in `modeldata._normalize` (one seam, every reader sees tcdc as percent). The
+"needs its own 3h time grid" concern was a NO-OP: off-grid valid times are NOT billed
+(gribstream.com pricing), so an hourly request just returns IFS's native 3-hourly subset. IFS is
+GLOBAL -> the ONLY extra model reaching the GFS-only OCONUS sites (PABI -7.6, PAED -4.0, KVBG -3.5
+were round-1's worst human-model gaps -- all single-guidance stations). Verified live at PAED
+(Alaska): IFS flows, tcc scaled, HRRR/NBM correctly dropped, renders cleanly beside GFS. No hazard
+bundle (no CAPE/pressure levels) -- icing/turbulence stays GFS+HRRR.
+
+**4. GEFS ENSEMBLE PRODUCT BUILT (`get_ensemble_prob` + `modeldata.prefetch_ensemble`).** Turns
+the 31-member spread into per-hour probabilities using the benchmark's OWN TAFVER category bands:
+ceiling/vis = % members per category, wind/gust = % >= 15/25/35/45 kt, T/Td = p10/p50/p90.
+KEY FACTS (all user-corrected against my wrong first guesses): GEFS is **0.25 deg, 31 members,
+3-hourly** (not 0.5/6h); it DOES carry ceiling + visibility (the catalog page's "no CEIL/VIS" was
+wrong -- verified by direct probe). **MEMBER BILLING CONFIRMED: members multiply credits LINEARLY**
+(a 31-member point pull billed 31 on a clean dashboard delta; the earlier "4" was cache
+contamination from repeated identical calls). `gribstream.TimeSeries.credits` FIXED to x member
+count -- the old formula would under-estimate a GEFS pull 31x (a real cost-guard footgun). GEFS is
+kept OUT of the default deterministic MODELS (member-billed); thinned 11-member default
+(`GEFS_DEFAULT_MEMBERS`). [[gribstream-seam]] [[v2-model-data-ifs-gefs]]
+
+**5. MODEL-DATA PRODUCT REVIEW (`logs/model_data_review_KWRI_*.md`, ~1751 cr).** Rendered every
+model-data product for one KWRI archive. **HRRR IS in use** (deterministic set = GFS/HRRR/NBM/IFS;
+it is the 2nd get_model_state block + a hazard model). Two structural gaps surfaced: (a) NO
+cross-model consensus/disagreement summary -- 4 wind tables the agent must fuse by hand (-> the
+experiment below); (b) HRRR verification was mis-tuned (fixed, item 2).
+
+**6. CROSS-MODEL CONSENSUS EXPERIMENT (`scripts/consensus_experiment.py`) -- the headline.**
+3 hard CONUS cases (KDMA monsoon microburst 49kt/TSRA; KMIB radiation fog vis 0.19/cig 100; KVBG
+marine stratus cig 200) x 5 render arms (control raw / A digest MEAN+range / B disagreement-only /
+C per-field transpose / A+C) x 2 models (Gemma, MiniMax) = 30 calls. Deterministic model data
+asOf-pinned to each issue time, 24h preceding obs + explicit NOW/window framing + a constant
+run-to-run trend note (latest + 2 prev runs). Structured-JSON forecast of peak wind+dir, gust,
+max/min temp, wind shift, present wx, min vis, min cig -- each with timing; scored vs benchmark-DB
+obs. **n=3, SUGGESTIVE not conclusive.**
+CORE FINDING: **mean consensus smooths extremes DOWNWARD** -- helps calm conditions, hurts the
+operationally-critical extremes:
+  - Gust bias FLIPS control **+2.0 -> A -2.3** (~4kt down, both models). Benign (KMIB/KVBG obs
+    gust 0): consensus lowered forecast toward reality (GOOD -- confirms the models-over-forecast-
+    gusts observation). Extreme (KDMA obs 49): consensus lowered it FURTHER (17->12, WORSE miss).
+  - Peak wind: control best (MAE 7.3), consensus worse (10.3) -- the mean under-calls the peak.
+  - Present weather TS: only the RAW views (control, B) let MiniMax call the KDMA thunderstorm;
+    smoothed arms (A/C/AC) lost the convective signal. Gemma missed it everywhere.
+  - Temperature (a SMOOTH field): consensus HELPED (Gemma max-temp MAE 3.3 control -> 1.0 C).
+  NO single arm wins -- it is element-dependent. This REVISES the mean decision we made together:
+  for hazard/extreme fields (gust, wind, convective wx) use an ENVELOPE (max / high percentile),
+  NOT the mean; mean is right only for smooth scalars. A concrete round-2 change.
+  Ceiling/vis differences are MOSTLY NOT about rendering: KVBG (marine, in the model data) every
+  arm nailed 200ft; KMIB (fog) + KDMA (convective) every arm missed -- driven by whether the signal
+  is IN the data, not how it is drawn (don't overclaim the B/C ceiling "win" -- part scoring
+  artifact from a "none" miss being excluded from the error mean).
+  Gemma RUMINATED to the token cap on the densest arm (AC, ~16k-char prompt) -- the more-data-hurts
+  convergence pattern reproduced; converged on retry.
+  THREE BUGS caught mid-build (each would silently corrupt results): (a) HRRR off-cycle hourly runs
+  only reach 18h -> a 30h forecast MUST select the 6-hourly MAIN cycle, and asOf must pin to
+  `run+1min` (pinning before the successor let hourly runs win); (b) model "ceiling" includes high
+  cirrus at 30-49 kft -> capped at 12000ft so consensus is not polluted; (c) GEFS 3-hourly grid is
+  anchored at 00Z, so an odd issue hour (KMIB 22Z) matched NOTHING -> 0 rows, 0 credits, no error
+  (promote the grid-snap into prefetch_ensemble before GEFS goes live).
+
+**7. GEFS HAZARD PICKUP CASE STUDY (MiniMax A+GEFS on the 3 cases).** Answers "did GEFS catch what
+the deterministic mean smoothed away?" -- **mostly NO, and it splits by SCALE**: KDMA microburst
+BLIND (0% of members forecast even a 15kt gust at any hour); KMIB fog BLIND (100% unrestricted
+ceiling+vis); KVBG marine PARTIAL (27% of members cig <1000ft at 06-09Z, but timed ~6h early). A
+0.25deg ensemble resolves the SYNOPTIC hazard (marine layer) partially, is blind to the MESOSCALE
+ones (microburst, fog). MiniMax A+GEFS scored **~identical to plain A** on every element -- won
+none; the apparent ceiling gain was a scoring artifact (A said 11000ft/wrong, A+GEFS said none/a
+miss excluded from error), and where GEFS had real signal (KVBG) plain A already got it. ROUND-2
+IMPLICATION: carry GEFS probability for SYNOPTIC restriction (marine/frontal/broad low cloud); it
+will NOT rescue convective gusts or fog -- the exact events the deterministic mean also loses.
+LEAD TIMES (user asked): microburst ~10h from issue (16-22h from the feeding model runs), fog
+~12-14h (16-24h from runs); both MISSED due to SCALE, not lead -- 10-14h is very forecastable.
+
+**8. CREDITS this session (~11k GRIBStream total).** Verification test 117 + IFS/review ~1751 +
+consensus experiment ~6500 (~1800 OVER the ~4700 estimate -- entirely the HRRR refetch forced by
+bug 6a; I'd billed the broken HRRR before catching the 18h truncation) + GEFS case study ~3170
+(KDMA 1089 + KVBG 1089 + KMIB 990 + probes). LLM ~$3-4 (Together; the 30 consensus calls + 3
+A+GEFS). GEFS member-billing probes ~40 cr. NOTE: MODEL_DATA still gated OFF on the Pi -- none of
+this touches live collection.
+
+### PICK UP HERE (2026-07-23)
+1. **Envelope-consensus variant.** The experiment says mean is WRONG for hazard fields. Build an
+   A-arm variant that shows MAX / high-percentile (not mean) for gust/wind + keeps mean for smooth
+   scalars, re-run the same 3 cases, see if it recovers the extremes control preserved. Cheap
+   (model data already archived in data/consensus_experiment/ -- 0 new GRIBStream credits; ~$1 LLM).
+2. **Promote the 3 experiment bug-fixes into the real code paths** if keeping GEFS/verification:
+   the GEFS grid-snap into prefetch_ensemble; HRRR main-cycle selection is already in
+   prefetch_verification but double-check archive_model_data / any forward-forecast HRRR path.
+3. **Two open M2 questions still stand** from 07-22: (a) a LIVE MODEL_DATA_ENABLED run to see the
+   agent actually READ get_model_verification in the loop (never been live); (b) model_run_verification
+   gating -- settle the worksheet keep/drop/redesign FIRST.
+4. Untouched: the August climo deadline (build BEFORE 2026-08-01, one station at a time), provider
+   price re-verify + ping_models before round 2, scheduler timeout fix.
+
+### SESSION 2026-07-22 -- doc-drift fixes, climo persisted, and get_model_verification rebuilt
+All UNCOMMITTED in the working tree. Files touched: CLAUDE.md, src/forecaster/{tools,store,
+worksheet,gribstream,modeldata}.py, scripts/{score_taf,test_modeldata}.py, and
+docs/gribstream_model_data.md (annotation only).
+
+**1. Worked `docs/july_20_findings_and_fixes.md` -- ALL items closed except the two it marked
+note-only.** The audit compared what the code DOES against what its own text SAYS. Nothing
+behaved wrongly; the text had gone stale, and some of that text is read by the model at run time.
+- C1 (worksheet told the model `get_model_run_verification` "does not exist" while the same
+  prompt told it to call the tool) and H1 (emit_taf said "base the forecast only on the
+  observations and trend provided" to an agent holding 18 tools) -- both fixed. These were the
+  two that actually mislead the agent.
+- M1/M2/M3/L4: tools.py module docstring, the IFS "unverified" comments in gribstream.py +
+  modeldata.py (names were verified 2026-07-19; IFS stays off for the 3h-grid + tcc reasons),
+  score_taf.py's baseline list, get_hazard_scan's valid_time wording.
+- CLAUDE.md batch (H2-H6, M4, M5, L1-L3, L5, L6): tree regenerated with the 14 missing modules,
+  get_loop documented, break-on-length moved to Resolved, step 11 marked DONE
+  (tafgen.emit_taf_guide), agent.py references put in past tense, the shipped inHg-column fix
+  recorded, counts corrected.
+- M6 (gribstream doc): additive STATUS block at the top + inline notes. It still said HRRR MSLP
+  was unverified -- following it would have RE-SPENT credits on a settled fact.
+- H7 (taf_worksheet_design.md) deliberately NOT edited -- superseded by the design session below.
+
+**2. get_loop: called ZERO times in 592 round-1 runs.** So it contaminates no round-1 statistic.
+Full tool-selection shares are now recorded in the imagery section. The two image tools nobody
+uses are get_loop (0%) and get_sounding (0.8%), while get_map ran in 67.9% -- so it is not that
+models avoid pictures, it is these two. Round-2 question: drop them or rewrite the descriptions.
+
+**3. Climatology baseline PERSISTED (298 rows at v2, pooled 78.11).** Ranking unchanged:
+human 85.84 > human_composite 83.96 > model 82.61 > persistence 80.63 > climo 78.11.
+FOUND AND FIXED A REAL BUG doing it: `--rescore` decided "already current" from scorer_version
+ALONE, ignoring WHICH BASELINES had rows, so `--rescore --baselines climo` on an already-v2 DB
+was a SILENT NO-OP (all 298 skipped, exit 0, nothing written). `store.evaluation_scored_at_version`
+now takes an optional `subject`, and `score_taf._already_current` requires every requested
+baseline to have rows ('human' excluded -- it is only scorable where a paired human TAF exists).
+Any future baseline added after a round is scored would have hit the same trap.
+
+**4. results_report at v2 reproduces the CLAUDE.md numbers.** ONE LABELLING FIX STILL TO MAKE
+(owner to decide): the corrected-headline block reports model-vs-persistence as **+1.53**, but
+that is the HUMAN-PAIRED subset (n=231). Over all 298 it is **+2.43 (+/-0.51)**. Both are right;
+the +1.53 currently sits in a sentence about "all 298 scored evaluations". Nothing was published
+-- owner's call is that round 1 was a proof of concept and these results are not being published.
+
+**5. M2 DESIGN SESSION -- `get_model_verification` rebuilt (the H7 answer).**
+The design doc plans Milestone 2 around a tool named `get_model_run_verification`, fetched from
+BUFKIT/mtarchive via a new `verify.py`. That plan is SUPERSEDED: the shipped tool reads the
+GRIBStream archive instead, which is leakage-safe by construction. Do not build `verify.py`.
+Decided by looking at REAL output (KWRI, GFS, 234 GRIBStream credits total), not on paper:
+- The tool now shows ALL fields (T, Td, QNH, wind dir/spd, gust), keeps forecast/observed beside
+  every error, and GROUPS BY MODEL RUN (newest 3, `_VER_MAX_RUNS`).
+- WHY multiple runs matter -- the mean T error by run went **-2.9C (00Z) -> -2.0C (06Z) -> -1.3C
+  (12Z)**. "Trust the fresher run" is now readable off the page instead of asserted in the prompt.
+- COST: ZERO extra. `modeldata._surface_vars` was ALREADY archiving wind/gust/mslp; only
+  `_VER_ALIASES` and the renderer needed changing.
+- Three judgement calls baked in, all easy to flip: wind direction prints the mean AND the
+  typical (absolute) miss, because +11deg hid a run that was typically 28deg off; a report with
+  no gust group counts as gust 0, so a model forecasting gusts that never happened shows its
+  error instead of a blank; when several reports land in one hour the ROUTINE one wins (a SPECI
+  only if there is no routine). NB an earlier claim that this should "match the scorer's worst-
+  in-hour rule" was wrong -- there is no "worst temperature".
+- NEW FINDING: **GFS over-forecast gusts by 15-22 kt** across all three runs. Round 1 already had
+  gusts as the model's worst element (-9.4 vs persistence) and blamed the missing BUFKIT gust
+  column. GRIBStream HAS a gust field -- but feeding it in raw, without this bias, could make
+  gusts WORSE. Worth its own look; it is a separate job from M2.
+- Self-tests: test_modeldata 66/66 (3 new checks; the old one pinned the previous wording),
+  test_worksheet 19/19, test_score_pending 29/29, test_tafgen 9/9, test_results_report 40/40.
+
+### PICK UP HERE TOMORROW
+1. **Decide the two open M2 questions.** (a) Do ONE live run with `MODEL_DATA_ENABLED=true` on a
+   single station/model to see whether the agent actually READS the new verification table -- it
+   has never been in a live agent's toolset (the tier was off for all of round 1, and the
+   benchmark DB has no `model_data` table at all). The 07-19 lesson applies: the agent ignored
+   the get_model_* tools entirely until collect.py NAMED them, which is already fixed.
+   (b) Should `model_run_verification` ever be GATED in required mode? Suggest settling the
+   worksheet keep/drop/redesign decision first, since gating compounds it.
+2. **Gust bias follow-up** (see 5 above) -- likely the bigger prize and independent of M2.
+3. The +1.53 vs +2.43 label fix in the corrected-headline block.
+4. Still open from 07-20 and untouched today: Pi state check (read-only ssh; the Pi may still sit
+   on orphaned c213d05 and needs an owner-run `git fetch && git reset --hard origin/main`),
+   provider price re-verification + ping_models before round 2, the scheduler timeout fix, and
+   the August climo deadline (build BEFORE 2026-08-01, one station at a time).
 
 ### SESSION 2026-07-20 EVENING -- results layer + climatology baseline + lit-review triage
 All UNCOMMITTED in the working tree. Non-code outputs of the session live only in this file.
@@ -518,7 +762,7 @@ distinct errors in numbers previously stated with confidence:
       from evaluations the subset excluded. All readers now carry `evaluation_id`.
 NOTE the older aggregators (`tafver_points`/`skill_errors`/`skill_cells`) still do NOT filter
 scorer_version -- safe today (only test_score_pending calls them, on a single-version DB) but
-a trap. Six new readers in `store.py` (seam rule: no SQL in scripts): `scorer_versions`,
+a trap. Seven new readers in `store.py` (seam rule: no SQL in scripts): `scorer_versions`,
 `evaluation_points`, `element_points`, `element_errors`, `lead_points`, `lead_errors`,
 `run_evaluations`. Self-test `scripts/test_results_report.py` 40/40 (offline temp DB;
 regression-tests all four errors above).
@@ -584,8 +828,9 @@ which is survivorship) is MiniMax 72.0%, Gemma 69.3%, **Kimi 40.0%** -- a far bi
 separator than the ~2 pt TAFVER spread.
 
 **6. BUFKIT POINT FORECAST -- used in 100% of runs, so there is NO ablation contrast.**
-Indirect evidence is unusually clean: `_fmt_point` renders exactly T / Td / wind / MSLP /
-cloud L-M-H / P01, and the model's margin over persistence tracks that column list almost
+Indirect evidence is unusually clean: `_fmt_point` renders exactly T / Td / wind / MSLP
+(+ a derived inHg column, added after round 1) / cloud L-M-H / P01, and the model's margin
+over persistence tracks that column list almost
 perfectly -- altimeter +11.4 and wind_dir +11.1 (both supplied), ceiling +2.3 (cloud % only),
 visibility -0.1 and present weather -5.7 (not supplied), **wind gust -9.4 (absent from the
 BUFKIT surface block entirely)**. Model QNH MAE 0.04 inHg ~= human 0.03, half persistence.
@@ -593,7 +838,11 @@ Model wind-speed MAE 3.16 kt is the BEST of all three subjects. Competing explan
 this data cannot rule out: element difficulty and table coverage are correlated (gusty
 regimes genuinely persist). TN carries a -0.53 C cold bias with TX unbiased (+0.14) --
 consistent with the `Td C` column bleeding into the overnight-minimum read (the old KLSV
-dewpoint-as-TN slip); cheap fix is column separation or a worksheet sanity check.
+dewpoint-as-TN slip). **The QNH half of that fix has SHIPPED** -- the point table and the
+model-state table now print a DERIVED inHg column with a "do not re-derive it" receipt note
+(`tools._inhg_md`), and `submit_taf_worksheet`'s description tells the model to take hPa->inHg
+from that printed column. Do not re-scope it for round 2. REMAINING (optional): literal T/Td
+column separation in `_fmt_point`, the temperature half of the same class of slip.
 ROUND-2 ACTION: `get_point_forecast` is the most-used tool in the suite and has NEVER been
 ablated. Add a withheld cell.
 The OTHER BUFKIT product diverges: `get_fcst_sounding` (same fetch, rendered as a skew-T) is
@@ -1127,6 +1376,8 @@ tafver.obs_hash over the exact scoring_window rows, truth-policy/profile hash vi
 `scripts/test_score_pending.py` 21/21 (offline; scored/partial/skip/future/idempotency/aggregators/
 taf_id-fallback-via-runs). Known limitation: human TAFs are parsed from raw (parse_body preferred
 when present, but no remark-stripper exists yet -- same as the validated KLSV grading path).
+**SUPERSEDED: `tafparse.strip_remarks` + the WND...AFT overlay (`WindOverride`) landed with the v2
+rescore, and are what raised human scores 85.15 -> 85.84.**
 
 ### M4 PLAN -- paired live collection (decisions locked with owner 2026-07-13)
 Goal: schedule the TAF AGENT to run in parallel with each HUMAN TAF so both are archived FROZEN together
@@ -1214,9 +1465,10 @@ DO NEXT: the two reinforcing pieces were the climatology tool + the forecasting 
 (Optional) Persist the vs-obs VERIFICATION below as a scoring note -- the first real TAFVER signal, seeds
 next-steps step 9.
 
-DEFERRED (was step 1, deprioritized 2026-07-09): the break-on-`length` convergence fix (nudge-and-continue
-on length+no-toolcall + max_tokens ~12-16k). Skipped for now because the worksheet may make it unnecessary;
-revisit only if convergence is still failing AFTER the worksheet lands. Details in Known problems below.
+DEFERRED (was step 1, deprioritized 2026-07-09) -- **since RESOLVED**: the break-on-`length` convergence
+fix (nudge-and-continue on length+no-toolcall + max_tokens ~12-16k). SHIPPED in `agent.py`
+(`_LENGTH_NUDGE`; nudge-and-continue on finish_reason=length, recovery recorded per turn) with
+collect.py running max_tokens 16000. See Resolved below.
 
 VERIFICATION vs observed METARs (KLSV 072255Z..081555Z = ~first 17h of validity; scored BOTH the
 2026-07-07 leaked run and the 2026-07-08 leak-free run). Models get SKY/VIS right (SKC 9999 held the
@@ -1245,7 +1497,8 @@ never-emit -> clean once the loop guard/caps landed.
    tool-selection + dependent-chain + image-return all verified; harness guard + time-correlation
    Fixes 1-3 landed (see Status). Tool-count guidance still holds: distinct verbs, namespace by
    data domain, subset `TOOLS` per phase — the "5-10 tools" limit is about CONFUSABILITY, not raw
-   count. Still-open candidate tools if needed: station metadata, climatology lookup.
+   count. Both earlier candidate tools have since SHIPPED: climatology lookup (`get_climo`) and
+   station metadata (`awc.station_latlon`).
 4. **TAF + METAR LIVE grabber from AWC (DONE).** `src/forecaster/awc.py` (fetch_metar/fetch_taf +
    load_metar) pulls live obs AND TAFs — incl. the military sites IEM does NOT serve — and the
    `src/forecaster/taf.py` PARSE seam (TafObs) is built and validated (see Status). Live METARs persist
@@ -1281,7 +1534,10 @@ never-emit -> clean once the loop guard/caps landed.
    `asOf` (the existing leakage guard) at roughly 500 credits per station-window -- ~150k for all of round 1
    before batching, so scope a single high-signal station (KVBG) first if this is wanted.
 10. Later: AF metric harness (OPVER/WARNVER); SuperCloud (Podman images, pre-stage weights, vLLM serve job).
-11. **Model-facing REFERENCE schema for emit_taf (agent-quality; pull forward when convenient).** The KLSV
+11. **Model-facing REFERENCE schema for emit_taf (DONE).** Built as `tafgen.emit_taf_guide()` -- a worked
+    TafProduct JSON example + the TAF text it renders to + a flattened field guide -- and injected into
+    EVERY collection system prompt (`scripts/collect.py`, alongside the worksheet guide). Covered by
+    `scripts/test_tafgen.py` ("emit_taf guide example" PASS, 9/9). Original rationale retained: the KLSV
     emit runs showed the tool's `TafProduct` JSON schema does NOT surface nested-model fields to the model:
     optional nested models render as `anyOf[$ref, null]`, so the model can't see e.g. `TafTemp`'s
     `temp_c/day/hour`. It then GUESSES the shape from validation errors (burning turns) AND anxiously
@@ -1290,7 +1546,7 @@ never-emit -> clean once the loop guard/caps landed.
     guide passed in the prompt) -- NOT a replacement for the pydantic schema, which stays the validator. Goal:
     the model can SEE the contract, cutting both the schema-guessing thrash and the verification loop. See the
     KLSV reasoning-mechanics findings + the emit-schema findings in Status (model quotes numbers / omits optional
-    fields).
+    fields). The pydantic schema remains the VALIDATOR; the guide is only the model-facing view of it.
 12. **Forecasting WORKSHEET -- intermediate tasks before emit (v1 DONE 2026-07-10).** `worksheet.py`
     (typed `TafWorksheet` + guardrails + semantic `validate()` + `worksheet_guide()`), the
     `submit_taf_worksheet` sink + `get_current_taf`/`check_taf` wrappers, config modes
@@ -1360,12 +1616,6 @@ follow-ups:
   products at (or just before) the issue hour and serve the agent the frozen copies (the M4
   "snapshot-and-replay (b)" path; also what makes historical valid times airtight and enables
   Batch API / multi-model replay off identical inputs).
-- **break-on-`length` kills a truncated emit turn (DEFERRED 2026-07-09 -- pending the worksheet).** In
-  `test_taf_agent.py`, a turn that hits the completion cap comes back `finish_reason=length` with no
-  tool_calls; the loop treats that as "model answered" and BREAKS. So a model whose emit-reasoning turn
-  exceeds max_tokens is killed with no TAF. Confirmed live: at max_tokens=8000, MiniMax (a reliable
-  converger) died mid-emit on step 3; Qwen dies to it at any cap. Fix = nudge-and-continue on
-  length+no-toolcall, then run max_tokens ~12-16k. This, not the token value, is the real blocker.
 - **Qwen agentic rumination (mitigate).** On the full-agent TAF task Qwen burned ~35.5k completion tokens and
   stalled at structural AFMAN findings without converging (issued 24h not 30h, no TX/TN). Model-specific
   (Gemma/MiniMax converge). The step-budget loop guard (below) now states the budget + nudges at turn N-2; the
@@ -1382,6 +1632,11 @@ follow-ups:
   unit-conversion inconsistency (Gemma MSLP->inHg). Addressed by the worksheet (step 12), not a code fix.
 
 ## Resolved
+- break-on-`length` killed a truncated emit turn — FIXED in `agent.py`. A turn that hit the
+  completion cap returned `finish_reason=length` with no tool_calls, and the old loop read that as
+  "model answered" and BROKE, killing the run with no TAF (confirmed live: at max_tokens=8000
+  MiniMax died mid-emit on step 3). `agent.py` now NUDGES AND CONTINUES on length+no-toolcall
+  (`_LENGTH_NUDGE`) and records the recovery on the turn; `collect.py` runs max_tokens 16000.
 - MetPy wind-direction fill in forecast soundings — FIXED 2026-07-08. `fcstsounding.parse`
   masked fill rows on Td/T only, so a level with a good temp but a -9999 wind DIRECTION reached
   `charts.skewt` -> `mpcalc.wind_components` and warned `Input over 12.566 radians`. The profile
@@ -1398,4 +1653,4 @@ follow-ups:
   to re-forecast the remainder; a carried temp whose hour has elapsed is flagged for re-emit.
   Requirement is gated on a new `TafProduct.military` flag (default True) so civil/NWS TAFs
   (which carry neither QNH nor TX/TN) are NOT falsely flagged. Late-amendment edge (window <24h)
-  can't occur: TAFs have an 8h shelf life, so >=16h of temp window always remains. Self-test 8/8.
+  can't occur: TAFs have an 8h shelf life, so >=16h of temp window always remains. Self-test 9/9.

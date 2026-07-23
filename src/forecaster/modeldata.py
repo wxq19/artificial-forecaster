@@ -67,21 +67,36 @@ _MSLP = {
 }
 
 # ECMWF IFS uses NATIVE shortnames (2t/2d/10u/10v/msl/tcc @ level 'sfc'; pressure levels as
-# 'pl 850'), NOT the GFS GRIB2 style. These are now VERIFIED from the official model page
-# (gribstream.com/models/ifsoper), so the spec below is accurate -- BUT ifsoper stays OUT of
-# the default MODELS until one live pull confirms it end to end, because two unit/format
-# quirks bite at enable time:
-#   - IFS `tcc` (total cloud) is a FRACTION 0-1, whereas GFS/NBM TCDC is PERCENT 0-100; the
-#     model-state formatter prints tcdc as-is, so a per-model *100 is needed before enabling.
-#   - IFS has NO surface visibility/gust/ceiling fields, and NO CAPE/CIN/HLCY/CLMR (so no
-#     convective-turbulence or cloud-liquid-icing signal); a future IFS hazard bundle could
-#     add icing (t/r) + shear (u/v/w) at 'pl <hPa>' levels only.
-# Global 0.25deg, runs 00/06/12/18Z, out to 360 h -> works OCONUS too (unlike HRRR).
-_IFS_ENABLED = False
+# 'pl 850'), NOT the GFS GRIB2 style, verified from the official model page
+# (gribstream.com/models/ifsoper). ENABLED 2026-07-23 -- now in the default MODELS. Handled:
+#   - IFS `tcc` (total cloud) is a FRACTION 0-1 vs GFS/NBM TCDC PERCENT 0-100 -> scaled to
+#     percent at ingest in `_normalize`, so every reader sees the tcdc alias as percent.
+#   - IFS is 3-HOURLY; off-grid valid times are not billed (gribstream.com pricing), so an
+#     hourly request just returns the native 3-hourly subset -- no separate time grid needed.
+# STILL a known gap (not blocking): IFS has NO surface visibility/gust/ceiling and NO CAPE/CIN/
+# HLCY/CLMR, so it contributes no hazard bundle (_hazard_vars returns [] for it) -- icing/
+# turbulence stays a GFS+HRRR product. A future IFS hazard bundle could add icing (t/r) + shear
+# (u/v/w) at 'pl <hPa>' levels only.
+# Global 0.25deg, runs 00/06/12/18Z, out to 360 h -> works OCONUS too (unlike HRRR/NBM).
+_IFS_ENABLED = True
+
+
+def _gefs_vars() -> list[gribstream.Var]:
+    """GEFS ensemble surface fields -- the aviation set (verified available 2026-07-23):
+    T/Td, u/v wind, GUST, MSLP, TCDC, VIS, and ceiling as HGT@cloud ceiling (same as GFS).
+    Each field is fetched across members, so a reader can build a probability per hour."""
+    V = gribstream.Var
+    return [V("TMP", "2 m above ground", "t2m"), V("DPT", "2 m above ground", "td2m"),
+            V("UGRD", "10 m above ground", "u10"), V("VGRD", "10 m above ground", "v10"),
+            V("GUST", "surface", "gust"), V("PRMSL", "mean sea level", "mslp"),
+            V("TCDC", "entire atmosphere", "tcdc"), V("VIS", "surface", "vis"),
+            V("HGT", "cloud ceiling", "ceil")]
 
 
 def _surface_vars(model: str) -> list[gribstream.Var]:
     V = gribstream.Var
+    if model == "gefsatmos":
+        return _gefs_vars()
     if model == "nbm":
         return [V("TMP", "2 m above ground", "t2m"), V("DPT", "2 m above ground", "td2m"),
                 V("WIND", "10 m above ground", "wind"), V("WDIR", "10 m above ground", "wdir"),
@@ -113,8 +128,10 @@ VVEL_LEVELS = ("700 mb", "500 mb", "300 mb")
 
 
 def _hazard_vars(model: str) -> list[gribstream.Var]:
-    # NBM is surface-only; IFS pressure-level names are unverified -> no hazard bundle until
-    # probed (icing/turbulence stays a GFS+HRRR product, as designed).
+    # NBM is surface-only; IFS names were verified 2026-07-19 (scripts/probe_ifs.py) but IFS
+    # is intentionally disabled pending a per-model 3h/6h time grid + tcc fraction->percent
+    # handling (see _IFS_ENABLED) -> no hazard bundle for either. Icing/turbulence stays a
+    # GFS+HRRR product, as designed.
     if model in ("nbm", "ifsoper"):
         return []
     V = gribstream.Var
@@ -365,6 +382,17 @@ def _time_grid(anchor: datetime, hours: int, step_h: int, back_h: int = 0) -> li
     return [start + timedelta(hours=step_h * k) for k in range(n + 1)]
 
 
+def _normalize(model: str, alias: str, value):
+    """Bring a raw model value onto the archive's per-alias unit convention, so a downstream
+    reader can treat an alias identically across models. Only IFS needs it today: its `tcc`
+    (total cloud) is a 0-1 FRACTION where GFS/NBM TCDC is a 0-100 PERCENT, and the tcdc alias
+    is documented as percent. Scaling here keeps that contract at the one seam that writes the
+    archive, instead of every formatter special-casing IFS."""
+    if value is not None and model == "ifsoper" and alias == "tcdc":
+        return value * 100.0
+    return value
+
+
 def _flatten(model: str, ts: gribstream.TimeSeries, *, as_of, fetched_at) -> list[dict]:
     """A TimeSeries -> model_data row dicts (one per row x variable column)."""
     var_cols = [c for c in ts.columns if c not in _SKIP_COLS]
@@ -379,7 +407,7 @@ def _flatten(model: str, ts: gribstream.TimeSeries, *, as_of, fetched_at) -> lis
             rows.append({
                 "model": model, "run": run, "valid_time": valid,
                 "lat": lat, "lon": lon, "loc_id": loc, "variable": v,
-                "value": r.get(v), "member": member,
+                "value": _normalize(model, v, r.get(v)), "member": member,
                 "as_of": as_of, "fetched_at": fetched_at,
             })
     return rows
@@ -444,13 +472,183 @@ def _fetch_and_insert(
     return charged, len(to_insert), inserted, notes
 
 
+# --- verification pulls -----------------------------------------------------------------
+# Verification is a DIFFERENT query shape from the forecast archive, and the difference is
+# not a parameter. Given a valid-time list plus asOf, GRIBStream returns, for each valid
+# time, the forecast from the FRESHEST qualifying run -- exactly right for "what is the
+# guidance now", and useless for "is the fresher run closer", because then every valid time
+# carries exactly ONE run and no hour is ever covered twice. Widening the window does not
+# help: while a 12Z run exists in the same request, 00Z will never be returned for 16Z.
+# So verification fetches ONE REQUEST PER RUN, each with asOf pinned inside that run's own
+# window (after it, before its successor) so that run is the only one available. Every hour
+# then carries one forecast per run and the comparison is real.
+# Native run cadence per model -- how often a new cycle posts. Two jobs: (a) SNAP the newest
+# verification run to a real cycle (GFS/IFS only exist at 00/06/12/18Z; HRRR/NBM every hour),
+# and (b) PIN each request's asOf to just before the successor at the SAME cadence, so exactly
+# the target run qualifies. Using a fixed 6h pin on an hourly model was the old bug: targeting
+# the 06Z HRRR run at asOf=11:59 returned the 11Z run, collapsing every run to a late, near-
+# zero-coverage hourly cycle.
+_MODEL_CYCLE_H = {"gfs": 6, "ifsoper": 6, "hrrr": 1, "nbm": 1}
+
+
+def _model_cycle_h(model: str) -> int:
+    return _MODEL_CYCLE_H.get(model, 6)
+
+
+def _ver_spacing_h(model: str) -> int:
+    """Hours between the runs verification compares. A 6-hourly model uses its native 6h. A
+    rapid-refresh (hourly) model at 1h spacing would give three near-identical columns that
+    each cover almost nothing -- observations end at the issue time, so only OLDER runs have
+    many hours to verify against -- so hourly models are spaced 3h: distinct recent runs with
+    real coverage that still show whether the fresher run is closer."""
+    return 6 if _model_cycle_h(model) >= 6 else 3
+
+
+def _verify_vars(model: str) -> list[gribstream.Var]:
+    """The surface subset verification actually renders. Cheaper per hour than the full
+    surface set (credits scale with variables), which is what buys the hourly grid."""
+    keep = ("t2m", "td2m", "u10", "v10", "wind", "wdir", "gust", "mslp")
+    return [v for v in _surface_vars(model) if v.alias in keep]
+
+
+def verification_runs(as_of: datetime, *, n_runs: int = 3, cycle_h: int = 6,
+                      spacing_h: int | None = None) -> list[datetime]:
+    """The newest `n_runs` runs at/before `as_of`, newest first. The newest is snapped to a
+    real `cycle_h` cadence (so a 6-hourly model never targets a cycle that does not exist);
+    successive runs step back by `spacing_h` (defaults to `cycle_h`)."""
+    spacing_h = spacing_h or cycle_h
+    newest = as_of.replace(minute=0, second=0, microsecond=0)
+    newest -= timedelta(hours=newest.hour % cycle_h)
+    return [newest - timedelta(hours=spacing_h * k) for k in range(n_runs)]
+
+
+def prefetch_verification(
+    station: str,
+    *,
+    as_of: datetime | None = None,
+    models: tuple[str, ...] = MODELS,
+    hours_back: int = 24,
+    n_runs: int = 3,
+    step_h: int = 1,
+    db_path: str | None = None,
+    use_cache: bool = True,
+) -> dict:
+    """Archive the last `n_runs` runs of each model over the SAME hourly grid, so the
+    verification table can show one hour forecast by several runs.
+
+    One request per (model, run). `as_of` for each request is pinned just before the NEXT
+    run so only that run qualifies -- leakage-safe by construction, since every run used is
+    older than the issue time. Each run is asked only for the hours it can actually cover
+    (a run cannot forecast before it starts), so the credits land at roughly
+    sum over runs of (covered hours x variables), not n_runs x window x variables."""
+    as_of = (as_of or _utcnow()).replace(minute=0, second=0, microsecond=0)
+    window_start = as_of - timedelta(hours=hours_back)
+    lat, lon, name = site_coord(station)
+    coords = [(lat, lon, name)]
+    use_models, dropped = _applicable_models(coords, models)
+    fetched_at = _utcnow()
+    charged, to_insert, notes = 0, [], []
+    if dropped:
+        notes.append(f"skipped CONUS-only model(s) {','.join(dropped)} for {station}")
+
+    model_runs: dict = {}
+    for model in use_models:
+        variables = _verify_vars(model)
+        cycle = _model_cycle_h(model)
+        runs = verification_runs(as_of, n_runs=n_runs, cycle_h=cycle,
+                                 spacing_h=_ver_spacing_h(model))
+        model_runs[model] = [f"{r:%Y-%m-%dT%HZ}" for r in runs]
+        for run in runs:
+            start = max(run, window_start)
+            if start > as_of:
+                continue
+            n = int((as_of - start).total_seconds() // 3600) // step_h
+            times = [start + timedelta(hours=step_h * k) for k in range(n + 1)]
+            # Pin asOf just before this run's successor at the MODEL's own cadence, so exactly
+            # this run qualifies (a fixed 6h pin on an hourly model selected the wrong run).
+            run_as_of = run + timedelta(hours=cycle) - timedelta(minutes=1)
+            try:
+                ts = gribstream.fetch_points(model, coords, variables, times=times,
+                                             as_of=run_as_of, use_cache=use_cache)
+                charged += ts.charged
+                to_insert += _flatten(model, ts, as_of=run_as_of, fetched_at=fetched_at)
+            except ValueError as e:
+                notes.append(f"{model} run {run:%Y-%m-%dT%HZ}: {e}")
+
+    with store.write_lock(db_path):
+        con = store.connect(db_path or settings.db_path)
+        try:
+            store.init_model_data_schema(con)
+            inserted = store.insert_model_data(con, to_insert)
+        finally:
+            con.close()
+    return {"station": station.upper(), "models": list(use_models),
+            "runs": model_runs,
+            "window": f"{window_start:%Y-%m-%dT%HZ}..{as_of:%Y-%m-%dT%HZ}",
+            "credits_charged": charged, "rows": len(to_insert), "inserted": inserted,
+            "notes": notes}
+
+
+# --- GEFS ensemble product --------------------------------------------------------------
+GEFS_MODEL = "gefsatmos"
+GEFS_N_MEMBERS = 31                         # control + 30 perturbations
+# A thinned default: members are billed linearly, and ~10 members recover most of the spread
+# for a probability read, so the roster-wide default is a subset. Override for a full pull.
+GEFS_DEFAULT_MEMBERS = tuple(range(0, GEFS_N_MEMBERS, 3))   # 0,3,6,...,30 -> 11 members
+
+
+def prefetch_ensemble(
+    station: str,
+    *,
+    as_of: datetime | None = None,
+    hours: int = 30,
+    step_h: int = 3,
+    members: tuple[int, ...] = GEFS_DEFAULT_MEMBERS,
+    db_path: str | None = None,
+    use_cache: bool = True,
+) -> dict:
+    """Archive the GEFS ensemble for one station so `get_ensemble_prob` can turn the member
+    spread into hourly probabilities. Distinct from `prefetch`: members are billed LINEARLY,
+    so this is deliberately NOT part of the default surface archive -- credits are
+    valid_times x variables x len(members) (coords pool to one bundle at a single site).
+
+    GEFS is 3-hourly; step_h below 3 just returns the native 3-hourly subset (off-grid times
+    are not billed). `members` defaults to a thinned subset -- pass range(31) for the full
+    ensemble. `as_of` pins the run cutoff (leakage-safe like the deterministic prefetch)."""
+    as_of = (as_of or _utcnow()).replace(minute=0, second=0, microsecond=0)
+    lat, lon, name = site_coord(station)
+    times = _time_grid(as_of, hours, step_h)
+    fetched_at = _utcnow()
+    charged, to_insert, notes = 0, [], []
+    try:
+        ts = gribstream.fetch_points(GEFS_MODEL, [(lat, lon, name)], _gefs_vars(),
+                                     times=times, as_of=as_of, members=list(members),
+                                     use_cache=use_cache)
+        charged += ts.charged
+        to_insert += _flatten(GEFS_MODEL, ts, as_of=as_of, fetched_at=fetched_at)
+    except ValueError as e:
+        notes.append(f"{GEFS_MODEL}: {e}")
+
+    with store.write_lock(db_path):
+        con = store.connect(db_path or settings.db_path)
+        try:
+            store.init_model_data_schema(con)
+            inserted = store.insert_model_data(con, to_insert)
+        finally:
+            con.close()
+    return {"station": station.upper(), "model": GEFS_MODEL, "members": list(members),
+            "window": f"{as_of:%Y-%m-%dT%HZ}..{as_of + timedelta(hours=hours):%Y-%m-%dT%HZ}",
+            "credits_charged": charged, "rows": len(to_insert), "inserted": inserted,
+            "notes": notes}
+
+
 def prefetch(
     station: str,
     *,
     as_of: datetime | None = None,
     models: tuple[str, ...] = MODELS,
     hours: int = 30,
-    step_h: int = 2,
+    step_h: int = 1,
     hazards: bool = True,
     hazard_step_h: int = 3,
     back_hours: int = 6,
@@ -478,7 +676,7 @@ def prefetch_many(
     as_of: datetime | None = None,
     models: tuple[str, ...] = MODELS,
     hours: int = 30,
-    step_h: int = 2,
+    step_h: int = 1,
     hazards: bool = True,
     hazard_step_h: int = 3,
     back_hours: int = 6,

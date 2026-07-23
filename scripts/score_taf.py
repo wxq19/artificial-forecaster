@@ -6,8 +6,9 @@ Two modes:
     writes the markdown report; nothing is persisted.
   - --pending (M4 step 3, the post-validity pass): selects pending evaluations whose
     windows have elapsed, checks truth coverage (optionally backfilling the missing
-    obs from IEM with --backfill iem), scores subject + baselines (persistence and the
-    paired HUMAN routine TAF), persists the per-scorer result tables, and flips the
+    obs from IEM with --backfill iem), scores subject + baselines (persistence,
+    climatology, and the paired HUMAN routine TAF, plus the routine+amendments
+    human_composite when amendments exist), persists the per-scorer result tables, and flips the
     evaluation to scored (or partial with --allow-partial). All writes run under the
     single-writer lock. An evaluation that fails required coverage stays PENDING --
     partial success and failed-required-coverage are distinct outcomes.
@@ -495,18 +496,29 @@ def _target_versions(scorers: list[str]) -> dict[str, str]:
             for n in scorers if n in _SCORER_MODULES}
 
 
-def _already_current(con, evaluation_id: str, scorers: list[str]) -> bool:
+def _already_current(con, evaluation_id: str, scorers: list[str],
+                     baselines: list[str] | None = None) -> bool:
     """True if EVERY requested scorer already has a result row for this evaluation at
-    its CURRENT version -- so a rescore pass can skip it instead of re-deriving truth.
-    Any scorer behind its version (or absent) makes the whole evaluation due."""
+    its CURRENT version, FOR EVERY REQUESTED SUBJECT -- so a rescore pass can skip it
+    instead of re-deriving truth. Any scorer behind its version (or absent), or any
+    requested baseline with no row, makes the whole evaluation due.
+
+    The per-subject check matters: a round scored before a baseline existed is at the
+    current scorer_version but has none of that baseline's rows, so a version-only
+    check would make `--rescore --baselines <new>` a silent no-op (observed 2026-07-22
+    when adding climatology to an already-v2 round-1 DB). 'human' is excluded -- it is
+    only scorable where a paired human TAF exists, so a missing human row is normal
+    and would make every unpaired evaluation permanently due."""
+    subjects = ["subject"] + [b for b in (baselines or []) if b != "human"]
     for name in scorers:
         entry = _SCORER_MODULES.get(name)
         if entry is None:
             continue
         mod, table = entry
-        if not store.evaluation_scored_at_version(con, evaluation_id, table,
-                                                  mod.SCORER_VERSION):
-            return False
+        for subj in subjects:
+            if not store.evaluation_scored_at_version(con, evaluation_id, table,
+                                                      mod.SCORER_VERSION, subject=subj):
+                return False
     return True
 
 
@@ -534,7 +546,8 @@ def cmd_pending(args) -> int:
                 due, current = [], 0
                 for ev in pend:
                     if ev["status"] != "pending" and _already_current(
-                            con, ev["evaluation_id"], args.scorers_list):
+                            con, ev["evaluation_id"], args.scorers_list,
+                            args.baselines_list):
                         current += 1
                     else:
                         due.append(ev)

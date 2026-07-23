@@ -1143,16 +1143,25 @@ def pending_evaluations(con: duckdb.DuckDBPyConnection,
 
 
 def evaluation_scored_at_version(con: duckdb.DuckDBPyConnection, evaluation_id: str,
-                                 table: str, scorer_version: str) -> bool:
+                                 table: str, scorer_version: str,
+                                 subject: str | None = None) -> bool:
     """True if this evaluation already has a result row in `table` (a *_runs table) at
     `scorer_version` -- lets a rescore pass skip evaluations that are already current
-    instead of re-deriving them. Assumes init_results_schema has run."""
+    instead of re-deriving them. Assumes init_results_schema has run.
+
+    `subject` narrows the check to ONE subject ('subject', 'persistence', 'climo',
+    'human', ...). Version alone is not sufficient currency: a round scored before a
+    baseline existed is at the current VERSION but is missing that baseline's rows, and
+    a version-only check makes the rescore that would add them a silent no-op. Callers
+    that request specific baselines should ask per subject."""
     if table not in _SCORER_RUN_TABLES:
         raise ValueError(f"unknown scorer runs table: {table}")
-    row = con.execute(
-        f"SELECT 1 FROM {table} WHERE evaluation_id = ? AND scorer_version = ? LIMIT 1",
-        [evaluation_id, scorer_version]).fetchone()
-    return row is not None
+    sql = f"SELECT 1 FROM {table} WHERE evaluation_id = ? AND scorer_version = ?"
+    params: list = [evaluation_id, scorer_version]
+    if subject is not None:
+        sql += " AND subject = ?"
+        params.append(subject)
+    return con.execute(sql + " LIMIT 1", params).fetchone() is not None
 
 
 def finalize_evaluation(con: duckdb.DuckDBPyConnection, evaluation_id: str, *,

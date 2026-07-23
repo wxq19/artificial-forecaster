@@ -14,7 +14,7 @@ Run: uv run python scripts/test_modeldata.py
 
 import shutil
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from forecaster import gribstream, modeldata, store, tools
@@ -49,11 +49,18 @@ def test_client():
             for h in (18, 19, 20) for la in (44.0, 45.0)]   # 3 times x 2 coords, 2 vars
     ts = gribstream.TimeSeries("gfs", "u", cols, rows)
     check("credits = times*vars*ceil(coords/500)", ts.credits == 3 * 2 * 1, f"got {ts.credits}")
-    check("member excluded from credits", "member" in cols and ts.credits == 6)
+    check("member column not counted as a variable", "member" in cols and ts.credits == 6)
     check("charged == credits when not cached", ts.charged == ts.credits)
     ts.cached = True
     check("charged == 0 on cache hit", ts.charged == 0)
     check("empty rows -> 0 credits", gribstream.TimeSeries("gfs", "u", cols, []).credits == 0)
+    # Ensemble: members multiply the bill LINEARLY (verified 2026-07-23, 31 members -> 31 cr).
+    ecols = ["forecasted_at", "forecasted_time", "lat", "lon", "name", "member", "t2m"]
+    ens = [{"forecasted_time": datetime(2026, 7, 17, 18), "lat": 44.0, "lon": -93.0,
+            "name": "X", "member": m, "t2m": 290.0} for m in range(5)]   # 1 time x 1 var x 5 mem
+    check("credits multiply by member count",
+          gribstream.TimeSeries("gefsatmos", "u", ecols, ens).credits == 5,
+          f"got {gribstream.TimeSeries('gefsatmos', 'u', ecols, ens).credits}")
 
     V = [gribstream.Var("TMP", "2 m above ground", "t2m")]
     for label, fn in [
@@ -162,10 +169,38 @@ def seed_state_db(path):
     for var, val in [("t500", 264.15), ("rh500", 80.0), ("cape", 900.0), ("cin", -30.0),
                      ("u850", 6.0), ("v850", 1.0), ("u300", 44.0), ("v300", 12.0), ("w500", -2.0)]:
         rows.append(md_row("hrrr", hz, LAT, LON, "KTEST", var, val))
+    # An OLDER run covering the SAME 18Z valid time, forecasting worse. This is the case the
+    # verification table exists for: one hour, several runs, so "was the fresher run closer?"
+    # is answerable. GRIBStream only returns one run per valid time per request, so the
+    # archive only ever holds this shape when prefetch_verification pins asOf per run.
+    older = RUN - timedelta(hours=6)
+    for var, val in [("t2m", 303.0), ("td2m", 286.0), ("u10", -9.0), ("v10", 1.0),
+                     ("gust", 25.0), ("mslp", 101100.0)]:
+        rows.append(md_row("gfs", datetime(2026, 7, 17, 18), LAT, LON, "KTEST", var, val,
+                           run=older))
     store.insert_model_data(con, rows)
     # obs at 18Z for verification (temp 25C so model 300K=26.85C -> +~1.9 bias)
     o = metar_parse("KTEST 171800Z 21008KT 10SM CLR 25/15 A2992")
     store.insert_obs(con, [o], year=2026, month=7, source="test")
+    con.close()
+
+
+def seed_ensemble_db(path):
+    """A 10-member GEFS ensemble at one valid time with a KNOWN spread, so the probability
+    numbers are checkable: 4/10 ceilings below 200 ft (cat A = 40%), 8/10 gusts >= 15 kt."""
+    con = store.connect(path)
+    store.init_model_data_schema(con)
+    vt = datetime(2026, 7, 23, 18)
+    ceil_m = [30, 40, 50, 55, 20000, 20000, 20000, 20000, 20000, 20000]   # 4 low, 6 unlimited
+    gust_ms = [5, 8, 10, 12, 13, 14, 8, 9, 20, 6]                         # *1.944 kt; 8 >= 15kt
+    rows = []
+    for mem in range(10):
+        for var, val in [("ceil", ceil_m[mem]), ("vis", 16000.0), ("gust", gust_ms[mem]),
+                         ("u10", 3.0), ("v10", 4.0), ("t2m", 293.0 + mem * 0.3), ("td2m", 288.0)]:
+            rows.append({"model": "gefsatmos", "run": RUN, "valid_time": vt, "lat": LAT, "lon": LON,
+                         "loc_id": "KTEST", "variable": var, "value": val, "member": mem,
+                         "as_of": AS_OF, "fetched_at": FETCHED})
+    store.insert_model_data(con, rows)
     con.close()
 
 
@@ -191,12 +226,39 @@ def test_formatters():
 
     r = tools.run_tool("get_model_verification", {"station": "KTEST", "model": "gfs"}, db_path=path)
     check("get_model_verification matches the seeded ob + bias",
-          "mean T bias" in r.text, r.text)
+          "+1.9" in r.text and "TEMPERATURE (C)" in r.text, r.text[:600])
+    check("get_model_verification renders a block per field",
+          all(f in r.text for f in ("TEMPERATURE (C)", "DEWPOINT (C)", "ALTIMETER / MSLP (inHg)",
+                                    "WIND DIRECTION (deg)", "WIND SPEED (kt)",
+                                    "WIND GUST (kt)")), r.text[:300])
+    check("get_model_verification puts each RUN in its own column",
+          "18Z run" in r.text and "12Z run" in r.text, r.text[:900])
+    # The point of the layout: the same hour, two runs, on one line.
+    trow = next((ln for ln in r.text.splitlines() if ln.strip().startswith("17/18Z")), "")
+    check("get_model_verification shows one hour across several runs on ONE row",
+          trow.count("(") >= 2, trow)
+    check("get_model_verification separates mean bias from typical error size",
+          "mean err" in r.text and "typical" in r.text and "cancelling" in r.text, r.text[:900])
 
     r = tools.run_tool("get_nearby_model_data", {"station": "KTEST", "variable": "t2m", "model": "gfs"},
                        db_path=path)
     check("get_nearby_model_data lists both points",
           "KTEST" in r.text and "KNB" in r.text, r.text)
+
+    seed_ensemble_db(path + ".ens")
+    r = tools.run_tool("get_ensemble_prob", {"station": "KTEST"}, db_path=path + ".ens")
+    check("get_ensemble_prob renders category + exceedance + percentile blocks",
+          all(s in r.text for s in ("CEILING", "VISIBILITY", "WIND SPEED", "WIND GUST",
+                                    "TEMPERATURE / DEWPOINT")), r.text[:300])
+    # 4 of 10 members below 200 ft -> ceiling cat A = 40%; 8 of 10 gust >= 15 kt.
+    cig = next((ln for ln in r.text.splitlines() if ln.strip().startswith("23/18Z")), "")
+    check("get_ensemble_prob ceiling category probability (40% cat A)", " 40" in cig, cig)
+    grow = [ln for ln in r.text.splitlines() if ln.strip().startswith("23/18Z")]
+    check("get_ensemble_prob gust exceedance present (80% >= 15kt)",
+          any(" 80" in ln for ln in grow), grow)
+    check("get_ensemble_prob has no data for a non-ensemble station -> feedback",
+          "no GEFS ensemble" in tools.run_tool("get_ensemble_prob", {"station": "KTEST"},
+                                                db_path=path).text)
     check("get_nearby_model_data converts t2m to C", "(C)" in r.text)
 
     # not-found feedback (not a crash)
@@ -313,13 +375,26 @@ def test_grid_flow_batch_ifs():
     chunks = list(modeldata._chunk(big))
     check("_chunk splits >500 into <=500 batches", [len(c) for c in chunks] == [500, 500, 100])
 
-    # IFS scaffold: fetchable + verified names, out of default MODELS, no hazard bundle
+    # IFS: enabled 2026-07-23 -- in the default MODELS, verified native names, tcc scaled to
+    # percent at ingest, still no hazard bundle, and global (kept OCONUS by _applicable_models)
     check("ifsoper is a VALID model", "ifsoper" in gribstream.VALID_MODELS)
-    check("ifsoper is NOT in the default prefetch set", "ifsoper" not in modeldata.MODELS)
+    check("ifsoper is in the default prefetch set", "ifsoper" in modeldata.MODELS)
     ifs = {(v.name, v.level, v.alias) for v in modeldata._surface_vars("ifsoper")}
     check("ifs surface uses ECMWF native names @ sfc",
           ("2t", "sfc", "t2m") in ifs and ("msl", "sfc", "mslp") in ifs and ("tcc", "sfc", "tcdc") in ifs)
     check("ifs has no hazard bundle yet", modeldata._hazard_vars("ifsoper") == [])
+    # tcc is a 0-1 fraction in IFS; _normalize scales it to percent so the tcdc alias is
+    # consistent with GFS/NBM. Other fields and other models are untouched.
+    check("ifs tcc fraction scaled to percent at ingest",
+          modeldata._normalize("ifsoper", "tcdc", 0.61) == 61.0)
+    check("_normalize leaves non-tcdc IFS fields alone",
+          modeldata._normalize("ifsoper", "t2m", 293.0) == 293.0)
+    check("_normalize leaves other models' tcdc alone",
+          modeldata._normalize("gfs", "tcdc", 61.0) == 61.0)
+    # IFS is global, so it must survive the OCONUS drop that removes HRRR/NBM.
+    keep, drop = modeldata._applicable_models([(64.8, -147.9, "PABI")], modeldata.MODELS)
+    check("ifs kept OCONUS while hrrr/nbm dropped",
+          "ifsoper" in keep and "gfs" in keep and "hrrr" in drop and "nbm" in drop)
     try:
         gribstream.fetch_points("ifsoper", [(1.0, 1.0, "X")], [gribstream.Var("2t", "sfc", "t2m")])
         check("ifsoper accepted as a model (raises on missing time, not model)", False)

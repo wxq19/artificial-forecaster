@@ -297,7 +297,7 @@ def _run_and_persist(args, st, icao, issue, valid_from, valid_to,
     # Strip get_current_taf (leakage) always; strip the model-data tier unless enabled (a
     # switchable experiment axis -- off means the archive is empty and no credits were spent).
     _MODEL_DATA_TOOLS = {"get_model_state", "get_hazard_scan", "get_model_verification",
-                         "get_nearby_model_data"}
+                         "get_nearby_model_data", "get_ensemble_prob"}
     _drop = {"get_current_taf"} | (set() if args.model_data else _MODEL_DATA_TOOLS)
     toolset = [t for t in TOOLS if t["function"]["name"] not in _drop]
     if args.taf_access:
