@@ -25,6 +25,7 @@ from forecaster import tafgen
 from forecaster import worksheet as wksht
 from forecaster.config import settings
 from forecaster.llm import client as _default_client
+from forecaster.llm import routing as _routing
 from forecaster.tafgen import TafProduct
 from forecaster.tools import ToolResult, _image_mime, run_tool
 from forecaster.worksheet import TafWorksheet
@@ -62,6 +63,9 @@ class StepRecord:
     recovery: str | None = None     # final_answer's reasoning-field recovery flag, if any
     served_model: str | None = None         # the model id the API RETURNED for this turn
     system_fingerprint: str | None = None   # provider build id; often None on Together
+    provider: str | None = None             # OpenRouter's chosen backend; None off OpenRouter
+    reasoning_tokens: int = 0               # CoT tokens (billed as completion); rumination measure
+    cost: float | None = None               # exact USD for this turn when the endpoint reports it
 
 
 @dataclass
@@ -83,6 +87,14 @@ class AgentConfig:
     stop_on_clean_taf: bool = True      # stop as soon as emit_taf returns a validate()-clean TAF
     step_budget_nudge: bool = False     # at turn max_steps-2, nudge to emit if none attempted yet
     db_path: str | None = None
+    # Extra request-body keys merged into every turn (OpenAI SDK passthrough). Used for
+    # per-run knobs the standard params do not cover -- reasoning_effort, usage accounting.
+    # The provider pin from llm.routing() is merged separately and wins on key collision.
+    extra_body: dict | None = None
+    # Per-request HTTP timeout in seconds. A call exceeding it is caught like any API error
+    # (fatal + loop ends), so one stuck or endlessly-ruminating turn fails ITS cell instead
+    # of hanging the whole matrix. None = the client default (10 min).
+    request_timeout: float | None = None
 
 
 @dataclass
@@ -95,6 +107,8 @@ class RunResult:
     used: Counter = field(default_factory=Counter)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    reasoning_tokens: int = 0           # subset of completion spent on CoT; 0 if not reported
+    cost: float | None = None           # exact USD summed over turns; None if never reported
     final_taf: TafProduct | None = None             # first validate()-clean emit
     last_taf: TafProduct | None = None              # most recent emit, clean or not
     worksheet: TafWorksheet | None = None           # last worksheet with no blocking findings
@@ -130,6 +144,13 @@ class RunResult:
         """Distinct provider build ids seen across turns (often empty on Together)."""
         return sorted({s.system_fingerprint for s in self.steps if s.system_fingerprint})
 
+    @property
+    def providers(self) -> list[str]:
+        """Distinct backends OpenRouter routed to across turns; empty off OpenRouter. More
+        than one = the run was rerouted mid-flight, the same data-quality flag served_models
+        exists to catch (different backend = different quantization = not one config cell)."""
+        return sorted({s.provider for s in self.steps if s.provider})
+
 
 def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResult:
     """Drive the tool-calling loop for one (model, config) against a seeded `messages`
@@ -153,6 +174,14 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
                       tool_choice="auto", temperature=cfg.temperature, max_tokens=cfg.max_tokens)
         if cfg.seed is not None:
             kwargs["seed"] = cfg.seed
+        # Provider pin (OpenRouter only; {} everywhere else, leaving the body unchanged).
+        # Read per turn, not cached, so a driver can re-point the seam mid-process.
+        # cfg.extra_body carries per-run knobs (reasoning_effort, usage accounting); the
+        # pin is merged last so a caller cannot accidentally unpin the route.
+        if body := {**(cfg.extra_body or {}), **_routing()}:
+            kwargs["extra_body"] = body
+        if cfg.request_timeout is not None:
+            kwargs["timeout"] = cfg.request_timeout
         try:
             r = client.chat.completions.create(**kwargs)
         except Exception as e:  # noqa: BLE001 -- a model that rejects the toolset is a finding, not a crash
@@ -160,21 +189,44 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
             res.stop_reason = "fatal"
             return res
 
+        # A provider can return HTTP 200 with an error body (or an empty choices list) instead
+        # of raising -- seen on OpenRouter's aggregated backends. .choices is then None/empty,
+        # so treat it like any API error: record it and end the run, don't crash the caller
+        # (a run is data, not a crash).
+        if not getattr(r, "choices", None):
+            err = getattr(r, "error", None)
+            res.fatal = f"no choices in response: {err or r!r}"[:300]
+            res.stop_reason = "fatal"
+            return res
+
         # usage is always present on Together, but round 2 adds providers -- a null usage
         # response must record 0 tokens, not crash (a run is data, not a crash).
         pt = r.usage.prompt_tokens if r.usage else 0
         ct = r.usage.completion_tokens if r.usage else 0
+        # Exact spend + CoT burn, reported only when the endpoint supports it (OpenRouter
+        # with usage accounting requested). Absent elsewhere -> cost stays None and the
+        # token counts alone carry, exactly as before.
+        cost = getattr(r.usage, "cost", None) if r.usage else None
+        det = getattr(r.usage, "completion_tokens_details", None) if r.usage else None
+        rt = getattr(det, "reasoning_tokens", None) or 0
         res.prompt_tokens += pt
         res.completion_tokens += ct
+        res.reasoning_tokens += rt
+        if cost is not None:
+            res.cost = (res.cost or 0.0) + float(cost)
         msg = r.choices[0].message
         tcs = msg.tool_calls or []
         rec = StepRecord(
             n=n, finish_reason=r.choices[0].finish_reason,
             prompt_tokens=pt, completion_tokens=ct,
+            reasoning_tokens=rt, cost=(float(cost) if cost is not None else None),
             content=(msg.content or "").strip(),
             reasoning=(getattr(msg, "reasoning", None) or "").strip(),
             served_model=getattr(r, "model", None),
             system_fingerprint=getattr(r, "system_fingerprint", None),
+            # OpenRouter returns a top-level `provider`; the SDK's models keep unknown
+            # fields reachable, so this is None rather than an error off OpenRouter.
+            provider=getattr(r, "provider", None),
         )
 
         if not tcs:                     # no tool calls this turn

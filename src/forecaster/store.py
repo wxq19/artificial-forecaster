@@ -1212,7 +1212,8 @@ CREATE TABLE IF NOT EXISTS runs (
     model             VARCHAR,              -- the model id we REQUESTED
     served_model      VARCHAR,              -- the model id the API RETURNED (may differ / drift)
     system_fingerprint VARCHAR,             -- provider build id; often NULL on Together
-    base_url          VARCHAR,              -- endpoint that served the run (local/Together/vLLM)
+    provider          VARCHAR,              -- backend OpenRouter routed to; NULL off OpenRouter, ' | '-joined if rerouted mid-run
+    base_url          VARCHAR,              -- endpoint that served the run (local/Together/vLLM/OpenRouter)
     temperature       DOUBLE,
     max_tokens        INTEGER,
     seed              INTEGER,              -- determinism knob, if set
@@ -1249,7 +1250,7 @@ _RUNS_MIGRATIONS = (
     ("served_model", "VARCHAR"), ("system_fingerprint", "VARCHAR"), ("base_url", "VARCHAR"),
     ("temperature", "DOUBLE"), ("max_tokens", "INTEGER"), ("seed", "INTEGER"),
     ("toolset_hash", "VARCHAR"), ("window_mismatch", "VARCHAR"), ("duration_s", "DOUBLE"),
-    ("tool_errors_json", "JSON"),
+    ("tool_errors_json", "JSON"), ("provider", "VARCHAR"),
 )
 
 
@@ -1269,7 +1270,7 @@ def insert_run(con: duckdb.DuckDBPyConnection, run: dict) -> None:
     cols = [
         "run_id", "experiment_id", "station", "issue_time_utc", "valid_from_utc",
         "valid_to_utc", "producer_kind", "model", "served_model", "system_fingerprint",
-        "base_url", "temperature", "max_tokens", "seed", "toolset_hash",
+        "provider", "base_url", "temperature", "max_tokens", "seed", "toolset_hash",
         "worksheet_mode", "config_id", "harness_git_sha", "prompt_tokens",
         "completion_tokens", "n_steps", "n_tool_calls", "tools_used_json", "stop_reason",
         "convergence", "first_emit_step", "nudge_step", "taf_id", "taf_clean",

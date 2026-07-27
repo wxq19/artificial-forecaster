@@ -17,6 +17,19 @@ class Settings(BaseSettings):
     # only varied sampling knob and any config cell is reproducible in principle. Sent to
     # the API only when set (best-effort determinism on Together; None = omit the param).
     llm_seed: int | None = 1337
+    # OpenRouter routes a slug to whichever backend it likes, at whatever quantization -- so an
+    # unpinned round silently mixes providers and the scores stop being comparable. Comma-
+    # separated backend names ("DeepInfra" or "DeepInfra,Novita"); empty = let the router
+    # choose. Ignored by non-routing endpoints (Together/Ollama/vLLM see no extra body at all).
+    llm_provider_order: str = ""
+    # With a pin set, refuse to silently fall back to an unpinned backend: a hard failure is a
+    # finding, a quiet reroute is contaminated data.
+    llm_provider_allow_fallbacks: bool = False
+    # Optional quantization pin ("fp8"), for when a provider exposes the same model at
+    # several quantizations. Blank = accept whatever that provider serves.
+    llm_provider_quantization: str = ""
+    # OpenRouter attribution header (cosmetic; ranks the app on their dashboard).
+    llm_app_title: str = "artificial-forecaster"
     db_path: str = str(_ROOT / "data" / "forecaster.duckdb")   # the only config the DB seam needs
     # GRIBStream point-forecast API (gribstream.py seam). Key lives in .env only; the
     # base_url is the portability seam (per-endpoint, never hardcoded in the client).

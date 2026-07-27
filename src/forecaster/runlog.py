@@ -204,6 +204,7 @@ def persist_run(
             "producer_kind": "artificial", "model": model,
             "served_model": " | ".join(res.served_models) or None,
             "system_fingerprint": " | ".join(res.system_fingerprints) or None,
+            "provider": " | ".join(res.providers) or None,
             "base_url": res.base_url, "temperature": res.temperature,
             "max_tokens": res.max_tokens, "seed": res.seed, "toolset_hash": th,
             "worksheet_mode": worksheet_mode,
