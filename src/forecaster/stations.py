@@ -3,8 +3,10 @@
 Every entry passed four gates (confirmed live -- see scripts/probe_bufkit_stations.py,
 probe_stations_extended.py, probe_taf_cycles.py):
   1. clearly a MILITARY airfield (AFB / SFB / Army airfield / overseas AB);
-  2. model BUFKIT coverage for its OWN ICAO (get_fcst_sounding / get_point_forecast work
-     without a proxy);
+  2. model BUFKIT coverage for its OWN ICAO. OBSOLETE as a gate since 2026-07-28: BUFKIT
+     was replaced by GRIBStream, which serves any lat/lon, so no station can fail this
+     any more. Kept in the history because it is why the roster is the shape it is -- it
+     excluded fields that would now be eligible;
   3. a fetchable, MILITARY-FORMAT TAF on the AWC public feed -- vis in meters, per-group
      QNH____INS, and TX/TN temperature groups (the discriminator that drops civil/FAA-format
      TAFs, which omit TX/TN and report vis in statute miles);
@@ -15,9 +17,9 @@ TX/TN, SM vis), the BUFKIT bases with no public AWC TAF (KGSB/KPOB/PAEI/KYUM/RJS
 the irregular-reissue Army field KGRK. The survivors are all on an 8-HOURLY (3/day)
 military cycle; `cycle` is the tuple of UTC issue hours.
 
-`bufkit_proxy` names a nearby civil ICAO for the model-data tools if a base ever has no
-BUFKIT of its own (None -- every roster station is self-covered). Regenerate/extend via
-the probe scripts.
+A `bufkit_proxy` field used to name a nearby civil ICAO for the model-data tools when a base
+had no BUFKIT of its own. REMOVED 2026-07-28 with BUFKIT itself: GRIBStream serves any
+lat/lon, so no station can need a stand-in. It was None for every roster station anyway.
 """
 
 from dataclasses import dataclass
@@ -28,11 +30,10 @@ class Station:
     icao: str
     name: str
     region: str
-    meso: str | None                    # densest mesoscale BUFKIT (hrrr/nam); None = GFS-only
+    meso: str | None                    # densest mesoscale model (hrrr/nam); None = GFS-only
     cycle: tuple[int, ...]              # UTC issue hours of the routine TAF (8-hourly)
     taf_hours: int = 30                 # routine TAF validity length
     cycle_provisional: bool = False     # cycle inferred from <3 obs; poller confirms over time
-    bufkit_proxy: str | None = None     # civil ICAO for model tools if the base has no BUFKIT
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,7 @@ class ArchiveStation:
     TAFVERs it against obs, but it is NEVER run through the model matrix. Deliberately a
     SEPARATE type from Station -- the scheduler iterates STATIONS, so an archive site is
     structurally incapable of entering a billed model run. Archive sites need no cycle /
-    BUFKIT / proxy (they issue no model forecast); `regime` tags the dominant forecast-
+    model data (they issue no model forecast); `regime` tags the dominant forecast-
     difficulty class for per-regime/per-hour TAFVER difficulty mining."""
 
     icao: str
@@ -73,17 +74,10 @@ def icaos() -> list[str]:
     return [s.icao for s in STATIONS]
 
 
-def model_station(icao: str) -> str:
-    """The ICAO to feed the model-data tools for a station: its proxy if one is set,
-    else the station itself. Raises KeyError for an off-roster ICAO."""
-    s = BY_ICAO[icao]
-    return s.bufkit_proxy or s.icao
-
-
 # Human-TAF archive-only sites (53): confirmed military-format on the AWC feed 2026-07-17
 # (marker QNH____INS + ~30h validity). The poller archives + the scorer TAFVERs these to map
 # forecast difficulty by site and hour; they never enter the billed model matrix. `regime`
-# is the dominant difficulty class. NOT gated on BUFKIT (no model run), so much wider than
+# is the dominant difficulty class. NOT gated on model coverage, so much wider than
 # STATIONS. Excluded as civil-format (no QNH INS): KABQ, LIPA, ETHA. Issued no TAF in the
 # 17Z probe -- re-add + let the poller confirm: KVAD, PAEI, RJSM, PHIK, KGFA, KFSI, KFLV,
 # KDAA, KWSD.

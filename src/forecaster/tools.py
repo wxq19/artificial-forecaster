@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pydantic import ValidationError
 
 from forecaster import (
-    awc, charts, fcstsounding, imagery, modeldata, neighbors, soundings, store, tafgen,
+    awc, charts, imagery, modeldata, neighbors, soundings, store, tafgen,
     tafparse, tafstate, terrain, worksheet, wxmaps,
 )
 from forecaster.config import settings
@@ -207,23 +207,29 @@ GET_FCST_SOUNDING = {
     "function": {
         "name": "get_fcst_sounding",
         "description": (
-            "Fetch a MODEL FORECAST sounding (skew-T image) for an airport at a chosen "
-            "forecast hour -- the PREDICTED vertical structure (stability/CAPE, inversions, "
-            "moisture, wind shear) at a future valid time. Unlike get_sounding, which is an "
-            "OBSERVED sounding at 00/12Z, this projects the atmosphere forward. `station` is "
-            "a 4-letter ICAO; `model` defaults to gfs (the only model with coverage outside "
-            "North America); `fhr` is the forecast hour (0 = analysis; hourly early, then "
-            "3-hourly). Coverage is dense over North America and sparse OCONUS -- an "
-            "unavailable station is reported back so you can pick another."
+            "MODEL FORECAST sounding for an airport at a chosen forecast hour -- the "
+            "PREDICTED vertical structure (stability/CAPE, inversions, moisture, wind shear) "
+            "at a future valid time. Unlike get_sounding, which is an OBSERVED sounding at "
+            "00/12Z, this projects the atmosphere forward. `station` is a 4-letter ICAO; "
+            "`model` is gfs (default, global), hrrr (CONUS only, high resolution) or ifsoper "
+            "(ECMWF, global -- good aloft but it carries no 950/900 mb level, so it resolves "
+            "the boundary layer poorly, which is where ceilings and inversions live). `fhr` "
+            "is the forecast hour (0 = analysis), snapped to the archived 3-hourly grid. "
+            "`form` selects how you receive it: 'chart' (default) is a skew-T image, 'table' "
+            "is the numbers level by level, 'both' returns each. Ask for whichever you read "
+            "more reliably."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
-                "model": {"type": "string", "enum": list(fcstsounding.MODELS),
+                "model": {"type": "string", "enum": list(modeldata.PROFILE_MODELS),
                           "description": "forecast model (default gfs)"},
                 "fhr": {"type": "integer",
                         "description": "forecast hour (0=analysis; e.g. 6, 12, 24, 36)"},
+                "form": {"type": "string", "enum": ["chart", "table", "both"],
+                         "description": "skew-T image, per-level numbers, or both "
+                                        "(default chart)"},
             },
             "required": ["station"],
         },
@@ -235,20 +241,21 @@ GET_POINT_FORECAST = {
     "function": {
         "name": "get_point_forecast",
         "description": (
-            "Hourly MODEL point forecast TABLE for an airport: surface conditions over time "
-            "-- temperature, dewpoint, wind, MSL pressure, low/mid/high cloud, and hourly "
-            "precipitation at each forecast hour, from the model's BUFKIT output. Use it to "
-            "see how conditions EVOLVE hour by hour at a site (complements get_fcst_sounding, "
-            "which is the vertical profile at one hour). Each row is one forecast hour; read a "
-            "column downward for a variable's trend. `station` 4-letter ICAO; `model` defaults "
-            "to gfs (only gfs has OCONUS coverage); `hours` limits the horizon (default 48). "
-            "Values are raw model surface fields."
+            "Hourly MODEL point forecast TABLE for an airport, from ONE model: surface "
+            "conditions over time -- temperature, dewpoint, wind, GUST, MSL pressure "
+            "(hPa and inHg), cloud cover, visibility and ceiling at each forecast hour. Use "
+            "it to see how conditions EVOLVE hour by hour at a site (complements "
+            "get_fcst_sounding, the vertical profile at one hour, and get_model_state, which "
+            "puts several models side by side). Each row is one forecast hour; read a column "
+            "downward for a variable's trend. `station` 4-letter ICAO; `model` is gfs "
+            "(default, global), hrrr or nbm (CONUS only) or ifsoper (ECMWF, global, no "
+            "gust/visibility/ceiling); `hours` limits the horizon (default 48)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "station": {"type": "string", "description": "4-letter ICAO, e.g. KMSP"},
-                "model": {"type": "string", "enum": list(fcstsounding.MODELS),
+                "model": {"type": "string", "enum": list(modeldata.MODELS),
                           "description": "forecast model (default gfs)"},
                 "hours": {"type": "integer",
                           "description": "forecast hours to include from the run (default 48)"},
@@ -354,14 +361,20 @@ GET_LOOP = {
     "function": {
         "name": "get_loop",
         "description": (
-            "Fetch a short satellite LOOP (a time sequence of frames) centered on an airport, "
-            "to see MOTION and TREND that a single still cannot show -- cloud advection, "
-            "growth/erosion, fog burn-off, convective initiation. Returns a labeled filmstrip "
-            "image (oldest to newest) and, for video-capable models, a short video. Give the "
-            "`station` ICAO; optionally `product` (geocolor default/visible/infrared/"
-            "water_vapor), `frames` (2-10, default 6), and `step_min` (minutes between frames, "
-            "default 30). GOES (Americas) and Himawari (Japan/W Pacific) loops are wide-area; "
-            "Meteosat (Europe/Africa/Middle East) loops are station-centered."
+            "Fetch a short satellite LOOP (a time sequence of frames) over an airport, to see "
+            "MOTION and TREND that a single still cannot show -- which way cloud is moving and "
+            "how fast, whether convection is building or collapsing, whether fog/stratus is "
+            "spreading or burning off, and where a boundary is going. Returns a labeled "
+            "filmstrip image (oldest to newest) and, for video-capable models, a short video. "
+            "Give the `station` ICAO; optionally `product`, `frames` (2-10, default 6), and "
+            "`step_min` (minutes between frames, default 30) -- frames x step_min sets how far "
+            "back the loop reaches, so 6 x 30 covers 2.5h of trend and 10 x 10 shows the last "
+            "90 min in detail. Products: geocolor (default; true colour by day, IR-blended at "
+            "night), visible (sharpest cloud texture, DAYLIGHT ONLY), infrared (cloud-top "
+            "temperature -- use at night and to spot deepening convection), water_vapor "
+            "(mid-level moisture and flow, works day or night). GOES (Americas) and Himawari "
+            "(Japan/W Pacific) loops cover the station's sector; Meteosat (Europe/Africa/"
+            "Middle East) loops are station-centered."
         ),
         "parameters": {
             "type": "object",
@@ -1232,9 +1245,12 @@ def _get_loop(args: dict) -> ToolResult:
     if len(fr) < 2:
         return ToolResult(f"error: only {len(fr)} loop frame(s) available for {icao}; "
                           "cannot show motion.")
-    span = f"{fr[0][0]} -> {fr[-1][0]}"
-    strip = charts.filmstrip(fr, title=f"{icao} {coverage} loop  {span}")
-    mp4 = charts.loop_mp4(fr)
+    span = f"{fr[0].label} -> {fr[-1].label}"
+    # satellite_loop returns FRAMES; the filmstrip/mp4 are composed here, so an archiver can
+    # store the frames and let replay re-compose whatever the model asks for.
+    tiles = [(f.label, f.data) for f in fr]
+    strip = charts.filmstrip(tiles, title=f"{icao} {coverage} loop  {span}")
+    mp4 = charts.loop_mp4(tiles)
     receipt = (f"satellite LOOP -- {coverage} for {icao}: {len(fr)} frames, {span} "
                f"(source: {source}); labeled filmstrip image (oldest->newest) and a short "
                "video follow. research/informational imagery, not an operational source.")
@@ -1275,26 +1291,68 @@ def _get_imagery(args: dict) -> ToolResult:
                       '"national_mosaic". Radar regions: ' + ", ".join(imagery.RADAR_REGIONS))
 
 
-def _get_fcst_sounding(args: dict) -> ToolResult:
-    """Fetch + render a model forecast sounding (network, no DB). A missing station or
-    forecast hour comes back as feedback -- fcstsounding raises ValueError with the reason
-    (404 / available hours) rather than crashing the loop. Receipt cites the source URL."""
-    station = args.get("station")
-    if not station:
-        return ToolResult('error: get_fcst_sounding needs a "station" ICAO, e.g. "station": "KMSP"')
+def _fmt_profile_table(prof) -> str:
+    """A forecast sounding as NUMBERS, level by level -- the `form='table'` rendering. Same
+    archived rows the skew-T is drawn from, so the two forms can never disagree."""
+    out = [(f"{'Pres mb':>8}{'Hgt m':>8}{'T C':>7}{'Td C':>7}{'RH %':>6}"
+            f"{'Wind':>10}")]
+    for p, z, t, d, dr, sp in zip(prof.pres, prof.hght, prof.tmpc, prof.dwpc,
+                                  prof.drct, prof.sknt):
+        # RH back out of T/Td for display only; the archive stores RH and we derive Td.
+        rh = 100.0 * (math.exp((17.625 * d) / (243.04 + d))
+                      / math.exp((17.625 * t) / (243.04 + t)))
+        out.append(f"{p:>8.0f}{z:>8.0f}{t:>7.1f}{d:>7.1f}{rh:>6.0f}"
+                   f"{f'{dr:03.0f}/{sp:.0f}':>10}")
+    return "\n".join(out)
+
+
+def _get_fcst_sounding(con, station: str, args: dict) -> ToolResult:
+    """Render an ARCHIVED model forecast sounding (DB read, no network). Pressure-level rows
+    come from modeldata.prefetch, so this is pinned to the issue time like every other
+    model-data tool. A model without a profile, or a forecast hour the archive does not
+    cover, comes back as feedback naming what IS available."""
     model = str(args.get("model") or "gfs").lower()
-    if model not in fcstsounding.MODELS:
-        return ToolResult(f"error: unknown model {model!r}; choose from {', '.join(fcstsounding.MODELS)}")
+    if model not in modeldata.PROFILE_MODELS:
+        return ToolResult(f"error: {model!r} has no vertical profile; choose from "
+                          f"{', '.join(modeldata.PROFILE_MODELS)} (NBM is surface-only)")
+    form = str(args.get("form") or "chart").lower()
+    if form not in ("chart", "table", "both"):
+        form = "chart"
+    loc = _resolve_md_location(con, station, None)
+    if loc is None:
+        return ToolResult(f"error: {station} is not a pre-fetched model-data location. "
+                          f"{_md_locations_hint(con)}")
+    lat, lon, _name = loc
+    times = modeldata.profile_valid_times(con, station, model, lat=lat, lon=lon)
+    if not times:
+        return ToolResult(f"error: no archived {model.upper()} profile for {station}; the "
+                          f"pressure-level bundle may not have been pulled for this cycle.")
     fhr = _int_arg(args.get("fhr"), 12, lo=0, hi=384)
+    # fhr counts from the ISSUE time, not from the first archived hour: the level grid snaps
+    # to a 00Z-anchored 3-hourly grid, so those differ by up to one step.
+    issue = store.model_data_as_of(con, model, lat, lon) or times[0]
+    want = issue.replace(minute=0, second=0, microsecond=0) + timedelta(hours=fhr)
+    valid = min(times, key=lambda t: abs((t - want).total_seconds()))   # snap to the grid
     try:
-        prof = fcstsounding.fetch_profile(station, model=model, fhr=fhr)
-        png = charts.skewt(prof)
-    except Exception as e:  # noqa: BLE001 -- fetch/parse failure becomes feedback, not a dead loop
-        return ToolResult(f"error: could not build forecast sounding for {str(station).upper()} "
-                          f"{model} f{fhr:03d} ({type(e).__name__}: {e})")
-    receipt = (f"{model.upper()} forecast skew-T for {prof.station}, f{fhr:03d} valid "
-               f"{prof.valid} (run {prof.run:%Y-%m-%dT%H:%MZ}, {prof.url}); image follows.")
-    return ToolResult(receipt, images=[png])
+        prof = modeldata.build_profile(con, station, model, valid, lat=lat, lon=lon)
+    except ValueError as e:
+        return ToolResult(f"error: {e}")
+    off_h = round((valid - want).total_seconds() / 3600)
+    snapped = ("" if not off_h else
+               f" (you asked for f{fhr:03d}; the archive is 3-hourly, so this is the nearest "
+               f"stored hour, {abs(off_h)}h {'later' if off_h > 0 else 'earlier'})")
+    ifs_note = ("\nNOTE: IFS carries no 950/900 mb level, so the boundary layer -- where "
+                "ceilings and inversions sit -- is resolved coarsely here. Cross-check low "
+                "cloud against GFS or HRRR." if model == "ifsoper" else "")
+    receipt = (f"{model.upper()} forecast sounding for {prof.station}, valid "
+               f"{valid:%Y-%m-%dT%H}Z (f{prof.fhr:03d} of the {prof.run:%Y-%m-%dT%H}Z run), "
+               f"{len(prof.pres)} levels{snapped}.{ifs_note}")
+    images = [charts.skewt(prof)] if form in ("chart", "both") else []
+    if form in ("table", "both"):
+        receipt += "\n\n" + _fmt_profile_table(prof)
+    if images:
+        receipt += "\nSkew-T image follows."
+    return ToolResult(receipt, images=images)
 
 
 def _uv_to_dirspd(u: float, v: float) -> tuple[int, int]:
@@ -1305,59 +1363,24 @@ def _uv_to_dirspd(u: float, v: float) -> tuple[int, int]:
     return d, spd
 
 
-def _fmt_point(pf, n: int) -> str:
-    """Format a PointForecast as a text table: one row per forecast hour, columns are the
-    raw surface variables (wind shown as dir/speed). Read a column down for a trend."""
-    # Slice by valid TIME, not row count: the BUFKIT surface series is hourly early but
-    # goes 3-hourly at longer ranges, so `n` rows would silently cover more than n hours.
-    if pf.rows:
-        cutoff = pf.rows[0]["valid"] + timedelta(hours=n)
-        rows = [r for r in pf.rows if r["valid"] <= cutoff]
-    else:
-        rows = []
-    out = [
-        f"{pf.model.upper()} point forecast for {pf.station} -- run {pf.run:%Y-%m-%dT%H:%MZ}, "
-        f"{len(rows)} hourly steps (source: {pf.url}). Raw model surface fields; each row is "
-        "one forecast hour -- read a column down to see a variable's trend. MSLP is given in "
-        "both hPa and inHg (same value, converted for you -- do not re-derive it); it is "
-        "sea-level pressure, so use it for the QNH TREND, not as the QNH value at an "
-        "elevated field.",
-        (f"{'Valid (UTC)':<18}{'T C':>5}{'Td C':>6}{'Wind kt':>10}{'MSLP':>7}{'inHg':>7}"
-         f"{'Cld L/M/H %':>14}{'P01 mm':>8}"),
-    ]
-    def _d(v, fmt: str = "{:.0f}") -> str:
-        return "--" if v is None else fmt.format(v)
+def _get_point_forecast(con, station: str, args: dict) -> ToolResult:
+    """ONE model's hourly surface table, read from the archive (DB read, no network).
 
-    for r in rows:
-        u, v = r["uwnd_ms"], r["vwnd_ms"]
-        wind = "--" if u is None or v is None else "{:03d}/{}".format(*_uv_to_dirspd(u, v))
-        vt = f"{r['valid']:%Y-%m-%dT%H:%MZ}"
-        trip = (r["lcld"], r["mcld"], r["hcld"])
-        cloud = "--" if any(c is None for c in trip) else "/".join(f"{c:.0f}" for c in trip)
-        out.append(
-            f"{vt:<18}{_d(r['t2m_c']):>5}{_d(r['td2m_c']):>6}{wind:>10}"
-            f"{_d(r['mslp_hpa']):>7}{_inhg_md(r['mslp_hpa']):>7}"
-            f"{cloud:>14}{_d(r['p01_mm'], '{:.1f}'):>8}"
-        )
-    return "\n".join(out)
-
-
-def _get_point_forecast(args: dict) -> ToolResult:
-    """Fetch + format a model point forecast table (network, no DB). A missing station (404)
-    comes back as feedback via fcstsounding's ValueError, not a crash."""
-    station = args.get("station")
-    if not station:
-        return ToolResult('error: get_point_forecast needs a "station" ICAO, e.g. "station": "KMSP"')
+    Kept as its own tool rather than folded into get_model_state: it is the single most-used
+    tool in the suite, the model already knows its shape, and a one-model table is easier to
+    read down a column than the multi-model one. Since 2026-07-28 it reads the GRIBStream
+    archive instead of BUFKIT, so it gains the gust, visibility and ceiling columns BUFKIT
+    never carried -- gust being the model's worst-scoring TAF element."""
     model = str(args.get("model") or "gfs").lower()
-    if model not in fcstsounding.MODELS:
-        return ToolResult(f"error: unknown model {model!r}; choose from {', '.join(fcstsounding.MODELS)}")
+    if model not in modeldata.MODELS:
+        return ToolResult(f"error: unknown model {model!r}; choose from "
+                          f"{', '.join(modeldata.MODELS)}")
+    loc = _resolve_md_location(con, station, None)
+    if loc is None:
+        return ToolResult(f"error: {station} is not a pre-fetched model-data location. "
+                          f"{_md_locations_hint(con)}")
     hours = _int_arg(args.get("hours"), 48, lo=1, hi=384)
-    try:
-        pf = fcstsounding.fetch_point(station, model=model)
-    except Exception as e:  # noqa: BLE001 -- fetch/parse failure becomes feedback, not a dead loop
-        return ToolResult(f"error: could not fetch point forecast for {str(station).upper()} "
-                          f"{model} ({type(e).__name__}: {e})")
-    return ToolResult(_fmt_point(pf, hours))
+    return ToolResult(_fmt_model_state(con, station, loc, [model], hours))
 
 
 _MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June", "July",
@@ -2374,8 +2397,8 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
              evidence_ids: list[str] | None = None) -> ToolResult:
     """Execute a model-issued tool call. The read tools run against a READ-ONLY
     connection; the sinks (emit_taf, check_taf, submit_taf_worksheet) and the network
-    fetches (get_current_taf, get_sounding, get_map, get_fcst_sounding,
-    get_point_forecast, get_imagery) need no DB and are handled first. `evidence_ids`
+    fetches (get_current_taf, get_sounding, get_map, get_imagery, get_loop, get_terrain)
+    need no DB and are handled first. `evidence_ids`
     (the ids the loop has threaded) lets submit_taf_worksheet RESOLVE evidence_refs.
     Returns a ToolResult: text receipt + images/TAF/worksheet."""
     if name == "emit_taf":
@@ -2393,10 +2416,6 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
         return _stamp_fetched(_get_sounding(args))
     if name == "get_map":
         return _stamp_fetched(_get_map(args))
-    if name == "get_fcst_sounding":
-        return _stamp_fetched(_get_fcst_sounding(args))
-    if name == "get_point_forecast":
-        return _stamp_fetched(_get_point_forecast(args))
     if name == "get_imagery":
         return _stamp_fetched(_get_imagery(args))
     if name == "get_loop":
@@ -2451,6 +2470,10 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
             return _get_nearby_obs(con, station, args)
         if name == "get_climo":
             return _get_climo(con, args)
+        if name == "get_fcst_sounding":
+            return _get_fcst_sounding(con, station, args)
+        if name == "get_point_forecast":
+            return _get_point_forecast(con, station, args)
         if name == "get_model_state":
             return _get_model_state(con, station, args)
         if name == "get_hazard_scan":

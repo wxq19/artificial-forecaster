@@ -12,6 +12,7 @@ bias vs seeded obs, nearby-field spatial slice).
 Run: uv run python scripts/test_modeldata.py
 """
 
+import math
 import shutil
 import tempfile
 from datetime import datetime, timedelta
@@ -403,12 +404,215 @@ def test_grid_flow_batch_ifs():
               "time" in str(e).lower() or "either" in str(e).lower())
 
 
+# --- 6. vertical profile bundle (the BUFKIT replacement) ------------------------------
+def test_profiles():
+    # Level coverage, PROBED LIVE 2026-07-28: GFS/HRRR serve all 20 standard levels, IFS a
+    # 12-level subset missing 950/900 (the boundary layer), NBM has no pressure levels.
+    check("gfs/hrrr serve 20 profile levels",
+          len(modeldata.profile_levels("gfs")) == 20 and len(modeldata.profile_levels("hrrr")) == 20)
+    check("ifs serves the 12-level subset, without 950/900",
+          len(modeldata.profile_levels("ifsoper")) == 12
+          and 950 not in modeldata.profile_levels("ifsoper")
+          and 900 not in modeldata.profile_levels("ifsoper"))
+    check("nbm has no profile (surface-only)", modeldata.profile_levels("nbm") == ())
+
+    # Five variables per level is the cost driver; the model dialects differ.
+    gv, iv = modeldata._profile_vars("gfs"), modeldata._profile_vars("ifsoper")
+    check("gfs profile = 20 levels x 5 vars", len(gv) == 100, f"got {len(gv)}")
+    check("ifs profile = 12 levels x 5 vars", len(iv) == 60, f"got {len(iv)}")
+    check("gfs uses GRIB2 names + '<n> mb' levels",
+          gv[0].name == "TMP" and gv[0].level == "1000 mb" and gv[0].alias == "t1000")
+    check("ifs uses ECMWF shortnames + 'pl <n>' levels",
+          iv[0].name == "t" and iv[0].level == "pl 1000" and iv[0].alias == "t1000")
+    check("nbm contributes no profile vars", modeldata._profile_vars("nbm") == [])
+
+    # ONE alias namespace: the hazard reader's aliases must be a SUBSET of the profile's, or
+    # merging the two bundles would silently break get_hazard_scan.
+    prof_aliases = {v.alias for v in gv}
+    haz_standalone = {v.alias for v in modeldata._hazard_vars("gfs", profiles=False)}
+    haz_merged = {v.alias for v in modeldata._hazard_vars("gfs", profiles=True)}
+    check("merged hazard bundle drops exactly what the profile already covers",
+          haz_standalone - haz_merged <= prof_aliases and not (haz_merged & prof_aliases),
+          f"dropped {sorted(haz_standalone - haz_merged)}")
+    check("merged hazard keeps cloud-liquid/omega/CAPE (not in the profile)",
+          {"clw500", "w500", "cape", "cin"} <= haz_merged)
+    check("1000 mb alias does not collide with 100 mb",
+          "t1000" in prof_aliases and "t100" in prof_aliases)
+
+    # The level grid must land on a 00Z-anchored 3-hourly grid whatever the issue hour, or
+    # IFS (00/03/06...Z only) silently archives nothing -- no rows, no credits, no error.
+    for hr in (0, 1, 2, 5, 17, 23):
+        a = datetime(2026, 7, 28, hr)
+        la = a.replace(hour=(a.hour // 3) * 3)
+        span = math.ceil((30 + (a.hour - la.hour)) / 3) * 3
+        grid = modeldata._time_grid(la, span, 3)
+        ok = all(x.hour % 3 == 0 for x in grid) and grid[-1] >= a + timedelta(hours=30)
+        check(f"level grid snaps to the 3h/00Z grid and still covers +30h (issue {hr:02d}Z)", ok)
+
+    # build_profile: archive rows -> the typed profile charts.skewt draws.
+    con = store.connect(DB)
+    store.init_model_data_schema(con)
+    valid = datetime(2026, 7, 28, 12)
+    rows = []
+    for i, hpa in enumerate(modeldata.profile_levels("gfs")):
+        k = str(hpa)
+        rows += [md_row("gfs", valid, LAT, LON, "KTEST", f"t{k}", 300.0 - 2.0 * i),
+                 md_row("gfs", valid, LAT, LON, "KTEST", f"rh{k}", 60.0),
+                 md_row("gfs", valid, LAT, LON, "KTEST", f"u{k}", 10.0),
+                 md_row("gfs", valid, LAT, LON, "KTEST", f"v{k}", 0.0),
+                 md_row("gfs", valid, LAT, LON, "KTEST", f"hgt{k}", 100.0 * i)]
+    store.insert_model_data(con, rows)
+    prof = modeldata.build_profile(con, "KTEST", "gfs", valid, lat=LAT, lon=LON)
+    check("build_profile returns every complete level", len(prof.pres) == 20, f"got {len(prof.pres)}")
+    check("build_profile is surface-first", prof.pres[0] == 1000.0 and prof.pres[-1] == 100.0)
+    check("build_profile converts K -> C", abs(prof.tmpc[0] - 26.85) < 0.01, f"{prof.tmpc[0]}")
+    check("build_profile derives Td <= T at every level",
+          all(d <= t + 1e-9 for t, d in zip(prof.tmpc, prof.dwpc)))
+    check("build_profile converts u/v -> wind FROM direction + knots",
+          abs(prof.drct[0] - 270.0) < 0.01 and abs(prof.sknt[0] - 19.44) < 0.05,
+          f"{prof.drct[0]}/{prof.sknt[0]}")
+    check("build_profile records the run it used", prof.run == RUN)
+
+    # A level missing ANY field is dropped whole rather than plotted half-formed.
+    con.execute("DELETE FROM model_data WHERE variable = 'hgt850' AND valid_time = ?", [valid])
+    check("a partial level is dropped, not half-plotted",
+          len(modeldata.build_profile(con, "KTEST", "gfs", valid, lat=LAT, lon=LON).pres) == 19)
+
+    check("profile_valid_times reports the archived hour",
+          modeldata.profile_valid_times(con, "KTEST", "gfs", lat=LAT, lon=LON) == [valid])
+    check("store.model_data_as_of returns the pinned issue time",
+          store.model_data_as_of(con, "gfs", LAT, LON) == AS_OF)
+    try:
+        modeldata.build_profile(con, "KTEST", "nbm", valid, lat=LAT, lon=LON)
+        check("build_profile refuses a model with no levels", False)
+    except ValueError as e:
+        check("build_profile refuses a model with no levels", "no vertical profile" in str(e))
+    try:
+        modeldata.build_profile(con, "KTEST", "gfs", datetime(2026, 7, 28, 21),
+                                lat=LAT, lon=LON)
+        check("build_profile reports an unarchived hour as feedback", False)
+    except ValueError as e:
+        check("build_profile reports an unarchived hour as feedback", "no archived" in str(e))
+    con.close()
+
+
+def test_credit_estimate():
+    """The estimator's whole job is not drifting from the fetch, so pin the four ways it
+    drifted before: the profile ladder, the pre-anchor tail, the merged-hazard subtraction,
+    and CONUS-only model dropping. Offline -- coords are stubbed, no AWC lookups."""
+    site = {"KAAA": (40.0, -75.0), "KBBB": (41.0, -76.0)}
+    saved = modeldata.site_coord
+    modeldata.site_coord = lambda s: (*site[s], s)
+    try:
+        e = modeldata.estimate_prefetch_many(
+            ["KAAA"], as_of=datetime(2026, 7, 28, 11), hours=48, step_h=2, hazard_step_h=3,
+            flow_relative=False)
+
+        # (a) surface grid includes the pre-anchor tail: (back_hours + hours)//step + 1.
+        check("estimate counts the pre-anchor surface tail",
+              e["surface_times"] == (6 + 48) // 2 + 1, f"got {e['surface_times']}")
+        # (b) the profile ladder dominates and must be present for every profile model.
+        for m in modeldata.PROFILE_MODELS:
+            if m in e["per_model"]:
+                check(f"estimate includes the {m} profile ladder",
+                      e["per_model"][m]["levels"] > 0 and e["per_model"][m]["level_vars"] >= 5 * len(
+                          modeldata.profile_levels(m)),
+                      f"got {e['per_model'][m]}")
+        # (c) merged bundle: level_vars must equal what _fetch_and_insert would build.
+        want = len(modeldata._profile_vars("gfs")) + len(modeldata._hazard_vars("gfs", profiles=True))
+        check("estimate uses the MERGED level bundle (no double-counted T/RH)",
+              e["per_model"]["gfs"]["level_vars"] == want,
+              f"got {e['per_model']['gfs']['level_vars']} want {want}")
+        # (d) credits are the sum of the parts, and each part is times x vars x chunks.
+        gfs_sfc = e["surface_times"] * len(modeldata._surface_vars("gfs"))
+        check("estimate surface term is times x vars x chunks",
+              e["per_model"]["gfs"]["surface"] == gfs_sfc,
+              f"got {e['per_model']['gfs']['surface']} want {gfs_sfc}")
+        check("estimate total is the sum of its parts",
+              e["credits"] == sum(m["surface"] + m["levels"] for m in e["per_model"].values())
+              + e["steering_probe"])
+
+        # (e) CONUS-only models are dropped for an OCONUS batch (they bill all-null rows).
+        modeldata.site_coord = lambda s: (35.75, 139.35, s)      # Yokota
+        o = modeldata.estimate_prefetch_many(["KAAA"], as_of=datetime(2026, 7, 28, 11),
+                                             flow_relative=False)
+        check("estimate drops CONUS-only models OCONUS",
+              "hrrr" not in o["models"] and "nbm" not in o["models"], f"got {o['models']}")
+        check("estimate says WHY a model was dropped", any("CONUS" in n for n in o["notes"]))
+
+        # (f) points are free below 500, so credits must not scale with station count.
+        modeldata.site_coord = lambda s: (*site[s], s)
+        one = modeldata.estimate_prefetch_many(["KAAA"], as_of=datetime(2026, 7, 28, 11),
+                                               flow_relative=False)
+        two = modeldata.estimate_prefetch_many(["KAAA", "KBBB"], as_of=datetime(2026, 7, 28, 11),
+                                               flow_relative=False)
+        check("estimate is flat while coords fit one 500-point chunk",
+              one["credits"] == two["credits"] and two["coords"] > one["coords"],
+              f"{one['credits']} vs {two['credits']}, coords {one['coords']}->{two['coords']}")
+        # (g) the steering probe is billed per station when flow-relative is on.
+        fr = modeldata.estimate_prefetch_many(["KAAA", "KBBB"], as_of=datetime(2026, 7, 28, 11),
+                                              flow_relative=True)
+        check("estimate bills one steering probe per station",
+              fr["steering_probe"] == 2 * len(modeldata._steer_vars()),
+              f"got {fr['steering_probe']}")
+    finally:
+        modeldata.site_coord = saved
+
+
+def test_ensemble_batch():
+    """The GEFS grid snap (a silent-empty bug that has bitten twice) and the batched pull."""
+    # (a) an ODD anchor must snap DOWN onto the model's 00Z-anchored cadence -- an unsnapped
+    #     22Z grid gives 22/01/04Z, matches no GEFS time, and returns nothing with no error.
+    g = modeldata._snapped_grid(datetime(2026, 7, 17, 22), 30, 3)
+    check("snapped grid lands on the 00Z-anchored step", all(t.hour % 3 == 0 for t in g),
+          f"got {[t.hour for t in g[:5]]}")
+    check("snapped grid starts at or before the anchor", g[0] <= datetime(2026, 7, 17, 22))
+    check("snapped grid still reaches anchor+hours",
+          g[-1] >= datetime(2026, 7, 17, 22) + timedelta(hours=30), f"ends {g[-1]}")
+    check("snapped grid is a no-op on an already-aligned anchor",
+          modeldata._snapped_grid(datetime(2026, 7, 17, 21), 30, 3)[0]
+          == datetime(2026, 7, 17, 21))
+
+    # (b) the ensemble bill is flat in station count -- one point per station, free below 500.
+    one = modeldata.estimate_ensemble(["KAAA"], hours=48)
+    many = modeldata.estimate_ensemble([f"K{i:03d}" for i in range(40)], hours=48)
+    check("ensemble estimate is flat in station count",
+          one["credits"] == many["credits"], f"{one['credits']} vs {many['credits']}")
+    full = modeldata.estimate_ensemble(["KAAA"], hours=48,
+                                       members=modeldata.GEFS_FULL_MEMBERS)
+    check("ensemble estimate scales LINEARLY with members",
+          full["credits"] == one["credits"] * 31 // len(modeldata.GEFS_DEFAULT_MEMBERS),
+          f"{full['credits']} vs {one['credits']}")
+    check("full member set is all 31", len(modeldata.GEFS_FULL_MEMBERS) == 31)
+
+    # (c) the single-station form must DELEGATE, so the grid fix cannot regress on one path.
+    seen = {}
+    saved = modeldata.prefetch_ensemble_many
+
+    def fake(stations, **kw):
+        seen.update(stations=stations, **kw)
+        return {"stations": [s.upper() for s in stations], "credits_charged": 7,
+                "rows": 1, "members": [0], "notes": []}
+
+    modeldata.prefetch_ensemble_many = fake
+    try:
+        r = modeldata.prefetch_ensemble("kaaa", hours=48, step_h=3)
+    finally:
+        modeldata.prefetch_ensemble_many = saved
+    check("prefetch_ensemble delegates to the batched form", seen.get("stations") == ["kaaa"])
+    check("prefetch_ensemble keeps its single-station return shape",
+          r["station"] == "KAAA" and "stations" not in r and r["credits_charged"] == 7, f"got {r}")
+
+
 def main():
     test_client()
     test_archive()
     test_formatters()
     test_collect_path()
     test_grid_flow_batch_ifs()
+    test_profiles()
+    test_credit_estimate()
+    test_ensemble_batch()
     npass = sum(1 for _, ok, _ in checks if ok)
     for label, ok, detail in checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {label}")

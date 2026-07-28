@@ -109,7 +109,7 @@ def persist_run(
         toolset_hash=th)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     # Tool failures made queryable: count, per tool, the calls whose receipt first line
-    # signalled failure -- a live tool that errored (AWC hiccup, TT 403, BUFKIT 404) means
+    # signalled failure -- a live tool that errored (AWC hiccup, TT 403, imagery 404) means
     # the model forecast with less data. {} = every tool call succeeded. (A per-tool CAP is
     # a budget stop, not a data failure -- counted separately so it doesn't read as an error.)
     tool_errors: dict[str, int] = {}

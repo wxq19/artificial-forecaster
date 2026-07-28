@@ -94,13 +94,12 @@ def station_meta(station: str) -> dict:
 
 
 def _month_bounds(year: int, month: int) -> tuple[datetime, datetime]:
-    """The ONE-day-buffered [start, end] for a (year, month) IEM request. IEM's day2
-    is EXCLUSIVE (Phase A Q1), so end = first-of-next-month + 1 day yields exactly a
-    one-day trailing buffer; start = first-of-month - 1 day is the leading buffer.
+    """The ONE-day-buffered [start, end] for a (year, month) IEM request, INCLUSIVE at
+    both ends (iem.fetch normalizes IEM's exclusive day2). end = first-of-next-month is
+    the one-day trailing buffer; start = first-of-month - 1 day is the leading buffer.
     The buffer lets local-day TX/TN at the month edges reclassify correctly."""
     start = datetime(year, month, 1) - timedelta(days=1)
-    nxt = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
-    end = nxt + timedelta(days=1)
+    end = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
     return start, end
 
 

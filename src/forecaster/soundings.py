@@ -35,7 +35,7 @@ _last_request = 0.0
 
 # A radiosonde posts ~60-90 min after its 00Z/12Z launch. Back off this much before
 # snapping so a call just after the hour doesn't target a sounding not yet on the server
-# (a 404 that reads as a bad site id). Same pattern as wxmaps/fcstsounding post lags.
+# (a 404 that reads as a bad site id). Same pattern as the wxmaps post lag.
 _POST_LAG_H = 2.0
 
 # A descriptive agent -- some providers reject the default urllib user-agent.
@@ -47,9 +47,25 @@ def synoptic_time(when: datetime | None = None) -> datetime:
     or before `when` (default: now), as naive UTC to match the store's tz contract.
     Soundings exist only at 00/12Z, so we snap down to one of them -- but only after
     backing off _POST_LAG_H, so a 12:30Z call still targets the prior 00Z (the 12Z
-    image is not up yet) instead of 404ing."""
-    now = (when or datetime.now(timezone.utc).replace(tzinfo=None)) - timedelta(hours=_POST_LAG_H)
-    return now.replace(hour=12 if now.hour >= 12 else 0, minute=0, second=0, microsecond=0)
+    image is not up yet) instead of 404ing.
+
+    IDEMPOTENT: a time that IS already a synoptic hour is returned unchanged, so applying
+    this twice cannot walk the answer backwards. That is not defensive tidying -- it was a
+    live defect. `fetch_skewt` snapped, then handed the snapped time to `skewt_url` and
+    `cache_path`, which each snapped AGAIN; with the old lag-then-snap the second pass
+    stepped back a further slot, so the receipt, the cited URL and the delivered image
+    were three different soundings, 24h apart at the ends. Nothing downstream would have
+    caught it, and a frozen archive preserves that mislabel permanently.
+
+    The trade this makes deliberately: passing exactly 12:00Z now MEANS 12Z, even moments
+    after the hour when the image may not be posted (the caller gets an honest 404 rather
+    than yesterday's sounding under today's label). That is the behaviour an archiver
+    wants -- name the sounding you meant."""
+    t = when or datetime.now(timezone.utc).replace(tzinfo=None)
+    if t.hour in (0, 12) and (t.minute, t.second, t.microsecond) == (0, 0, 0):
+        return t
+    t -= timedelta(hours=_POST_LAG_H)
+    return t.replace(hour=12 if t.hour >= 12 else 0, minute=0, second=0, microsecond=0)
 
 
 def _spc_url(site: str, t: datetime) -> str:

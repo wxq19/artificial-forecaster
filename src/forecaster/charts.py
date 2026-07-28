@@ -290,10 +290,16 @@ def skewt(profile) -> bytes:
     lines = [f"{n:<5}{profile.indices[n]:>8.0f}" if n in ("CAPE", "CINS")
              else f"{n:<5}{profile.indices[n]:>8.1f}"
              for n in order if n in profile.indices]
-    ax_txt.text(0.0, 0.0, f"{profile.model.upper()} indices\n" + "\n".join(lines),
-                family="monospace", fontsize=9, va="bottom", ha="left",
-                transform=ax_txt.transAxes,
-                bbox=dict(boxstyle="round", facecolor="#f4f4f4", edgecolor="#bbb"))
+    # Draw the box ONLY when there is something in it. IFS carries no CAPE/CIN/helicity, so
+    # an unguarded box renders as a labelled empty rectangle -- honest, but a vision model
+    # reading "IFSOPER indices" followed by nothing has to guess whether that means zero,
+    # missing, or a render failure. Say nothing instead of saying nothing loudly.
+    if lines:
+        ax_txt.text(0.0, 0.0, f"{profile.model.upper()} indices\n" + "\n".join(lines),
+                    family="monospace", fontsize=9, va="bottom", ha="left",
+                    transform=ax_txt.transAxes,
+                    bbox=dict(boxstyle="round", facecolor="#f4f4f4", edgecolor="#bbb"))
+    ax_txt.set_visible(bool(lines))
 
     fig.suptitle(
         f"{profile.model.upper()} forecast skew-T  |  {profile.station}  "

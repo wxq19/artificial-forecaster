@@ -692,16 +692,36 @@ def model_data_field(
     return out
 
 
-def model_data_valid_times(
+def model_data_as_of(
     con: duckdb.DuckDBPyConnection, model: str, lat: float, lon: float
-) -> list[datetime]:
-    """Distinct valid times stored for a model at a point (rounded), ascending. Lets a tool
-    default a window/valid-time to what the archive actually holds."""
+) -> datetime | None:
+    """The issue time the archive at this point was pinned to (the newest `as_of` written).
+    A forecast hour the agent asks for is relative to ITS issue time, so a reader needs this
+    rather than the first archived valid time -- those differ whenever the valid-time grid is
+    snapped (the pressure-level bundle snaps to a 00Z-anchored 3-hourly grid)."""
     cur = con.execute(
-        "SELECT DISTINCT valid_time FROM model_data WHERE model = ? AND lat = ? AND lon = ? "
-        "ORDER BY valid_time",
+        "SELECT max(as_of) FROM model_data WHERE model = ? AND lat = ? AND lon = ?",
         [model, _round_ll(lat), _round_ll(lon)],
     )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def model_data_valid_times(
+    con: duckdb.DuckDBPyConnection, model: str, lat: float, lon: float,
+    *, variables: list[str] | None = None,
+) -> list[datetime]:
+    """Distinct valid times stored for a model at a point (rounded), ascending. Lets a tool
+    default a window/valid-time to what the archive actually holds. `variables` restricts to
+    hours carrying a specific alias -- e.g. the pressure-level bundle, which is pulled on a
+    coarser grid than the surface fields, so "has surface rows" does not imply "has a profile"."""
+    sql = ("SELECT DISTINCT valid_time FROM model_data "
+           "WHERE model = ? AND lat = ? AND lon = ?")
+    params: list = [model, _round_ll(lat), _round_ll(lon)]
+    if variables:
+        sql += f" AND variable IN ({','.join('?' * len(variables))})"
+        params += list(variables)
+    cur = con.execute(sql + " ORDER BY valid_time", params)
     return [r[0] for r in cur.fetchall()]
 
 
@@ -1744,6 +1764,50 @@ def evaluation_points(con: duckdb.DuckDBPyConnection, *,
         sql += " AND tr.scorer_version = ?"
         params.append(scorer_version)
     cur = con.execute(sql + " GROUP BY 1,2,3,4,5", params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def archive_difficulty_points(con: duckdb.DuckDBPyConnection, *,
+                              scorer_version: str | None = None,
+                              station: str | None = None) -> list[dict]:
+    """Pooled TAFVER points per (station, subject) for STANDALONE archive-difficulty
+    scores -- the difficulty-mining ranking. The caller divides earned/available
+    (anti-averaging: points pool, never percentages).
+
+    Joins `tafs`, NOT `evaluations`, and that is the whole point. Archive-difficulty
+    rows are keyed on a synthetic 'archdiff:<taf_id>' evaluation_id and deliberately
+    have NO evaluations-spine row, so every evaluations-joined reader here
+    (tafver_points, evaluation_points, element_points, ...) structurally EXCLUDES
+    them -- which is why the difficulty ranking could not be read at all until this
+    existed. The 'archdiff:' prefix is what keeps the two populations separable in
+    the shared result tables; filtering on it here is the mirror of the INNER JOIN
+    that excludes them elsewhere.
+
+    Reads combined_earned/combined_available straight off tafver_runs rather than
+    re-summing tafver_hourly: the scorer already pooled them, and partial-coverage
+    TAFs (fewer scorable hours -> smaller `available`) pool correctly by construction.
+
+    scorer_version-keyed like its siblings: the result tables are append-only, so an
+    unfiltered read of a rescored DB silently collapses v1+v2 into one row with
+    SUMMED totals while the row count still looks plausible."""
+    # Resolve the station from the EVALUATION_ID, not r.taf_id: a synthetic baseline row
+    # (persistence) carries taf_id NULL, so joining on r.taf_id inner-joins every baseline
+    # away and the persistence column comes back empty -- which silently removes the very
+    # comparison that separates "hard regime" from "stable regime". archive_evaluation_id
+    # is 'archdiff:' + taf_id, so substr past the 9-char prefix recovers it for both rows.
+    sql = ("SELECT t.station, r.subject, COUNT(*) AS n_tafs, "
+           "SUM(r.combined_earned) AS earned, SUM(r.combined_available) AS available "
+           "FROM tafver_runs r JOIN tafs t ON t.taf_id = SUBSTR(r.evaluation_id, 10) "
+           "WHERE r.evaluation_id LIKE 'archdiff:%' AND r.combined_available > 0")
+    params: list = []
+    if scorer_version is not None:
+        sql += " AND r.scorer_version = ?"
+        params.append(scorer_version)
+    if station is not None:
+        sql += " AND t.station = ?"
+        params.append(station)
+    cur = con.execute(sql + " GROUP BY 1,2 ORDER BY 1,2", params)
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 

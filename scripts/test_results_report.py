@@ -174,6 +174,43 @@ def main() -> int:
           con.execute("SELECT count(*) FROM tafver_runs WHERE evaluation_id = ?",
                       [arch_id]).fetchone()[0] > 0)
 
+    # --- the MIRROR of the exclusions above: the one reader that must INCLUDE archdiff ---
+    # Everything else here joins `evaluations` and so drops these rows by construction;
+    # the difficulty ranking joins `tafs` instead. If this ever returns empty while the
+    # raw-table check above passes, the ranking is silently blind to its whole population.
+    diff = store.archive_difficulty_points(con, scorer_version=base_version)
+    check("archive_difficulty_points INCLUDES the archdiff row",
+          len(diff) > 0, str(diff))
+    check("archive_difficulty_points resolves the station via tafs (not evaluations)",
+          all(r["station"] == human_taf["station"] for r in diff),
+          str([r["station"] for r in diff]))
+    check("archive_difficulty_points carries the graded TAF under subject='subject'",
+          any(r["subject"] == "subject" for r in diff),
+          str(sorted({r["subject"] for r in diff})))
+    # Regression: a persistence baseline row has taf_id NULL, so resolving the station
+    # via r.taf_id inner-joins every baseline away and the persistence column renders
+    # empty -- losing the stable-regime vs hard-regime comparison the ranking exists for.
+    check("archive_difficulty_points INCLUDES the NULL-taf_id persistence baseline",
+          any(r["subject"] == "persistence" for r in diff),
+          str(sorted({r["subject"] for r in diff})))
+    check("archive_difficulty_points excludes REAL evaluations (no spine rows leak in)",
+          all(r["n_tafs"] >= 1 for r in diff)
+          and con.execute("SELECT count(*) FROM tafver_runs WHERE evaluation_id "
+                          "NOT LIKE 'archdiff:%'").fetchone()[0] > 0
+          and sum(r["n_tafs"] for r in diff if r["subject"] == "subject") == 1,
+          str(diff))
+    check("archive_difficulty_points is scorer_version-keyed",
+          store.archive_difficulty_points(con, scorer_version="no-such-version") == [])
+    check("archive_difficulty_points station filter narrows",
+          store.archive_difficulty_points(con, scorer_version=base_version,
+                                          station="ZZZZ") == [])
+
+    dsec = "\n".join(rr.section_difficulty(diff))
+    check("section_difficulty renders the station, not the archdiff id",
+          human_taf["station"] in dsec and "archdiff" not in dsec, dsec)
+    check("section_difficulty degrades cleanly with no rows",
+          "No archive-difficulty rows" in "\n".join(rr.section_difficulty([])))
+
     subj = [r for r in pts if r["subject"] == "subject"]
     check("both evaluations produced subject rows", len(subj) == 2, str(len(subj)))
 

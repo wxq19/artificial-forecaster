@@ -213,6 +213,50 @@ def section_stations(points: list[dict]) -> list[str]:
     return ["## Per-station TAFVER", ""] + _table(rows, ["station", "n", *ordered])
 
 
+def section_difficulty(diff: list[dict]) -> list[str]:
+    """Station DIFFICULTY RANKING from standalone archive-difficulty scoring -- a
+    DIFFERENT population from every other section here. These are archived HUMAN TAFs
+    scored against obs with no model run involved, across the wide archive-only net
+    (63 stations), which is what makes them a station-selection input rather than a
+    result. `--paired` does not apply and is not applied.
+
+    NOTE ON LABELS: archive-difficulty scores the human TAF under subject='subject'
+    (the scorer's slot for "the TAF being graded"), so the column below is the HUMAN
+    forecaster's score, NOT the model's. The model never ran at these stations.
+
+    Reading it: LOW human score = genuinely hard to forecast. Persistence beside it
+    separates two regimes -- persistence at or above the human means a stable regime
+    where doing nothing scores well (low skill headroom), while persistence far below
+    the human means forecaster judgement is carrying real weight (high headroom, the
+    interesting sites to spend model budget on)."""
+    agg: dict[tuple[str, str], list[float]] = defaultdict(lambda: [0.0, 0.0])
+    n_tafs: dict[str, int] = {}
+    for r in diff:
+        cell = agg[(r["station"], r["subject"])]
+        cell[0] += r["earned"]
+        cell[1] += r["available"]
+        if r["subject"] == "subject":
+            n_tafs[r["station"]] = r["n_tafs"]
+    if not agg:
+        return ["## Station difficulty ranking", "",
+                "No archive-difficulty rows at this scorer_version.", ""]
+
+    rows = []
+    for stn in {k[0] for k in agg}:
+        human = pct(*agg[(stn, "subject")]) if (stn, "subject") in agg else None
+        persist = pct(*agg[(stn, "persistence")]) if (stn, "persistence") in agg else None
+        gap = (human - persist) if (human is not None and persist is not None) else None
+        rows.append((stn, n_tafs.get(stn, 0), human, persist, gap))
+    # Hardest first: lowest human score. None sorts last.
+    rows.sort(key=lambda r: (r[2] is None, r[2]))
+    table = [(r[0], r[1], _f(r[2]), _f(r[3]), _signed(r[4], 1)) for r in rows]
+    out = ["## Station difficulty ranking", "",
+           "Archived HUMAN TAFs scored standalone (no model run). Hardest first.",
+           "`human-persist` > 0 means forecaster judgement beats doing nothing.", ""]
+    return out + _table(table, ["station", "n TAFs", "human", "persistence",
+                                "human-persist"], align_right={1, 2, 3, 4})
+
+
 def section_orchestration(runs: list[dict], model_pct: dict[str, float],
                           all_runs: list[dict]) -> list[str]:
     """Orchestration as a headline result, not a debugging aside: how many attempts
@@ -551,6 +595,9 @@ def build(con, *, scorer_version: str, paired: bool) -> str:
     lead = store.lead_points(con, scorer_version=scorer_version)
     lead_err = store.lead_errors(con, scorer_version=scorer_version)
     all_runs = store.all_runs(con, producer_kind=None)
+    # Separate population (archive-only human TAFs, no evaluations spine), so it is read
+    # unconditionally and is deliberately NOT narrowed by --paired.
+    diff = store.archive_difficulty_points(con, scorer_version=scorer_version)
 
     if paired:
         # Every reader carries evaluation_id precisely so the subset is exact: filtering
@@ -588,6 +635,7 @@ def build(con, *, scorer_version: str, paired: bool) -> str:
     md += section_gaps(points)
     md += section_elements(elements)
     md += section_stations(points)
+    md += section_difficulty(diff)
     md += section_lead_time(lead, lead_err)
     md += section_orchestration(runs, model_pct, all_runs)
     md += section_tools(runs, model_pct, persist_pct)

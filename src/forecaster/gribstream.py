@@ -1,8 +1,9 @@
 """GRIBStream point-forecast client -- live/archived model time-series fetch seam.
 
-Sibling to fcstsounding.py / soundings.py / awc.py: a network data-source client. Fetches a
+Sibling to soundings.py / awc.py: a network data-source client. Fetches a
 model forecast time series for a point (or points) from the GRIBStream API and returns plain
-rows. No matplotlib, no SQL. Two things set it apart from the BUFKIT seam (fcstsounding.py):
+rows. No matplotlib, no SQL. Two things set it apart from the BUFKIT seam it REPLACED
+(fcstsounding.py, removed 2026-07-28):
   - ARBITRARY lat/lon -- it extracts from the underlying GRIB, not a fixed ~2100-station
     list, so an off-BUFKIT site (e.g. KBAB) needs no proxy station.
   - Every row carries `forecasted_at` -- the model RUN reference time -- so the agent can

@@ -61,6 +61,32 @@ must remain a `.env` edit with ZERO code change. Preserve this seam in any sugge
 - SuperCloud: 8B–32B class VLM (fits V100s).
 - KEEP THE SAME MODEL TIER across environments so benchmark numbers are comparable.
 
+### ROUND-2 MODEL CANDIDATE SET (screened 2026-07-24 on OpenRouter; `scripts/screen_models.py`)
+Screened 11 vision+tools models on 3 HARD frozen round-1 fixtures (KFTK/RJTY/KWRI) for
+$/AFMAN-clean TAF + chart-reading + reasoning ablation. Full report:
+`logs/model_screen_20260724-141933.md`; details in memory `model-screen-resume`. TAFVER here is
+on hard cases so runs below round-1's 83.5 pooled. Candidates (best clean arm; model -> provider):
+- **Inkling (reason-high) 85.9** @ Together -- best forecaster; 1 of 3 miss was a provider
+  JSONDecodeError, scored 87.6/84.3 where it ran. ~$0.093/clean.
+- **Gemma-4-31B (base) 82.8** @ Together -- best value+reliability, vision 9/9, $0.016.
+- **Grok-4.5 (reason-low) 80.6** @ xAI -- most reliable (3/3), $0.074, vision 9/9.
+- **Gemini-3.1-flash-lite (reason-low) 76.8** @ Google -- cheap+reliable (3/3), $0.014.
+- **Mistral-small-3.2 (base) 74.6** @ Mistral -- CHEAPEST $0.007, vision 7/9.
+- MiniMax-M3 (reason-on) 74.5 @ Together (round-1 anchor), $0.026; Kimi-K3 75.4 @ Moonshot
+  but priciest ($0.151, int4); Qwen3-VL-235B 66.1 @ Alibaba/DeepInfra (lowest emitter).
+- **OUT: MiMo-v2.5 and Qwen3-VL-32B cannot emit a valid TAF on any provider** (MiMo ruminates
+  10-40k tok then the provider empty-responds; re-run at 16 steps/40k tok did not help).
+KEY LESSONS: (1) MORE reasoning mostly HURT -- default LOW/OFF (Gemini-high broke emit entirely;
+only Inkling rewarded high). (2) Vision is near-universal; EMIT reliability (valid nested TAF JSON)
+is the discriminator, same as round-1 orchestration. (3) OpenRouter routes to third-party backends
+of wildly varying tool-call/image fidelity -- BAD: Novita (mangles nested args), SiliconFlow (leaks
+special tokens), GMICloud (empty-responds); a hard provider pin OVERRIDES account presets, so put
+the exclusion in the request (`ignore` list). xAI rejects GIF (transcode charts to PNG). Validate on
+the REAL nested-emit task, not a small probe. Before a round: set an OpenRouter hard per-key credit
+cap, and wire the validated (model->provider) pins + IGNORE_PROVIDERS into `schedule.py`.
+NOTE: all screen code is UNCOMMITTED (OpenRouter seam in src/forecaster/{config,llm,agent,store,
+runlog}.py + ping_models.py + .env.example; new scripts/screen_models.py).
+
 ## Tech stack
 - **App / serving code:** Python, managed with `uv`. Pure-PyPI deps (openai,
   pydantic-settings, python-dotenv, matplotlib, metpy). Run things with `uv run python ...`.
@@ -651,8 +677,9 @@ this touches live collection.
 3. **Two open M2 questions still stand** from 07-22: (a) a LIVE MODEL_DATA_ENABLED run to see the
    agent actually READ get_model_verification in the loop (never been live); (b) model_run_verification
    gating -- settle the worksheet keep/drop/redesign FIRST.
-4. Untouched: the August climo deadline (build BEFORE 2026-08-01, one station at a time), provider
-   price re-verify + ping_models before round 2, scheduler timeout fix.
+4. Untouched: round-2 climo (NOT a deadline -- corrected 2026-07-27, see the CLIMO FOR ROUND 2
+   block; gated on station selection, not the calendar), provider price re-verify +
+   ping_models before round 2, scheduler timeout fix.
 
 ### SESSION 2026-07-22 -- doc-drift fixes, climo persisted, and get_model_verification rebuilt
 All UNCOMMITTED in the working tree. Files touched: CLAUDE.md, src/forecaster/{tools,store,
@@ -734,7 +761,8 @@ Decided by looking at REAL output (KWRI, GFS, 234 GRIBStream credits total), not
 4. Still open from 07-20 and untouched today: Pi state check (read-only ssh; the Pi may still sit
    on orphaned c213d05 and needs an owner-run `git fetch && git reset --hard origin/main`),
    provider price re-verification + ping_models before round 2, the scheduler timeout fix, and
-   the August climo deadline (build BEFORE 2026-08-01, one station at a time).
+   round-2 climo (believed a hard Aug-1 deadline at the time; CORRECTED 2026-07-27 -- there is
+   no calendar constraint, see the CLIMO FOR ROUND 2 block).
 
 ### SESSION 2026-07-20 EVENING -- results layer + climatology baseline + lit-review triage
 All UNCOMMITTED in the working tree. Non-code outputs of the session live only in this file.
@@ -787,7 +815,8 @@ altimeter 75.5, wind_dir 48.2, and present_weather **0.0** -- a STRUCTURAL zero,
 p50 rule never forecasts a phenomenon. NOT YET PERSISTED: the rows exist only when computed;
 run `score_taf.py --pending --rescore` to write them, then the report picks them up
 automatically. Unbuilt-month path VERIFIED to degrade cleanly (named error, no crash) --
-important given the Aug-1 climo deadline.
+which matters whenever round 2 spans a month whose climo has not been built yet (the
+"Aug-1 deadline" this once cited was not real; see the CLIMO FOR ROUND 2 block).
 
 **3. LEAD-TIME DEGRADATION (new report section; `lead_hr` was already persisted).**
 The textbook picture, and the strongest validation the baseline design has had:
@@ -936,10 +965,23 @@ decision, and it gates which stations need August climo.** The low-yield station
 (KVBG/KFTK/KRCA/PABI, all "provisional" cycle) are the same ones that produced most of the
 62 unpaired evaluations -- irregular issuance is a real property of those fields.
 
-### HARD DEADLINE -- August climo before 2026-08-01
-If round 2 runs in August, climo must be built BEFORE Aug 1, ONE STATION AT A TIME (concurrent
-IEM builds 503 -- see [[iem-single-client-builds]]). Decide round-2 stations first (see above)
-so the right list gets built; otherwise build August for the current 10 as insurance.
+### CLIMO FOR ROUND 2 -- NOT a deadline (corrected 2026-07-27)
+This block previously read "HARD DEADLINE -- August climo before 2026-08-01". **That was
+wrong and it misdirected planning three times before anyone checked the code.** There is no
+calendar constraint: `climo.build` iterates `range(climo_start_year, climo_end_year + 1)` =
+2006..2025 (`climo_end_year` is a FIXED config value), and the raw history lands in a scratch
+DuckDB that is discarded -- it never touches the runtime `obs` table. Building August climo
+DURING August 2026 pulls Augusts 2006-2025, the identical row set, and the build is
+deterministic + idempotent, so the output is byte-identical whenever it runs. The likely
+origin of the false deadline is a conflation with the obs-leakage problem, which the
+scratch-DB design already solved on 2026-07-09. A date would only matter if `climo_end_year`
+were bumped to 2026 -- a config decision, not a calendar one.
+THE ACTUAL CONSTRAINT: build the right MONTHS for the right STATIONS before round 2 needs
+them, ONE STATION AT A TIME (concurrent IEM builds 503 -- see [[iem-single-client-builds]]).
+So it is GATED ON ROUND-2 STATION SELECTION (see above), not on the calendar; building early
+for a guessed station list is wasted work. Cost is ~40 IEM requests per station-month
+(20 years x 2 report types) = ~5-10 min per station at the throttle, so a 10-station build is
+an hour or two of unattended time whenever it is wanted.
 
 ### SME GOLDEN FIXTURE -- SUBMITTED 2026-07-20, expect 1-2 weeks
 Sent blind (our 88.7 withheld): KDMA 181100Z routine 30h TAF (TEMPO + 4 BECMG, monsoon
@@ -1310,8 +1352,10 @@ GO-LIVE STEPS (next session):
    loss window if the SD card dies between pulls).
 
 CAVEATS: climo is JULY-ONLY (this test ~1 week per owner) -- if collection runs into August, build
-August BEFORE Aug 1 (`build_climo.py --station <icao> --months 8`, one station at a time -- concurrent
-IEM builds 503). Satellite images ~1MB base64; transcripts ~1-3MB/run -> ~1.3-3.8GB/week (prune keeps
+August (`build_climo.py --station <icao> --months 8`, one station at a time -- concurrent
+IEM builds 503). [The original text said "BEFORE Aug 1"; CORRECTED 2026-07-27 -- the build is
+date-independent, see the CLIMO FOR ROUND 2 block. Only the month/station list matters.]
+Satellite images ~1MB base64; transcripts ~1-3MB/run -> ~1.3-3.8GB/week (prune keeps
 the Pi lean).
 
 ### (historical 2026-07-13) TAF SCORING SUBSYSTEM built (M0-M3 of docs/taf_score.md)

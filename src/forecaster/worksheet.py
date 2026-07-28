@@ -564,7 +564,7 @@ def _example_worksheet() -> TafWorksheet:
                            takeaway="TX mean 40.5C; afternoon SW wind; TS 0.7%; fog 0%",
                            evidence_refs=["ev_005"]),
             ],
-            missing_inputs=["no BUFKIT output at KLSV; used KLAS as a proxy"],
+            missing_inputs=["no observed 00/12Z sounding within 300 km"],
         ),
         current_state=CurrentState(
             observed_regime_summary="hot, dry, cloud-free summer ridge; gusty SW afternoon wind",

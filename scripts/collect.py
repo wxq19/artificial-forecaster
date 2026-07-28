@@ -22,6 +22,7 @@ fans out the matrix. All persistence runs under the single-writer lock.
 """
 
 import argparse
+import base64
 import json
 import shutil
 import subprocess
@@ -32,10 +33,10 @@ from pathlib import Path
 
 from forecaster import awc, modeldata, neighbors, stations, store, tafgen
 from forecaster import worksheet as wksht
-from forecaster.agent import AgentConfig, run_agent
+from forecaster.agent import AgentConfig, _image_mime, run_agent
 from forecaster.config import settings
 from forecaster.runlog import persist_run
-from forecaster.tools import EMIT_TAF, GET_PREVIOUS_TAF, SUBMIT_WORKSHEET, TOOLS
+from forecaster.tools import EMIT_TAF, GET_PREVIOUS_TAF, SUBMIT_WORKSHEET, TOOLS, run_tool
 
 TOOL_CAPS = {"get_map": 8, "get_sounding": 8, "get_fcst_sounding": 8, "get_point_forecast": 8}
 
@@ -55,11 +56,12 @@ def _git_sha() -> str | None:
         return None
 
 
-def _system_prompt(max_steps: int, mode: str, taf_access: bool, model_data: bool = False) -> str:
+def _system_prompt(max_steps: int, mode: str, taf_access: bool) -> str:
     """The USAF-forecaster system prompt for a COLLECTION run -- the tool list omits
-    get_current_taf on purpose (leakage guard); get_previous_taf appears only when this
-    cell grants prior-TAF access; the get_model_* tools appear only when model_data is on
-    (naming them in the prompt is what makes the model actually call them)."""
+    get_current_taf on purpose (leakage guard) and get_previous_taf appears only when this
+    cell grants prior-TAF access. The get_model_* tools are ALWAYS named: naming them in
+    the prompt is what makes the model actually call them (2026-07-19 finding), and model
+    data is no longer an experimental axis (see the --model-data retirement below)."""
     gate = {
         "off": "Reason, then call emit_taf.",
         "advisory": "Fill and submit a worksheet (submit_taf_worksheet) BEFORE emit_taf. Its "
@@ -70,45 +72,76 @@ def _system_prompt(max_steps: int, mode: str, taf_access: bool, model_data: bool
     }[mode]
     prev = (" get_previous_taf (the prior official TAF, for continuity)," if taf_access else "")
     md = (" get_model_state (hourly NWP surface guidance -- T/Td/wind/MSLP/ceiling from "
-          "GFS/HRRR/NBM), get_hazard_scan (icing + convective/turbulence environment, "
+          "GFS/HRRR/NBM/IFS), get_hazard_scan (icing + convective/turbulence environment, "
           "cross-model), get_model_verification (recent model-vs-obs bias), "
-          "get_nearby_model_data (a field at upstream points)," if model_data else "")
+          "get_nearby_model_data (a field at upstream points), get_ensemble_prob (GEFS "
+          "probabilities in the forecast categories),")
     s = (
         "You are a USAF weather forecaster issuing terminal aerodrome forecasts under AFMAN "
         "15-124. Tools: query_obs/get_latest_obs (stored METARs), get_trend (meteogram), "
-        "get_sounding/get_fcst_sounding (skew-Ts), get_map (synoptic charts), get_point_forecast "
-        "(hourly model point forecast), get_climo (typical conditions), get_imagery (sat/radar), "
-        "get_terrain (local terrain + coastline with the nearby airfields plotted on a relief "
-        "map), get_nearby_obs (latest observations from those neighbors),"
+        "get_sounding (observed 00/12Z skew-T), get_fcst_sounding (model forecast sounding -- "
+        "ask for form 'chart', 'table' or 'both'), get_map (synoptic charts), "
+        "get_point_forecast (one model's hourly surface table), get_climo (typical "
+        "conditions), get_imagery (sat/radar), get_nearby_obs (latest observations from the "
+        "neighboring airfields),"
         + md + prev + " check_taf (AFMAN dry-run), and emit_taf (submit the forecast). Each data-tool "
         "receipt begins with an [evidence_id: ev_NNN] you can cite. " + gate + " Think step by step, "
-        "gather what you need, and base the forecast only on tool data. Place the field in its "
-        "mesoscale setting: use get_terrain to see the surrounding terrain and airfields, then "
-        "get_nearby_obs for the upwind/relevant neighbors to judge whether a restriction is "
-        "regional or local, what may advect in, and any terrain-driven effect (upslope/downslope, "
-        "sea breeze, valley cold-air pooling). "
+        "gather what you need, and base the forecast only on the data you are given. Your "
+        "station's terrain and its last 24 hours of observations are supplied below -- read "
+        "them first; they are the mesoscale setting. Use get_nearby_obs for the "
+        "upwind/relevant neighbors to judge whether a restriction is regional or local, what "
+        "may advect in, and any terrain-driven effect (upslope/downslope, sea breeze, valley "
+        "cold-air pooling). "
         f"You have up to {max_steps} tool-calling turns -- take the time to reason thoroughly."
     )
-    if model_data:
-        s += (" Model guidance is available: anchor quantitative trends -- temperature extremes "
-              "(TX/TN), the pressure/QNH trend, wind and gusts -- to get_model_state and "
-              "get_point_forecast rather than extrapolating the last observation, use "
-              "get_hazard_scan to judge convective and icing risk, and get_model_verification "
-              "to weight the model your recent obs say is less biased.")
+    s += (" Model guidance is available: anchor quantitative trends -- temperature extremes "
+          "(TX/TN), the pressure/QNH trend, wind and gusts -- to get_model_state and "
+          "get_point_forecast rather than extrapolating the last observation, use "
+          "get_hazard_scan to judge convective and icing risk, and get_model_verification "
+          "to weight the model your recent obs say is less biased.")
     if mode != "off":
         s += "\n\n" + wksht.worksheet_guide(settings.evidence_mode)
     return s + "\n\n" + tafgen.emit_taf_guide()
 
 
 def _task_prompt(st: stations.Station, valid_from: datetime) -> str:
-    proxy = st.bufkit_proxy
-    note = (f"\nNOTE: {st.icao} has surface observations but NO model BUFKIT output -- use nearby "
-            f"{proxy} for get_fcst_sounding and get_point_forecast." if proxy else "")
     return (
         f"Produce a {st.taf_hours}-hour Air Force TAF for {st.icao} ({st.name}), valid from "
-        f"{valid_from:%d%H%M}Z ({valid_from:%Y-%m-%d %H:%MZ}).{note} "
-        "Begin by checking current and recent conditions."
+        f"{valid_from:%d%H%M}Z ({valid_from:%Y-%m-%d %H:%MZ}). "
+        "Your station's terrain and its last 24 hours of observations follow. Read them, "
+        "then gather whatever else you need."
     )
+
+
+def _preload(icao: str, run_db: str) -> tuple[str, list[bytes]]:
+    """Build the always-supplied context: the station's terrain and its last 24 h of obs.
+
+    Both were TOOLS in round 1 and both were named in the system prompt with an explicit
+    two-step nudge -- and get_terrain was called ZERO times in 336 runs that had it. Naming
+    a tool is demonstrably not enough to get it used, so the static, always-relevant part of
+    the picture is now handed over instead of offered. Obs are preloaded for a different
+    reason: get_latest_obs and get_trend already ran in 99.1% of runs, so this removes a
+    round-trip rather than adding information.
+
+    Terrain is a live fetch and obs are a DB read; either can fail without being fatal, so a
+    failure degrades to the tool still being available rather than killing the cell."""
+    blocks, images = [], []
+    for name, args, label in (
+        ("get_terrain", {"station": icao}, "TERRAIN AND SURROUNDING AIRFIELDS"),
+        ("get_trend", {"station": icao, "hours": 24}, "LAST 24 HOURS -- METEOGRAM"),
+        ("get_latest_obs", {"station": icao, "n": 8}, "MOST RECENT OBSERVATIONS"),
+    ):
+        try:
+            r = run_tool(name, args, db_path=run_db)
+        except Exception as e:  # noqa: BLE001 -- preload is best-effort, never fatal
+            print(f"  preload {name}: FAILED {type(e).__name__}: {e}")
+            continue
+        if r.text.startswith("error:"):
+            print(f"  preload {name}: {r.text.splitlines()[0][:90]}")
+            continue
+        blocks.append(f"=== {label} ===\n{r.text}")
+        images += r.images
+    return "\n\n".join(blocks), images
 
 
 def _load_metar_retry(icao: str, hours: float, bench_db, tries: int = 3):
@@ -124,14 +157,11 @@ def _load_metar_retry(icao: str, hours: float, bench_db, tries: int = 3):
             time.sleep(1.5 * (i + 1))
 
 
-def _ingest_obs(icao: str, model_icao: str, neighbor_icaos: list[str],
-                hours: float, bench_db) -> dict:
-    """Fetch+bank obs for the home station (+ proxy + neighbors) into the benchmark DB, ONCE.
+def _ingest_obs(icao: str, neighbor_icaos: list[str], hours: float, bench_db) -> dict:
+    """Fetch+bank obs for the home station and its neighbors into the benchmark DB, ONCE.
     insert_obs is idempotent, so the model cells later COPY these banked obs (store.copy_obs)
     rather than each re-hitting AWC. Returns the obs-feed summary for the run record."""
     load = _load_metar_retry(icao, hours, bench_db)
-    if model_icao != icao:                  # also bank the proxy's obs for the model tools
-        load = {"base": load, "proxy": _load_metar_retry(model_icao, hours, bench_db)}
     for nb in neighbor_icaos:
         try:
             _load_metar_retry(nb, hours, bench_db)
@@ -154,10 +184,16 @@ def main() -> int:
                     help="pre-cutoff obs back-window (24 matches get_trend's default look-back)")
     ap.add_argument("--neighbors", action=argparse.BooleanOptionalAction, default=True,
                     help="also ingest nearby-station obs for get_nearby_obs (spatial awareness)")
-    ap.add_argument("--model-data", action=argparse.BooleanOptionalAction,
-                    default=settings.model_data_enabled,
-                    help="GRIBStream model-data tier: prefetch the station's model neighborhood at "
-                         "issue time and grant the get_model_* tools (BILLS credits; off by default)")
+    # RETIRED 2026-07-28: --model-data / --no-model-data. It was an experimental axis (withhold
+    # the model-data tier from the agent), and BUFKIT *was* model data -- so "no model data" now
+    # describes a state no forecaster in this benchmark ever had. The get_model_* tools are
+    # always granted; the archive simply answers "not pre-fetched" when it is empty. What
+    # remains is the CREDIT-SPENDING action, which is opt-in and named for what it does.
+    ap.add_argument("--prefetch-model-data", action="store_true",
+                    help="with --ingest-only, also pull this station's model neighborhood from "
+                         "GRIBStream at issue time (BILLS credits). Normally left off: "
+                         "scripts/archive_model_data.py keeps the archive fresh on the model-run "
+                         "cadence and the cells copy from it for free")
     ap.add_argument("--ingest-only", action="store_true",
                     help="fetch+bank obs (home+proxy+neighbors) into the benchmark DB and exit -- "
                          "the scheduler runs this ONCE per station so the matrix cells share one "
@@ -180,7 +216,6 @@ def main() -> int:
              else datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0, second=0))
     valid_from = _floor_hour(issue)
     valid_to = valid_from + timedelta(hours=st.taf_hours)
-    model_icao = stations.model_station(icao)
     bench_db = args.db or settings.db_path
     # Nearest-neighbor airfields for spatial awareness (get_nearby_obs); best-effort per
     # neighbor so one dud id (no live AWC METAR) never sinks the run. Banked into the
@@ -195,12 +230,12 @@ def main() -> int:
     # idempotent, so the cells then COPY these under --no-ingest.
     if args.ingest_only:
         with store.write_lock(args.db):
-            load = _ingest_obs(icao, model_icao, neighbor_icaos, args.ingest_hours, bench_db)
+            load = _ingest_obs(icao, neighbor_icaos, args.ingest_hours, bench_db)
         print(f"[{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}] ingest-only {icao}: {json.dumps(load)}")
         # Prefetch the model neighborhood ONCE per station/cycle (like obs banking): as_of =
         # valid_from pins the run cutoff, so the archive is leakage-safe and the matrix cells
-        # copy it for 0 credits. Gated: no credits unless --model-data is on.
-        if args.model_data:
+        # copy it for 0 credits. Opt-in: archive_model_data.py normally does this instead.
+        if args.prefetch_model_data:
             md = modeldata.prefetch(icao, as_of=valid_from, db_path=bench_db)
             print(f"  model-data prefetch {icao}: inserted {md['rows_inserted']} rows, "
                   f"{md['credits_charged']} credits" + (f"; notes={md['notes']}" if md["notes"] else ""))
@@ -231,7 +266,7 @@ def main() -> int:
         #   4. stub the runs row, so a cell killed by the scheduler's timeout still leaves a
         #      record (persist_run replaces it by run_id on success).
         with store.write_lock(args.db):
-            load = (_ingest_obs(icao, model_icao, neighbor_icaos, args.ingest_hours, bench_db)
+            load = (_ingest_obs(icao, neighbor_icaos, args.ingest_hours, bench_db)
                     if args.ingest else {"reused_bank": True, "station": icao})
             bcon = store.connect(bench_db)      # RW so a fresh benchmark DB gets its schema
             try:
@@ -260,9 +295,6 @@ def main() -> int:
                 # into a run invoked at 03:07 forecasting from 03:00).
                 n_obs = store.copy_obs(rcon, bench_db, icao,
                                        before=valid_from, hours=args.ingest_hours)
-                if model_icao != icao:
-                    n_obs += store.copy_obs(rcon, bench_db, model_icao,
-                                            before=valid_from, hours=args.ingest_hours)
                 for nb in neighbor_icaos:       # same cutoff -> leakage-safe by construction
                     n_obs += store.copy_obs(rcon, bench_db, nb,
                                             before=valid_from, hours=args.ingest_hours)
@@ -275,10 +307,9 @@ def main() -> int:
                 # as_of=valid_from), so it copies with NO cutoff -- just the station's
                 # coordinate neighborhood. copy_model_data creates its own schema, so the
                 # get_model_* tools return clean "not pre-fetched" feedback on an empty archive.
-                n_md = (store.copy_model_data(
-                            rcon, bench_db,
-                            coords=modeldata.station_coords(icao, as_of=valid_from, db_path=bench_db))
-                        if args.model_data else store.init_model_data_schema(rcon) or 0)
+                n_md = store.copy_model_data(
+                    rcon, bench_db,
+                    coords=modeldata.station_coords(icao, as_of=valid_from, db_path=bench_db))
                 if prev_taf:
                     store.insert_taf(rcon, prev_taf)
             finally:
@@ -294,19 +325,29 @@ def _run_and_persist(args, st, icao, issue, valid_from, valid_to,
                      run_db, prev_taf, n_climo, n_obs, n_md, load,
                      run_id, experiment_id, started_at) -> int:
     """The agent run + final persist (split from main so the temp-dir finally wraps it)."""
-    # Strip get_current_taf (leakage) always; strip the model-data tier unless enabled (a
-    # switchable experiment axis -- off means the archive is empty and no credits were spent).
-    _MODEL_DATA_TOOLS = {"get_model_state", "get_hazard_scan", "get_model_verification",
-                         "get_nearby_model_data", "get_ensemble_prob"}
-    _drop = {"get_current_taf"} | (set() if args.model_data else _MODEL_DATA_TOOLS)
-    toolset = [t for t in TOOLS if t["function"]["name"] not in _drop]
+    # Strip get_current_taf (leakage guard) -- the only tool ever withheld now. The model-data
+    # drop-set was retired 2026-07-28 along with the --no-model-data arm; an empty archive
+    # answers "not pre-fetched" on its own, which is a truthful degrade rather than a
+    # pretend-the-tool-does-not-exist one.
+    toolset = [t for t in TOOLS if t["function"]["name"] != "get_current_taf"]
     if args.taf_access:
         toolset.append(GET_PREVIOUS_TAF)
     toolset += ([SUBMIT_WORKSHEET] if args.mode != "off" else []) + [EMIT_TAF]
 
-    messages = [{"role": "system", "content": _system_prompt(args.max_steps, args.mode, args.taf_access,
-                                                             args.model_data)},
-                {"role": "user", "content": _task_prompt(st, valid_from)}]
+    pre_text, pre_images = _preload(icao, run_db)
+    task = _task_prompt(st, valid_from)
+    if pre_text:
+        content: list = [{"type": "text", "text": f"{task}\n\n{pre_text}"}]
+        for im in pre_images:                     # terrain map + meteogram, same encoding
+            b64 = base64.b64encode(im).decode()   # the agent loop uses for tool images
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:{_image_mime(im)};base64,{b64}"}})
+        user_msg = {"role": "user", "content": content}
+    else:
+        user_msg = {"role": "user", "content": task}
+    messages = [{"role": "system", "content": _system_prompt(args.max_steps, args.mode,
+                                                             args.taf_access)},
+                user_msg]
     cfg = AgentConfig(
         model=args.model, toolset=toolset, max_steps=args.max_steps, max_tokens=args.max_tokens,
         temperature=args.temperature, tool_caps=TOOL_CAPS, worksheet_mode=args.mode,
@@ -316,7 +357,7 @@ def _run_and_persist(args, st, icao, issue, valid_from, valid_to,
     print(f"[{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}] collect {icao} valid {valid_from:%d%H%M}Z "
           f"| model={args.model} temp={args.temperature} mode={args.mode} seed={cfg.seed} "
           f"taf_access={args.taf_access} climo_months={n_climo} run_obs={n_obs} "
-          f"model_data={n_md if args.model_data else 'off'}"
+          f"model_data={n_md}"
           + (f" (prev {prev_taf['bulletin_type']} {prev_taf['issue_time_utc']:%d%H%MZ})"
              if prev_taf else (" (no prior TAF on file)" if args.taf_access else "")))
     res = run_agent(messages, cfg)

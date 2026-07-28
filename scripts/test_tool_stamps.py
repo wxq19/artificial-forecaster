@@ -8,12 +8,9 @@ the RECEIPT WIRING, not the network. Restores every patched symbol in a finally.
 """
 
 from datetime import datetime
-from types import SimpleNamespace
 
-from forecaster import charts, fcstsounding, imagery, soundings, tools, wxmaps
-from forecaster.tools import (
-    _get_fcst_sounding, _get_imagery, _get_loop, _get_map, _get_point_forecast, _get_sounding,
-)
+from forecaster import charts, imagery, soundings, tools, wxmaps
+from forecaster.tools import _get_imagery, _get_loop, _get_map, _get_sounding
 
 checks: list[tuple[str, bool, str]] = []
 
@@ -54,20 +51,10 @@ try:
     check("get_map (forecast): run + fhr on first line",
           "run 2026-07-17T12:00Z" in _first(r) and "f006" in _first(r), _first(r))
 
-    # get_fcst_sounding: BUFKIT run hour on line 1.
-    prof = SimpleNamespace(
-        station="KMSP", model="gfs", run=RUN, fhr=12, valid="260717/1200",
-        url="http://isu/x.buf")
-    _patch(fcstsounding, "fetch_profile", lambda *a, **k: prof)
-    _patch(charts, "skewt", lambda p: PNG)
-    r = _get_fcst_sounding({"station": "KMSP", "model": "gfs", "fhr": 12})
-    check("get_fcst_sounding: run on first line", "run 2026-07-17T12:00Z" in _first(r), _first(r))
-
-    # get_point_forecast: BUFKIT run on line 1.
-    pf = SimpleNamespace(station="KMSP", model="gfs", run=RUN, url="http://isu/x.buf", rows=[])
-    _patch(fcstsounding, "fetch_point", lambda *a, **k: pf)
-    r = _get_point_forecast({"station": "KMSP", "model": "gfs"})
-    check("get_point_forecast: run on first line", "run 2026-07-17T12:00Z" in _first(r), _first(r))
+    # get_fcst_sounding / get_point_forecast USED to be checked here. Since 2026-07-28 they
+    # read the model_data archive instead of fetching BUFKIT, so they are no longer network
+    # tools and carry no fetch stamp -- their receipts cite the archived model RUN, which is
+    # covered by scripts/test_modeldata.py against a real DB rather than a monkeypatch.
 
     # get_imagery satellite: fetch wall-clock stamp on line 1.
     _patch(imagery, "fetch_satellite", lambda region, product: (PNG, "http://star/x.jpg"))
@@ -82,7 +69,8 @@ try:
     check("get_imagery (radar): fetched-stamp on first line", "fetched " in _first(r), _first(r))
 
     # get_loop: frame time span on line 1 (the observed-time marker).
-    frames = [("2026-07-17T10:00Z", PNG), ("2026-07-17T11:00Z", PNG), ("2026-07-17T12:00Z", PNG)]
+    frames = [imagery.LoopFrame(datetime(2026, 7, 17, h), f"2026-07-17T{h}:00Z",
+                                f"http://cdn/{h}.jpg", PNG) for h in (10, 11, 12)]
     _patch(imagery, "satellite_loop", lambda *a, **k: (frames, "GOES19 CONUS", "CONUS"))
     _patch(charts, "filmstrip", lambda *a, **k: PNG)
     _patch(charts, "loop_mp4", lambda *a, **k: b"\x00mp4")

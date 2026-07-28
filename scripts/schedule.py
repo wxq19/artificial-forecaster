@@ -98,9 +98,8 @@ def main() -> int:
     ap.add_argument("--max-parallel", type=int, default=MAX_PARALLEL,
                     help=f"concurrent collection subprocesses (default {MAX_PARALLEL})")
     ap.add_argument("--db", default=None, help="benchmark DB path (default: settings.db_path)")
-    ap.add_argument("--model-data", action=argparse.BooleanOptionalAction, default=None,
-                    help="force the GRIBStream model-data tier on/off for this dispatch "
-                         "(default: inherit collect.py's MODEL_DATA_ENABLED; BILLS credits when on)")
+    # --model-data / --no-model-data retired 2026-07-28: the model-data tier is always on for
+    # the agent, and the credit-spending pull lives in archive_model_data.py, not here.
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc).replace(tzinfo=None, minute=0, second=0, microsecond=0)
@@ -114,20 +113,15 @@ def main() -> int:
     if not stns:
         return 0
 
-    # Model-data is NOT prefetched at forecast time anymore -- it is archived on the MODEL-RUN
-    # cadence by scripts/archive_model_data.py (~4x/day, ONE batched pull of the whole roster
-    # for the freshest runs). The cells just COPY that archive (collect.py copy_model_data, 0
-    # credits), so forecast timing is decoupled from data availability. _md_flag toggles the copy.
-    def _md_flag() -> list[str]:
-        # None -> inherit collect's settings default; True/False -> force it for this dispatch.
-        return [] if args.model_data is None else (
-            ["--model-data"] if args.model_data else ["--no-model-data"])
-
+    # Model-data is NOT prefetched at forecast time -- it is archived on the MODEL-RUN cadence
+    # by scripts/archive_model_data.py (~4x/day, ONE batched pull of the whole roster on the
+    # 00/06/12/18Z cycles). The cells just COPY that archive (collect.py copy_model_data, 0
+    # credits), so forecast timing is decoupled from data availability.
     def _ingest_cmd(st: stations.Station) -> list[str]:
-        # Obs banking only -- model-data is archived separately (archive_model_data.py), so the
-        # ingest subprocess never prefetches.
+        # Obs banking only -- collect.py's prefetch is opt-in (--prefetch-model-data) and we
+        # never pass it here, so the ingest subprocess cannot spend credits.
         cmd = [sys.executable, str(_COLLECT), "--station", st.icao, "--ingest-only",
-               "--no-model-data", "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
+               "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
         return cmd + (["--db", args.db] if args.db else [])
 
     def _cell_cmd(st: stations.Station, cell: Cell) -> list[str]:
@@ -136,7 +130,7 @@ def main() -> int:
                "--taf-access" if cell.taf_access else "--no-taf-access",
                "--no-ingest",  # obs are pre-banked once per station by the ingest pass below
                "--issue-time", f"{issue:%Y-%m-%dT%H%M}Z"]
-        return cmd + _md_flag() + (["--db", args.db] if args.db else [])
+        return cmd + (["--db", args.db] if args.db else [])
 
     if args.dry_run:
         for st in stns:
@@ -165,7 +159,7 @@ def main() -> int:
 
     # Phase 2 -- run the matrix cells (--no-ingest) for the successfully-ingested stations.
     # (Model-data is NOT prefetched here -- archive_model_data.py keeps the archive fresh on the
-    # run cadence; --model-data cells copy from it. If it is stale/empty the get_model_* tools
+    # run cadence and every cell copies from it. If it is stale/empty the get_model_* tools
     # just return "not pre-fetched" feedback, which is non-fatal.)
     jobs = [(f"{st.icao} {cell.label} ({cell.model.split('/')[-1]})", _cell_cmd(st, cell))
             for st in ready for cell in MATRIX]

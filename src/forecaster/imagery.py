@@ -35,6 +35,7 @@ precise local view.
 """
 
 import json
+import re
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -134,7 +135,11 @@ class SatRegion:
 SAT_REGIONS: dict[str, SatRegion] = {
     r.name: r for r in [
         SatRegion("conus_east", GOES_EAST, "CONUS", "1250x750", "CONUS (GOES-East)"),
-        SatRegion("conus_west", GOES_WEST, "CONUS", "1250x750", "CONUS (GOES-West)"),
+        # NB GOES-West's "CONUS" product is PACUS -- it is centered on the eastern Pacific
+        # and Hawaii and does NOT show the central or eastern US. Labeled for what it
+        # actually is, because "CONUS (GOES-West)" read as a drop-in for conus_east and
+        # sent two roster stations an image they were not in (see satellite_region_for_latlon).
+        SatRegion("conus_west", GOES_WEST, "CONUS", "1250x750", "Pacific/West (GOES-West PACUS)"),
         SatRegion("full_disk_east", GOES_EAST, "FD", "1808x1808", "Full disk (GOES-East)"),
         SatRegion("full_disk_west", GOES_WEST, "FD", "1808x1808", "Full disk (GOES-West)"),
         SatRegion("alaska", GOES_WEST, "SECTOR/ak", "1000x1000", "Alaska",
@@ -161,8 +166,13 @@ SAT_REGIONS: dict[str, SatRegion] = {
                   "Upper Mississippi Valley", (-98.0, 41.0, -86.0, 49.0)),
         SatRegion("great_lakes", GOES_EAST, "SECTOR/cgl", "1200x1200", "Central Great Lakes",
                   (-92.0, 38.0, -80.0, 46.0)),
+        # East edge widened -104 -> -99 (2026-07-28): the real nr sector reaches the upper
+        # Mississippi (Iowa is visible at its right edge), but the old bbox stopped at the
+        # Montana line, leaving the DAKOTAS in a gap between this and upper_mississippi.
+        # KMIB and KRCA fell in that gap and dropped to the CONUS fallback. Sectors overlap
+        # generously by design -- the nearest-center rule below arbitrates.
         SatRegion("northern_rockies", GOES_EAST, "SECTOR/nr", "1200x1200", "Northern Rockies",
-                  (-117.0, 42.0, -104.0, 49.5)),
+                  (-117.0, 42.0, -99.0, 49.5)),
         # Himawari-9: full_disk is the wide SLIDER geocolor view (clean single tile). japan is
         # the TIGHT local view via OSPO (clean rectangular enhanced-IR GIF, coastlines + scale +
         # timestamp) -- SLIDER's japan tile is padded/irregular, so OSPO serves the tight one.
@@ -257,7 +267,12 @@ def satellite_region_for_latlon(lat: float, lon: float) -> str | None:
             return _haversine_km(lat, lon, (s + n) / 2, (w + e) / 2)
         return min(hits, key=_center_km).name
     if _in_bbox(_CONUS_BBOX, lat, lon):
-        return "conus_west" if lon < _EAST_WEST_LON else "conus_east"
+        # ALWAYS GOES-East here: its CONUS product covers the whole continental US, while
+        # GOES-West's "CONUS" is PACUS (eastern Pacific + Hawaii) and would return an image
+        # the station is not in. Splitting this fallback by longitude was the second half of
+        # the KMIB/KRCA defect; the bird split below is still right for FULL DISKS, which
+        # genuinely differ by hemisphere.
+        return "conus_east"
     if _GOES_LON[0] <= lon <= _GOES_LON[1] and _GOES_LAT[0] <= lat <= _GOES_LAT[1]:
         return "full_disk_west" if lon < _EAST_WEST_LON else "full_disk_east"
     return None
@@ -436,101 +451,200 @@ def fetch_meteosat_point(lat: float, lon: float, product: str,
 
 # --- Satellite LOOPS: N time-stamped frames for a filmstrip / short video -------------
 # A VLM can't watch motion, so a "loop" is a filmstrip (one image, universal) or a short
-# mp4 (video-capable models). This module fetches the FRAMES, STATION-CENTERED and zoomed
-# via a bbox+TIME WMS so the field fills the frame (not a whole hemisphere): NASA GIBS for
-# GOES (geocolor) and Himawari (clean-IR -- GIBS has no Himawari geocolor), EUMETSAT for
-# Meteosat (MTG geocolor). All carry a coastline/border overlay. charts.py composes them.
+# mp4 (video-capable models). This module fetches the FRAMES; charts.py composes them.
+#
+# REBUILT 2026-07-28: off NASA GIBS, onto each provider's OWN timestamped archive. GIBS had
+# two defects that together made a loop unfreezable. It could only be probed BACKWARDS from
+# now (fetch a tiny tile, check it isn't blank, step back), so no loop could be built for a
+# past instant -- and an archive that can only capture "now" cannot be replayed. And its NRT
+# geocolor is too intermittent to loop, so every product silently collapsed to clean-IR: the
+# tool offered four products and served one, which is misinformation, not a limitation.
+# Both providers used here PUBLISH the times they hold, so frames are now SELECTED from a
+# real index rather than probed for, every canonical product is honoured, and `at` can name
+# any instant still inside the provider's window.
+#
+# The trade: STAR serves the CDN's fixed scopes, so a GOES loop is SECTOR-wide (CONUS or
+# full disk where no sector covers the point) rather than cropped to the station. Wider than
+# the old GIBS crop, and the price of having an archive at all. Meteosat stays station-
+# centered -- its WMS takes an arbitrary bbox AND a TIME, so it was already freezable.
 LOOP_DEFAULT_FRAMES = 6
 LOOP_MAX_FRAMES = 10
 LOOP_DEFAULT_STEP_MIN = 30
 
-# NASA GIBS WMS: colorized geostationary layers with a TIME dimension over an arbitrary bbox.
-_GIBS_WMS = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
-_GIBS_REF = "Reference_Features_15m"    # coastlines + political borders overlaid on the RGB
-_GIBS_PAD_DEG = 4.0                     # half-width of a station-centered loop (~900 km across)
-_GIBS_LAG_MIN = 40                      # near-real-time lag: newest frame is ~this many min old
-_GIBS_BLANK_BYTES = 3000                # a GetMap smaller than this is an empty (no-data) frame
+# What each provider actually holds, for callers deciding when a loop must be captured:
+# STAR keeps ~10 days at a 5-minute cadence; SLIDER's index is its last 100 scans (~17h at
+# Himawari's 10-minute cadence). Past those windows a loop is not recoverable at all, so an
+# archiver has to capture it during the round, not reconstruct it afterwards.
+STAR_HISTORY_H = 240
+SLIDER_HISTORY_H = 17
+
+# Per-frame pixel target: take the smallest offered size that reaches it. charts.filmstrip
+# renders each tile at ~341 px (3.1 in at 110 dpi), so 600 px is already oversampled and a
+# sector's 2400x2400 would cost ~16x the bytes for detail no tile can show.
+_LOOP_TARGET_PX = 500
+# How far from a requested time we will accept a real frame. Half a default step, so a step
+# finer than the provider's cadence yields fewer honestly-spaced frames, never repeats.
+_LOOP_SNAP_TOL_MIN = 15
+
+# STAR filenames: <YYYYDDDHHMM>_GOES19-ABI-<scope>-<PRODUCT>-<W>x<H>.jpg (day-of-year stamp).
+_STAR_FRAME_RE = re.compile(r'href="((\d{11})_GOES\d+-ABI-[^"]*?-(\d+x\d+)\.jpg)"')
 
 
-def _gibs_layer(coverage: str, product: str) -> str:
-    """GIBS layer for a coverage family + canonical product. LOOPS default to clean-IR: it
-    is produced every 10 min and is day/night stable, whereas GIBS geocolor NRT is
-    intermittent (frequent no-data frames, worst at night) -- unusable for a smooth loop.
-    Only an explicit `visible` request uses the daytime visible band."""
-    if coverage == "himawari":
-        return ("Himawari_AHI_Band3_Red_Visible_1km" if product == "visible"
-                else "Himawari_AHI_Band13_Clean_Infrared")
-    bird = "East" if coverage == "goes-east" else "West"
-    return f"GOES-{bird}_ABI_Band13_Clean_Infrared"
+@dataclass(frozen=True)
+class LoopFrame:
+    """One fetched loop frame, carrying what an ARCHIVE needs to key on rather than only
+    what a chart needs to draw.
+
+    `time` is the frame's REAL valid time (naive UTC) and `url` is the exact byte source, so
+    a stored frame is identified by what the provider actually returned -- not by what was
+    requested. That distinction is the whole point: `label` is a display string with no year
+    or month ('28 15:56Z'), fine on a filmstrip tile and useless as a storage key, and the
+    requested time is not the served time once `_select_times` snaps to a real scan. Frames
+    are shared across stations sitting in the same satellite sector, so `url` doubles as the
+    natural de-duplication key."""
+    time: datetime
+    label: str
+    url: str
+    data: bytes
 
 
-def _gibs_time_url(layer: str, lat: float, lon: float, t: datetime, *, size: int = 900) -> str:
-    w, s, e, n = lon - _GIBS_PAD_DEG, lat - _GIBS_PAD_DEG, lon + _GIBS_PAD_DEG, lat + _GIBS_PAD_DEG
-    # WMS 1.3.0 + EPSG:4326 uses lat,lon axis order -> BBOX = south,west,north,east.
-    return (f"{_GIBS_WMS}?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={layer},{_GIBS_REF}"
-            f"&CRS=EPSG:4326&BBOX={s},{w},{n},{e}&WIDTH={size}&HEIGHT={size}"
-            f"&FORMAT=image/png&TIME={t:%Y-%m-%dT%H:%M:00Z}")
-
-
-def _gibs_anchor_time(layer: str, lat: float, lon: float) -> datetime:
-    """Newest available 10-min GIBS frame (NRT lag varies ~30-50 min): probe back from now
-    with a tiny GetMap until one returns real (non-empty) pixels."""
-    now = _utcnow().replace(second=0, microsecond=0)
-    t = now - timedelta(minutes=now.minute % 10 + _GIBS_LAG_MIN)
-    for _ in range(6):
-        if len(_get(_gibs_time_url(layer, lat, lon, t, size=64))) > _GIBS_BLANK_BYTES:
-            return t
-        t -= timedelta(minutes=10)
-    return t
-
-
-def _gibs_loop_frames(layer: str, lat: float, lon: float, n: int, step_min: int
-                      ) -> list[tuple[str, bytes]]:
-    anchor = _gibs_anchor_time(layer, lat, lon)
-    out: list[tuple[str, bytes]] = []
-    for t in sorted(anchor - timedelta(minutes=step_min * k) for k in range(n)):
-        data = _get(_gibs_time_url(layer, lat, lon, t))
-        if len(data) > _GIBS_BLANK_BYTES:          # skip an empty frame rather than show black
-            out.append((f"{t:%d %H:%MZ}", data))
+def _star_frame_index(sat: str, scope: str, product: str) -> dict[datetime, dict[str, str]]:
+    """{valid time -> {size -> url}} from the CDN's directory index for one bird/scope/
+    product. The index IS the archive listing, so every frame named here is a frame that
+    exists -- the empty-NAM-directory failure mode cannot happen silently."""
+    base = f"{_STAR_CDN}/GOES{sat}/ABI/{scope}/{SAT_PRODUCTS[product]}/"
+    html = _get(base).decode("utf-8", "replace")
+    out: dict[datetime, dict[str, str]] = {}
+    for name, stamp, size in _STAR_FRAME_RE.findall(html):
+        out.setdefault(datetime.strptime(stamp, "%Y%j%H%M"), {})[size] = base + name
     return out
 
 
-def _eumetsat_loop_frames(lat: float, lon: float, product: str, n: int, step_min: int
-                          ) -> list[tuple[str, bytes]]:
-    # MTG posts every 10 min with a short latency; snap 'now' to the 10-min grid and back
-    # off two slots so the newest requested frame is reliably available on the WMS.
-    now = _utcnow().replace(second=0, microsecond=0)
-    base = now - timedelta(minutes=now.minute % 10 + 20)
-    targets = sorted(base - timedelta(minutes=step_min * k) for k in range(n))
-    out: list[tuple[str, bytes]] = []
-    for t in targets:
+def _pick_size(sizes: dict[str, str]) -> str:
+    """Smallest offered size whose long edge reaches _LOOP_TARGET_PX, else the largest."""
+    def long_edge(s: str) -> int:
+        return max(int(x) for x in s.split("x"))
+    ordered = sorted(sizes, key=long_edge)
+    return next((s for s in ordered if long_edge(s) >= _LOOP_TARGET_PX), ordered[-1])
+
+
+def _select_times(available: list[datetime], n: int, step_min: int,
+                  at: datetime | None) -> list[datetime]:
+    """Choose up to `n` frame times ending at/just before `at` (default: the newest frame
+    held), spaced `step_min` apart, each snapped to the nearest REAL frame within
+    _LOOP_SNAP_TOL_MIN. Returns ascending, de-duplicated: asking for a step finer than the
+    provider's cadence gives fewer frames, not the same frame repeated."""
+    times = sorted(t for t in available if at is None or t <= at)
+    if not times:
+        return []
+    anchor = times[-1]
+    picked: list[datetime] = []
+    for k in range(n):
+        target = anchor - timedelta(minutes=step_min * k)
+        best = min(times, key=lambda t: abs((t - target).total_seconds()))
+        if abs((best - target).total_seconds()) <= _LOOP_SNAP_TOL_MIN * 60 and best not in picked:
+            picked.append(best)
+    return sorted(picked)
+
+
+def _frame_get(url: str, *, referer: str | None = None) -> bytes | None:
+    """One loop frame, or None if it could not be fetched. Frames are INDEPENDENT: EUMETSAT's
+    WMS in particular returns an intermittent 500 on perfectly valid times (measured
+    2026-07-28 -- the same request succeeds on retry), and losing a whole station's loop to
+    one flaky frame is a bad trade when the remaining frames still show the motion. One
+    retry, then skip; the caller enforces the 2-frame floor below which there is no loop."""
+    for attempt in range(2):
+        try:
+            return _get(url, referer=referer)
+        except Exception:  # noqa: BLE001 -- any per-frame failure degrades to a skipped frame
+            if attempt:
+                return None
+    return None
+
+
+def _star_loop_frames(r: SatRegion, product: str, n: int, step_min: int,
+                      at: datetime | None) -> list[LoopFrame]:
+    idx = _star_frame_index(r.sat, r.scope, product)
+    out: list[LoopFrame] = []
+    for t in _select_times(list(idx), n, step_min, at):
+        url = idx[t][_pick_size(idx[t])]
+        if (data := _frame_get(url)) is not None:
+            out.append(LoopFrame(t, f"{t:%d %H:%MZ}", url, data))
+    return out
+
+
+def _slider_times(sector: str, prod: str) -> list[datetime]:
+    """The scan times SLIDER currently holds for a sector+product, oldest first."""
+    raw = _get(f"{_SLIDER_BASE}/data/json/{_SLIDER_SAT}/{sector}/{prod}/latest_times.json",
+               referer=_SLIDER_BASE)
+    return sorted(datetime.strptime(str(ts), "%Y%m%d%H%M%S")
+                  for ts in json.loads(raw)["timestamps_int"])
+
+
+def _slider_loop_frames(sector: str, product: str, n: int, step_min: int,
+                        at: datetime | None) -> list[LoopFrame]:
+    prod = _SLIDER_PRODUCTS.get(product, _SLIDER_PRODUCTS["geocolor"])
+    out: list[LoopFrame] = []
+    for t in _select_times(_slider_times(sector, prod), n, step_min, at):
+        url = _slider_tile_url(sector, prod, f"{t:%Y%m%d%H%M%S}")
+        if (data := _frame_get(url, referer=_SLIDER_BASE)) is not None:
+            out.append(LoopFrame(t, f"{t:%d %H:%MZ}", url, data))
+    return out
+
+
+def _eumetsat_loop_frames(lat: float, lon: float, product: str, n: int, step_min: int,
+                          at: datetime | None) -> list[LoopFrame]:
+    """MTG posts every 10 min with a short latency, and the WMS holds a rolling archive, so
+    `at` just moves the anchor. Without one, back off two slots from now so the newest
+    requested frame is reliably served."""
+    base = (at or _utcnow()).replace(second=0, microsecond=0)
+    base -= timedelta(minutes=base.minute % 10)
+    if at is None:
+        base -= timedelta(minutes=20)
+    out: list[LoopFrame] = []
+    for t in sorted(base - timedelta(minutes=step_min * k) for k in range(n)):
         url = meteosat_point_url(lat, lon, product) + f"&time={t:%Y-%m-%dT%H:%M:00.000Z}"
-        out.append((f"{t:%d %H:%MZ}", _get(url)))
+        if (data := _frame_get(url)) is not None:
+            out.append(LoopFrame(t, f"{t:%d %H:%MZ}", url, data))
     return out
 
 
 def satellite_loop(lat: float, lon: float, product: str, *, frames: int = LOOP_DEFAULT_FRAMES,
-                   step_min: int = LOOP_DEFAULT_STEP_MIN
-                   ) -> tuple[list[tuple[str, bytes]], str, str]:
-    """Fetch a short, STATION-CENTERED loop of time-stamped frames for a point. Returns
-    (frames oldest-first as (label, bytes), source_label, coverage_label). Provider by
-    coverage: EUMETSAT WMS TIME for Meteosat; NASA GIBS WMS TIME for GOES (geocolor) and
-    Himawari (clean-IR). Raises ValueError for a point with no geostationary coverage."""
+                   step_min: int = LOOP_DEFAULT_STEP_MIN, at: datetime | None = None
+                   ) -> tuple[list[LoopFrame], str, str]:
+    """Fetch a short loop of time-stamped frames for a point. Returns (frames oldest-first
+    as LoopFrame, source_label, coverage_label).
+
+    `at` anchors the loop at a past instant (naive UTC) instead of the newest frame held --
+    this is what makes a loop archivable and replayable. Provider by coverage: NESDIS/STAR
+    for GOES, RAMMB/CIRA SLIDER for Himawari, EUMETSAT WMS for Meteosat; every provider
+    honours the canonical `product`. Raises ValueError for a point with no geostationary
+    coverage.
+
+    Returns the FRAMES, deliberately: the filmstrip and mp4 are composed downstream by
+    charts.py, so an archiver stores these bytes and replay re-composes any (frames,
+    step_min) the model asks for. Freezing the composite instead would bake in one
+    parameter combination and one rendering."""
     frames = max(2, min(int(frames), LOOP_MAX_FRAMES))
     region = satellite_region_for_latlon(lat, lon)
     if region is None:
         raise ValueError("no geostationary satellite coverage for this point")
     r = SAT_REGIONS[region]
     if r.provider == "meteosat_eumetsat_wms":
-        fr = _eumetsat_loop_frames(lat, lon, product, frames, step_min)
-        return fr, _PROVIDER_SOURCE["meteosat_eumetsat_wms"], "Meteosat geocolor, station-centered"
-    mode = "visible" if product == "visible" else "clean-IR"
+        fr = _eumetsat_loop_frames(lat, lon, product, frames, step_min, at)
+        return (fr, _PROVIDER_SOURCE["meteosat_eumetsat_wms"],
+                f"Meteosat {product}, station-centered")
     if r.provider in ("himawari_slider", "himawari_ospo"):
-        fr = _gibs_loop_frames(_gibs_layer("himawari", product), lat, lon, frames, step_min)
-        return fr, "NASA GIBS (Himawari-9)", f"Himawari {mode}, station-centered"
-    coverage = "goes-east" if r.sat == GOES_EAST else "goes-west"
-    fr = _gibs_loop_frames(_gibs_layer(coverage, product), lat, lon, frames, step_min)
-    return fr, f"NASA GIBS ({coverage.upper()})", f"{coverage.upper()} {mode}, station-centered"
+        # OSPO serves one LATEST gif and keeps no archive, so Himawari loops always come
+        # from SLIDER. An OSPO region borrows SLIDER's matching sector rather than falling
+        # back to the whole disk, so a Japan station keeps its tight view.
+        sector = "japan" if r.provider == "himawari_ospo" else r.scope
+        fr = _slider_loop_frames(sector, product, frames, step_min, at)
+        return (fr, _PROVIDER_SOURCE["himawari_slider"],
+                f"Himawari {product}, {sector.replace('_', ' ')}")
+    fr = _star_loop_frames(r, product, frames, step_min, at)
+    bird = "GOES-East" if r.sat == GOES_EAST else "GOES-West"
+    return fr, f"NESDIS/STAR ({bird})", f"{r.label}, {product}"
 
 
 def fetch_radar(mode: str, *, center: tuple[float, float] | None = None,

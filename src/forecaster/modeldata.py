@@ -22,6 +22,7 @@ as_of = issue_time. The archive then needs no valid_time read-cutoff (see store.
 """
 
 import math
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from forecaster import awc, gribstream, neighbors, store
@@ -127,25 +128,87 @@ SHEAR_LEVELS = ("850 mb", "500 mb", "300 mb")
 VVEL_LEVELS = ("700 mb", "500 mb", "300 mb")
 
 
-def _hazard_vars(model: str) -> list[gribstream.Var]:
-    # NBM is surface-only; IFS names were verified 2026-07-19 (scripts/probe_ifs.py) but IFS
-    # is intentionally disabled pending a per-model 3h/6h time grid + tcc fraction->percent
-    # handling (see _IFS_ENABLED) -> no hazard bundle for either. Icing/turbulence stays a
-    # GFS+HRRR product, as designed.
+def _lvl_key(hpa: int) -> str:
+    """Alias suffix for a pressure level. Kept as the plain integer so the pre-existing
+    hazard aliases (t650, u850, w500...) are unchanged -- the profile bundle reuses the SAME
+    alias namespace, so one set of archived rows serves both readers. NB the old code sliced
+    `"850 mb"[:3]`, which would have collided 1000 mb onto '100'; this does not."""
+    return str(hpa)
+
+
+def _pl(model: str, hpa: int) -> str:
+    """Pressure-level string in the model's own dialect: GFS/HRRR take GRIB2 '<n> mb',
+    ECMWF IFS takes native 'pl <n>' (verified live 2026-07-28)."""
+    return f"pl {hpa}" if model == "ifsoper" else f"{hpa} mb"
+
+
+# --- vertical profile bundle (model soundings) -----------------------------------------
+# Replaces the BUFKIT forecast-sounding source (fcstsounding.py, removed 2026-07-28). BUFKIT
+# was free but gave a fixed North-America station list, no IFS/NBM/ensemble, a third-party
+# posting dependency, and a parser that silently corrupted 4 of its 5 models. GRIBStream
+# gives the exact station lat/lon, the same asOf leakage guard as everything else here, and
+# IFS -- the only model reaching our OCONUS sites with independent guidance.
+#
+# Levels PROBED LIVE 2026-07-28 (KWRI): GFS and HRRR both serve all 20 standard levels with
+# TMP/RH/UGRD/VGRD/HGT (HRRR also has DPT; GFS does not, so dewpoint is derived from RH for
+# both, keeping the two models directly comparable). IFS serves a 12-level SUBSET and is
+# boundary-layer sparse -- 1000 -> 925 -> 850 with no 950/900, which is exactly where TAF
+# ceilings and inversions live. Good aloft, weak where it matters most: say so in the receipt.
+PROFILE_LEVELS = (1000, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500,
+                  450, 400, 350, 300, 250, 200, 150, 100)
+_IFS_PROFILE_LEVELS = (1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100)
+# NBM has no pressure levels at all and never will, so it is surface-only by construction.
+PROFILE_MODELS = ("gfs", "hrrr", "ifsoper")
+
+
+def profile_levels(model: str) -> tuple[int, ...]:
+    """Pressure levels this model actually serves, highest pressure first (surface-first)."""
+    if model == "ifsoper":
+        return _IFS_PROFILE_LEVELS
+    return PROFILE_LEVELS if model in PROFILE_MODELS else ()
+
+
+def _profile_vars(model: str) -> list[gribstream.Var]:
+    """T / RH / u / v / height at every level this model serves. Five variables per level is
+    the whole cost driver: credits = valid_times * variables, so the level ladder and the
+    time step are the two levers, never the point count."""
+    levels = profile_levels(model)
+    if not levels:
+        return []
+    V = gribstream.Var
+    t, rh, u, v, hgt = (("t", "r", "u", "v", "gh") if model == "ifsoper"
+                        else ("TMP", "RH", "UGRD", "VGRD", "HGT"))
+    vs: list[gribstream.Var] = []
+    for hpa in levels:
+        lv, k = _pl(model, hpa), _lvl_key(hpa)
+        vs += [V(t, lv, f"t{k}"), V(rh, lv, f"rh{k}"), V(u, lv, f"u{k}"),
+               V(v, lv, f"v{k}"), V(hgt, lv, f"hgt{k}")]
+    return vs
+
+
+def _hazard_vars(model: str, *, profiles: bool = True) -> list[gribstream.Var]:
+    """Icing/turbulence extras. NBM is surface-only; IFS carries no CAPE/CIN/HLCY/CLMR/VVEL,
+    so icing/turbulence stays a GFS+HRRR product (IFS still contributes a PROFILE, above).
+
+    When the profile bundle is on it already covers T/RH/u/v at every level, so this returns
+    only what the profile does NOT: cloud liquid, vertical velocity, and the convective
+    scalars. The aliases are identical either way, so `_fmt_hazard_scan` is unaffected."""
     if model in ("nbm", "ifsoper"):
         return []
     V = gribstream.Var
     vs: list[gribstream.Var] = []
     for lv in ICE_LEVELS:
-        p = lv[:3]
-        vs += [V("TMP", lv, f"t{p}"), V("RH", lv, f"rh{p}")]
+        p = _lvl_key(int(lv[:3]))
+        if not profiles:
+            vs += [V("TMP", lv, f"t{p}"), V("RH", lv, f"rh{p}")]
         if model == "gfs":
             vs.append(V("CLMR", lv, f"clw{p}"))
-    for lv in SHEAR_LEVELS:
-        p = lv[:3]
-        vs += [V("UGRD", lv, f"u{p}"), V("VGRD", lv, f"v{p}")]
+    if not profiles:
+        for lv in SHEAR_LEVELS:
+            p = _lvl_key(int(lv[:3]))
+            vs += [V("UGRD", lv, f"u{p}"), V("VGRD", lv, f"v{p}")]
     for lv in VVEL_LEVELS:
-        vs.append(V("VVEL", lv, f"w{lv[:3]}"))
+        vs.append(V("VVEL", lv, f"w{_lvl_key(int(lv[:3]))}"))
     if model == "gfs":
         vs += [V("CAPE", "surface", "cape"), V("CIN", "surface", "cin"),
                V("HLCY", "3000-0 m above ground", "hlcy")]
@@ -413,6 +476,26 @@ def _flatten(model: str, ts: gribstream.TimeSeries, *, as_of, fetched_at) -> lis
     return rows
 
 
+def _snapped_grid(anchor: datetime, hours: int, step_h: int) -> list[datetime]:
+    """Valid-time grid SNAPPED to a 00Z-anchored multiple of `step_h`, extended so it still
+    reaches anchor+hours.
+
+    Coarse-cadence models exist ONLY at 00Z-anchored multiples -- IFS at 00/03/06...Z, GEFS
+    likewise -- so a grid anchored on an odd issue hour (02Z -> 02/05/08...) matches nothing.
+    The request then returns zero rows, zero credits and NO ERROR: a silently empty archive
+    that looks like a successful pull. That failure has now happened twice, once for the IFS
+    level bundle and once for GEFS in the consensus experiment, which is why both callers go
+    through this one helper instead of each snapping its own grid.
+
+    The extension matters as much as the snap: without rounding the span UP to a whole step,
+    `_time_grid`'s floor division drops the partial step and the grid ends short of the
+    horizon that was asked for."""
+    a = anchor.replace(minute=0, second=0, microsecond=0)
+    snapped = a.replace(hour=(a.hour // step_h) * step_h)
+    span = math.ceil((hours + (a.hour - snapped.hour)) / step_h) * step_h
+    return _time_grid(snapped, span, step_h)
+
+
 def _chunk(coords: list, size: int = 500):
     """Split a coordinate list into <=size batches (the free-coordinate ceiling per request)."""
     for i in range(0, len(coords), size):
@@ -433,34 +516,56 @@ def _fetch_and_insert(
     as_of: datetime, anchor: datetime, models: tuple[str, ...],
     hours: int, step_h: int, hazards: bool, hazard_step_h: int, back_hours: int,
     db_path: str | None, use_cache: bool, extra_rows: list[dict] | None = None,
+    profiles: bool = True,
 ) -> tuple[int, int, int, list]:
-    """Fetch surface (+ hazard) for the given coordinate unions across `models`, chunked to
-    <=500 coords/request, and insert under one write_lock (with any `extra_rows`, e.g. the
-    steering-probe columns). Returns (charged, flattened, inserted, notes)."""
+    """Fetch surface + pressure-level data for the given coordinate unions across `models`,
+    chunked to <=500 coords/request, and insert under one write_lock (with any `extra_rows`,
+    e.g. the steering-probe columns). Returns (charged, flattened, inserted, notes).
+
+    The pressure-level request is ONE MERGED BUNDLE: the sounding ladder (T/RH/u/v/height at
+    every level the model serves) plus the hazard extras the ladder does not cover (cloud
+    liquid, omega, CAPE/CIN/helicity). Merging matters because credits are
+    valid_times x variables x ceil(coords/500) -- two requests over the same coordinates and
+    the same time grid would bill the shared T/RH/u/v twice. Both readers use the same
+    aliases, so one set of rows serves the skew-T and the icing/turbulence scan alike."""
     sfc_times = _time_grid(anchor, hours, step_h, back_h=back_hours)
-    haz_times = _time_grid(anchor, hours, hazard_step_h)
+    # The pressure-level grid must sit on IFS's 00/03/06...Z cadence or it silently archives
+    # nothing; GFS/HRRR are hourly at these ranges, so snapping costs them nothing.
+    haz_times = _snapped_grid(anchor, hours, hazard_step_h)
     fetched_at = _utcnow()
     charged = 0
     to_insert: list[dict] = list(extra_rows or [])
     notes: list[str] = []
     for model in models:
+        # Per-model as_of: hourly models are pinned to the synoptic cycle so the archived
+        # cycle names a run. One as_of for every model was the old behaviour and it let
+        # HRRR/NBM drift to whatever hourly run the cron happened to catch.
+        run, model_as_of = archive_run_and_as_of(model, as_of)
+        if run is not None:
+            notes.append(f"{model} pinned to the {run:%Y-%m-%dT%HZ} synoptic run "
+                         "(hourly model archived on the 6-hourly cycle)")
         for chunk in _chunk(surface_coords):
             try:
                 ts = gribstream.fetch_points(model, chunk, _surface_vars(model),
-                                             times=sfc_times, as_of=as_of, use_cache=use_cache)
+                                             times=sfc_times, as_of=model_as_of,
+                                             use_cache=use_cache)
                 charged += ts.charged
-                to_insert += _flatten(model, ts, as_of=as_of, fetched_at=fetched_at)
+                to_insert += _flatten(model, ts, as_of=model_as_of, fetched_at=fetched_at)
             except ValueError as e:
                 notes.append(f"{model} surface: {e}")
-        if hazards and _hazard_vars(model) and hazard_coords_all:
+        level_vars = (_profile_vars(model) if profiles else [])
+        if hazards:
+            level_vars += _hazard_vars(model, profiles=profiles)
+        if level_vars and hazard_coords_all:
             for chunk in _chunk(hazard_coords_all):
                 try:
-                    ts = gribstream.fetch_points(model, chunk, _hazard_vars(model),
-                                                 times=haz_times, as_of=as_of, use_cache=use_cache)
+                    ts = gribstream.fetch_points(model, chunk, level_vars,
+                                                 times=haz_times, as_of=model_as_of,
+                                                 use_cache=use_cache)
                     charged += ts.charged
-                    to_insert += _flatten(model, ts, as_of=as_of, fetched_at=fetched_at)
+                    to_insert += _flatten(model, ts, as_of=model_as_of, fetched_at=fetched_at)
                 except ValueError as e:
-                    notes.append(f"{model} hazard: {e}")
+                    notes.append(f"{model} levels: {e}")
 
     with store.write_lock(db_path):
         con = store.connect(db_path or settings.db_path)
@@ -470,6 +575,121 @@ def _fetch_and_insert(
         finally:
             con.close()
     return charged, len(to_insert), inserted, notes
+
+
+# --- reading a vertical profile back out of the archive --------------------------------
+# The read half of the sounding replacement: archived pressure-level rows -> the typed
+# profile `charts.skewt` draws. Pure computation over store rows; no network, no matplotlib.
+
+@dataclass
+class FcstProfile:
+    """A model forecast sounding for one valid time, surface-first, levels with missing data
+    dropped. Plain lists/floats -- no units, no matplotlib (charts.py owns plotting). Field
+    names are the ones charts.skewt reads; they outlived the BUFKIT source they were named
+    for (drct/sknt/hght are GEMPAK spellings)."""
+    station: str
+    model: str
+    run: datetime                 # cycle, naive UTC
+    fhr: int
+    valid: str                    # display stamp, e.g. '260728/1800'
+    lat: float
+    lon: float
+    elev_m: float
+    pres: list[float]             # hPa
+    tmpc: list[float]             # C
+    dwpc: list[float]             # C
+    drct: list[float]             # deg
+    sknt: list[float]             # kt
+    hght: list[float]             # m
+    indices: dict                 # CAPE/CINS/... where the model supplies them
+    url: str
+
+
+def _dewpoint_c(t_c: float, rh_pct: float) -> float:
+    """Dewpoint from temperature + relative humidity, Magnus-Tetens. Done here rather than
+    with MetPy because charts.py is the only module allowed to import MetPy, and doing it in
+    one place keeps GFS (no DPT field) and HRRR (has one) directly comparable."""
+    rh = min(max(rh_pct, 0.1), 100.0)
+    a, b = 17.625, 243.04
+    g = math.log(rh / 100.0) + (a * t_c) / (b + t_c)
+    return (b * g) / (a - g)
+
+
+def _uv_to_dir_speed(u_ms: float, v_ms: float) -> tuple[float, float]:
+    """u/v in m/s -> (meteorological wind-FROM direction in degrees, speed in knots)."""
+    return (math.degrees(math.atan2(-u_ms, -v_ms)) % 360.0,
+            math.hypot(u_ms, v_ms) * 1.943844)
+
+
+_PROFILE_IDX = {"cape": "CAPE", "cin": "CINS", "hlcy": "HLCY"}
+
+
+def build_profile(con, station: str, model: str, valid_time: datetime, *,
+                  lat: float | None = None, lon: float | None = None) -> FcstProfile:
+    """Assemble one archived vertical profile into a FcstProfile.
+
+    Reads the pressure-level rows for `valid_time` at the station coordinate, keeps the
+    freshest run present, and converts to the plotting units (K->C, RH->dewpoint, u/v->
+    direction/speed). Raises ValueError -- which the tool layer turns into feedback, not a
+    crash -- when the model carries no profile or the archive has no rows for that hour."""
+    if model not in PROFILE_MODELS:
+        raise ValueError(
+            f"{model} carries no vertical profile (pressure levels exist for "
+            f"{', '.join(PROFILE_MODELS)}; NBM is surface-only by construction)")
+    if lat is None or lon is None:
+        lat, lon, _ = site_coord(station)
+    levels = profile_levels(model)
+    wanted = [f"{p}{_lvl_key(hpa)}" for hpa in levels for p in ("t", "rh", "u", "v", "hgt")]
+    wanted += list(_PROFILE_IDX)
+    rows = store.model_data_series(con, model, lat, lon, start=valid_time, end=valid_time,
+                                   variables=wanted)
+    if not rows:
+        raise ValueError(
+            f"no archived {model.upper()} profile for {station.upper()} at "
+            f"{valid_time:%Y-%m-%dT%H}Z (the prefetch may not cover this hour)")
+    run = max(r["run"] for r in rows)
+    vals = {r["variable"]: r["value"] for r in rows if r["run"] == run and r["value"] is not None}
+
+    pres, tmpc, dwpc, drct, sknt, hght = [], [], [], [], [], []
+    for hpa in levels:                       # PROFILE_LEVELS is already surface-first
+        k = _lvl_key(hpa)
+        t, rh, u, v, z = (vals.get(f"t{k}"), vals.get(f"rh{k}"),
+                          vals.get(f"u{k}"), vals.get(f"v{k}"), vals.get(f"hgt{k}"))
+        if None in (t, rh, u, v, z):         # a partial level would distort the plot
+            continue
+        t_c = t - 273.15 if t > 100.0 else t            # archived K for GFS/HRRR and IFS alike
+        d, s = _uv_to_dir_speed(u, v)
+        pres.append(float(hpa))
+        tmpc.append(t_c)
+        dwpc.append(min(_dewpoint_c(t_c, rh), t_c))     # Td can never exceed T
+        drct.append(d)
+        sknt.append(s)
+        hght.append(z)
+    if len(pres) < 3:
+        raise ValueError(
+            f"archived {model.upper()} profile for {station.upper()} at "
+            f"{valid_time:%Y-%m-%dT%H}Z has only {len(pres)} complete level(s)")
+    idx = {label: vals[a] for a, label in _PROFILE_IDX.items() if a in vals}
+    return FcstProfile(
+        station=station.upper(), model=model, run=run,
+        fhr=max(int((valid_time - run).total_seconds() // 3600), 0),
+        valid=f"{valid_time:%y%m%d/%H%M}", lat=lat, lon=lon,
+        elev_m=float("nan"), pres=pres, tmpc=tmpc, dwpc=dwpc, drct=drct,
+        sknt=sknt, hght=hght, indices=idx,
+        url=f"gribstream:{model}@{lat:.4f},{lon:.4f}",
+    )
+
+
+def profile_valid_times(con, station: str, model: str, *, lat=None, lon=None) -> list[datetime]:
+    """Valid times that actually have profile rows archived, for snapping a request and for
+    telling the model what it can ask for when it misses."""
+    if lat is None or lon is None:
+        lat, lon, _ = site_coord(station)
+    levels = profile_levels(model)
+    if not levels:
+        return []
+    probe = f"t{_lvl_key(levels[len(levels) // 2])}"     # a mid-level temperature
+    return store.model_data_valid_times(con, model, lat, lon, variables=[probe])
 
 
 # --- verification pulls -----------------------------------------------------------------
@@ -493,6 +713,40 @@ _MODEL_CYCLE_H = {"gfs": 6, "ifsoper": 6, "hrrr": 1, "nbm": 1}
 
 def _model_cycle_h(model: str) -> int:
     return _MODEL_CYCLE_H.get(model, 6)
+
+
+# --- archive cadence: every archived cycle must NAME a run ------------------------------
+# HRRR and NBM update hourly, but the archive job fires ~4x/day, so "the freshest run at fire
+# time" made the guidance behind a forecast an accident of cron timing -- two runs at the same
+# station could sit on different HRRR cycles with nothing recording why. Decision 2026-07-28:
+# archive them on the SAME 00/06/12/18Z synoptic cycles as GFS and IFS. Zero credit impact
+# (identical requests, identical time grid); it trades up to ~6h of freshness for a cycle that
+# is deterministic and therefore comparable across runs -- the property a replayable archive
+# needs and a live cron does not.
+_ARCHIVE_CYCLE_H = 6
+# Wait this long after a cycle before selecting it. HRRR/NBM post ~50 min out, so an hour is
+# enough, and it stops a call made ON a synoptic hour from pinning a run that is not up yet
+# (which would return nothing rather than falling back to the previous cycle).
+_ARCHIVE_POST_LAG_H = 1
+
+
+def archive_run_and_as_of(model: str, as_of: datetime) -> tuple[datetime | None, datetime]:
+    """Pin `model` to a deterministic synoptic run for archiving.
+
+    Returns (run, as_of_to_send). `run` is None for a model already on a 6-hourly cycle
+    (GFS, IFS) -- its freshest run IS a synoptic run, so it is left alone and nothing about
+    its cost or coverage changes. An hourly model (HRRR, NBM) is snapped BACK to the newest
+    00/06/12/18Z cycle that has had time to post, then pinned just before that cycle's
+    HOURLY successor so exactly it qualifies -- the same pin `prefetch_verification` uses,
+    and for the same reason: a 6h pin on an hourly model selects the wrong run.
+
+    The result is never later than the caller's `as_of`, so the leakage guard still holds."""
+    cycle = _model_cycle_h(model)
+    if cycle >= _ARCHIVE_CYCLE_H:
+        return None, as_of
+    t = (as_of - timedelta(hours=_ARCHIVE_POST_LAG_H)).replace(minute=0, second=0, microsecond=0)
+    run = t - timedelta(hours=t.hour % _ARCHIVE_CYCLE_H)
+    return run, min(run + timedelta(hours=cycle) - timedelta(minutes=1), as_of)
 
 
 def _ver_spacing_h(model: str) -> int:
@@ -592,9 +846,83 @@ def prefetch_verification(
 # --- GEFS ensemble product --------------------------------------------------------------
 GEFS_MODEL = "gefsatmos"
 GEFS_N_MEMBERS = 31                         # control + 30 perturbations
+GEFS_STEP_H = 3                             # native cadence; the grid is anchored at 00Z
 # A thinned default: members are billed linearly, and ~10 members recover most of the spread
 # for a probability read, so the roster-wide default is a subset. Override for a full pull.
 GEFS_DEFAULT_MEMBERS = tuple(range(0, GEFS_N_MEMBERS, 3))   # 0,3,6,...,30 -> 11 members
+GEFS_FULL_MEMBERS = tuple(range(GEFS_N_MEMBERS))            # the archive default (see below)
+
+
+def estimate_ensemble(stations: list[str], *, hours: int = 30, step_h: int = GEFS_STEP_H,
+                      members: tuple[int, ...] = GEFS_DEFAULT_MEMBERS) -> dict:
+    """Credits `prefetch_ensemble_many` would charge. No network.
+
+    Note what is NOT in this formula: the station count. The ensemble pulls ONE point per
+    station and points are free below 500, so the bill is identical for 1 station or 400 --
+    the whole reason the batched form exists."""
+    times = _snapped_grid(_utcnow(), hours, max(int(step_h), GEFS_STEP_H))
+    chunks = max(1, math.ceil(len(stations) / 500))
+    return {"credits": len(times) * len(_gefs_vars()) * len(members) * chunks,
+            "valid_times": len(times), "vars": len(_gefs_vars()), "members": len(members),
+            "chunks": chunks}
+
+
+def prefetch_ensemble_many(
+    stations: list[str],
+    *,
+    as_of: datetime | None = None,
+    hours: int = 30,
+    step_h: int = GEFS_STEP_H,
+    members: tuple[int, ...] = GEFS_DEFAULT_MEMBERS,
+    db_path: str | None = None,
+    use_cache: bool = True,
+) -> dict:
+    """Archive the GEFS ensemble for SEVERAL stations in ONE bundle.
+
+    The batching asymmetry here is sharper than for the deterministic tier. Members bill
+    LINEARLY (credits = valid_times x variables x members) but coordinates are free below
+    500, and the ensemble pulls a SINGLE point per station -- probabilities are for the
+    aerodrome, not its neighbourhood. So N separate `prefetch_ensemble` calls cost N times
+    the bundle for data one request would have returned. Whole network, one request, one bill.
+
+    `as_of` pins the run cutoff (leakage-safe like the deterministic prefetch). The valid-time
+    grid is snapped to GEFS's own 00Z-anchored 3-hourly cadence -- see `_snapped_grid`; an
+    unsnapped grid returns nothing at all and says so nowhere."""
+    as_of = (as_of or _utcnow()).replace(minute=0, second=0, microsecond=0)
+    coords = _dedupe([[site_coord(s)] for s in stations])
+    times = _snapped_grid(as_of, hours, max(int(step_h), GEFS_STEP_H))
+    fetched_at = _utcnow()
+    charged, to_insert, notes = 0, [], []
+    for chunk in _chunk(coords):
+        try:
+            ts = gribstream.fetch_points(GEFS_MODEL, chunk, _gefs_vars(), times=times,
+                                         as_of=as_of, members=list(members),
+                                         use_cache=use_cache)
+            charged += ts.charged
+            to_insert += _flatten(GEFS_MODEL, ts, as_of=as_of, fetched_at=fetched_at)
+        except ValueError as e:
+            notes.append(f"{GEFS_MODEL}: {e}")
+    # An empty return is the failure mode this product actually has -- no exception, no
+    # credits, an archive that looks pulled. Say so rather than reporting a clean zero.
+    if not to_insert and not notes:
+        notes.append(f"{GEFS_MODEL} returned NO rows for {len(coords)} coord(s) over "
+                     f"{times[0]:%Y-%m-%dT%HZ}..{times[-1]:%Y-%m-%dT%HZ}: the run may not be "
+                     "posted at this as_of, or no member carried these fields. Nothing was "
+                     "archived -- do not treat this cycle as captured.")
+
+    with store.write_lock(db_path):
+        con = store.connect(db_path or settings.db_path)
+        try:
+            store.init_model_data_schema(con)
+            inserted = store.insert_model_data(con, to_insert)
+        finally:
+            con.close()
+    return {"stations": [s.upper() for s in stations], "model": GEFS_MODEL,
+            "members": list(members), "as_of": as_of, "coords": len(coords),
+            "valid_times": len(times),
+            "window": f"{times[0]:%Y-%m-%dT%HZ}..{times[-1]:%Y-%m-%dT%HZ}",
+            "credits_charged": charged, "rows": len(to_insert), "inserted": inserted,
+            "notes": notes}
 
 
 def prefetch_ensemble(
@@ -607,39 +935,18 @@ def prefetch_ensemble(
     db_path: str | None = None,
     use_cache: bool = True,
 ) -> dict:
-    """Archive the GEFS ensemble for one station so `get_ensemble_prob` can turn the member
+    """Archive the GEFS ensemble for ONE station so `get_ensemble_prob` can turn the member
     spread into hourly probabilities. Distinct from `prefetch`: members are billed LINEARLY,
-    so this is deliberately NOT part of the default surface archive -- credits are
-    valid_times x variables x len(members) (coords pool to one bundle at a single site).
+    so this is deliberately NOT part of the default surface archive.
 
-    GEFS is 3-hourly; step_h below 3 just returns the native 3-hourly subset (off-grid times
-    are not billed). `members` defaults to a thinned subset -- pass range(31) for the full
-    ensemble. `as_of` pins the run cutoff (leakage-safe like the deterministic prefetch)."""
-    as_of = (as_of or _utcnow()).replace(minute=0, second=0, microsecond=0)
-    lat, lon, name = site_coord(station)
-    times = _time_grid(as_of, hours, step_h)
-    fetched_at = _utcnow()
-    charged, to_insert, notes = 0, [], []
-    try:
-        ts = gribstream.fetch_points(GEFS_MODEL, [(lat, lon, name)], _gefs_vars(),
-                                     times=times, as_of=as_of, members=list(members),
-                                     use_cache=use_cache)
-        charged += ts.charged
-        to_insert += _flatten(GEFS_MODEL, ts, as_of=as_of, fetched_at=fetched_at)
-    except ValueError as e:
-        notes.append(f"{GEFS_MODEL}: {e}")
-
-    with store.write_lock(db_path):
-        con = store.connect(db_path or settings.db_path)
-        try:
-            store.init_model_data_schema(con)
-            inserted = store.insert_model_data(con, to_insert)
-        finally:
-            con.close()
-    return {"station": station.upper(), "model": GEFS_MODEL, "members": list(members),
-            "window": f"{as_of:%Y-%m-%dT%HZ}..{as_of + timedelta(hours=hours):%Y-%m-%dT%HZ}",
-            "credits_charged": charged, "rows": len(to_insert), "inserted": inserted,
-            "notes": notes}
+    A thin wrapper over `prefetch_ensemble_many` rather than a parallel implementation --
+    this function previously built its own unsnapped valid-time grid and, at an odd issue
+    hour, matched none of GEFS's 00Z-anchored 3-hourly times: zero rows, zero credits, no
+    error. Sharing the batched path means that cannot be fixed in one place and left broken
+    in the other. `members` defaults to a thinned subset; pass GEFS_FULL_MEMBERS for all 31."""
+    r = prefetch_ensemble_many([station], as_of=as_of, hours=hours, step_h=step_h,
+                               members=members, db_path=db_path, use_cache=use_cache)
+    return {"station": station.upper(), **{k: v for k, v in r.items() if k != "stations"}}
 
 
 def prefetch(
@@ -655,19 +962,107 @@ def prefetch(
     flow_relative: bool | None = None,
     db_path: str | None = None,
     use_cache: bool = True,
+    profiles: bool = True,
 ) -> dict:
     """Pre-fetch ONE station's model neighborhood into the model_data archive for a cycle.
 
     `as_of` (default now) pins the run cutoff: only forecasts issued at/before it are pulled,
     so passing the TAF issue time makes the archive leakage-safe by construction. Surface
-    fields are pulled for the FULL coordinate set at a `step_h` grid; the pressure-level
-    hazard bundle (GFS/HRRR) at a coarser `hazard_step_h` grid. `flow_relative` (default from
+    fields are pulled for the FULL coordinate set at a `step_h` grid; the merged pressure-level
+    bundle (sounding ladder + hazard extras) at a coarser `hazard_step_h` grid. `profiles`
+    adds the sounding ladder that backs get_fcst_sounding. `flow_relative` (default from
     settings) densifies upstream via climo. HRRR is CONUS-only, so an OCONUS site simply
     yields no HRRR rows (caught, not fatal). A thin wrapper over prefetch_many."""
     r = prefetch_many([station], as_of=as_of, models=models, hours=hours, step_h=step_h,
                       hazards=hazards, hazard_step_h=hazard_step_h, back_hours=back_hours,
-                      flow_relative=flow_relative, db_path=db_path, use_cache=use_cache)
+                      flow_relative=flow_relative, db_path=db_path, use_cache=use_cache,
+                      profiles=profiles)
     return {"station": station.upper(), **{k: v for k, v in r.items() if k != "stations"}}
+
+
+def estimate_prefetch_many(
+    stations: list[str],
+    *,
+    as_of: datetime | None = None,
+    models: tuple[str, ...] = MODELS,
+    hours: int = 30,
+    step_h: int = 1,
+    hazards: bool = True,
+    hazard_step_h: int = 3,
+    back_hours: int = 6,
+    flow_relative: bool | None = None,
+    profiles: bool = True,
+) -> dict:
+    """What `prefetch_many` WOULD charge, with a per-model breakdown. No network, no DB.
+
+    Deliberately built from the SAME helpers the fetch uses -- `_time_grid`,
+    `_applicable_models`, `_surface_vars`/`_profile_vars`/`_hazard_vars`, `_chunk` -- rather
+    than reimplementing the cost model. The previous estimator was a simplified restatement
+    and under-reported by roughly 3x, in four separate ways, every one of which is the kind
+    of drift a parallel implementation invites:
+      - it omitted `_profile_vars` entirely (5 variables at EVERY pressure level), which
+        became the dominant cost when the sounding tier moved off BUFKIT onto GRIBStream;
+      - it used `hours // step_h + 1`, ignoring the pre-anchor tail `back_hours` adds;
+      - it called `_hazard_vars(model)` without `profiles=`, counting the T/RH the profile
+        bundle already pays for -- the merged-bundle saving, double-counted;
+      - it iterated `MODELS` directly, billing HRRR and NBM on an all-OCONUS batch that
+        `_applicable_models` drops.
+    Signature mirrors `prefetch_many` so the two cannot be called with different assumptions.
+
+    One irreducible approximation: the flow-relative grid's ROTATION needs a live steering
+    probe. Rotation does not change the point COUNT and points are free below 500, so the
+    figure is exact unless a chunk boundary is straddled -- flagged in `notes` when close."""
+    as_of = as_of or _utcnow()
+    anchor = as_of.replace(minute=0, second=0, microsecond=0)
+    if flow_relative is None:
+        flow_relative = settings.model_data_flow_relative
+    # Any bearing gives the right CARDINALITY; only the orientation would differ live.
+    flow_from = 0.0 if flow_relative else None
+
+    surface_coords = _dedupe([coords_for(s, flow_from=flow_from) for s in stations])
+    want_levels = hazards or profiles
+    hazard_coords_all = (_dedupe([hazard_coords(s, flow_from=flow_from) for s in stations])
+                         if want_levels else [])
+
+    # Same two grids _fetch_and_insert builds, including the 00Z-anchored level snap.
+    sfc_times = _time_grid(anchor, hours, step_h, back_h=back_hours)
+    haz_times = _snapped_grid(anchor, hours, hazard_step_h)
+
+    models_eff, dropped = _applicable_models(surface_coords, models)
+    n_sfc_chunks = len(list(_chunk(surface_coords)))
+    n_lvl_chunks = len(list(_chunk(hazard_coords_all))) if hazard_coords_all else 0
+
+    per_model, total = {}, 0
+    for model in models_eff:
+        sfc = len(sfc_times) * len(_surface_vars(model)) * n_sfc_chunks
+        level_vars = _profile_vars(model) if profiles else []
+        if hazards:
+            level_vars = level_vars + _hazard_vars(model, profiles=profiles)
+        lvl = (len(haz_times) * len(level_vars) * n_lvl_chunks
+               if (level_vars and hazard_coords_all) else 0)
+        per_model[model] = {"surface": sfc, "levels": lvl, "level_vars": len(level_vars)}
+        total += sfc + lvl
+    # The steering probe is one request per station: one valid time, the deep-layer u/v set.
+    probe = len(stations) * len(_steer_vars()) if flow_relative else 0
+
+    notes = []
+    if dropped:
+        notes.append(f"{', '.join(dropped)} skipped: no coordinate in CONUS")
+    for label, n in (("surface", len(surface_coords)), ("level", len(hazard_coords_all))):
+        if n and n % 500 > 450:
+            notes.append(f"{label} coords ({n}) are near a 500-point chunk boundary; a live "
+                         "flow-relative rotation could add a chunk and raise the true cost")
+    return {
+        "credits": total + probe,
+        "per_model": per_model,
+        "steering_probe": probe,
+        "models": list(models_eff),
+        "coords": len(surface_coords),
+        "hazard_coords": len(hazard_coords_all),
+        "surface_times": len(sfc_times),
+        "level_times": len(haz_times),
+        "notes": notes,
+    }
 
 
 def prefetch_many(
@@ -683,6 +1078,7 @@ def prefetch_many(
     flow_relative: bool | None = None,
     db_path: str | None = None,
     use_cache: bool = True,
+    profiles: bool = True,
 ) -> dict:
     """Pre-fetch SEVERAL stations that share one issue time (`as_of`) in as few requests as
     possible -- the batched roster-wide optimization. Because coordinates are free up to 500,
@@ -711,9 +1107,10 @@ def prefetch_many(
             if flow_from is not None:
                 oriented += 1
         surf_lists.append(coords_for(s, flow_from=flow_from))
-        haz_lists.append(hazard_coords(s, flow_from=flow_from) if hazards else [])
+        want_levels = hazards or profiles
+        haz_lists.append(hazard_coords(s, flow_from=flow_from) if want_levels else [])
     surface_coords = _dedupe(surf_lists)
-    hazard_coords_all = _dedupe(haz_lists) if hazards else []
+    hazard_coords_all = _dedupe(haz_lists) if (hazards or profiles) else []
 
     # Drop CONUS-only models for a wholly-OCONUS request (they return only billable all-null).
     models_eff, dropped_models = _applicable_models(surface_coords, models)
@@ -722,7 +1119,8 @@ def prefetch_many(
     charged, flattened, inserted, notes = _fetch_and_insert(
         surface_coords, hazard_coords_all, as_of=as_of, anchor=anchor, models=models_eff,
         hours=hours, step_h=step_h, hazards=hazards, hazard_step_h=hazard_step_h,
-        back_hours=back_hours, db_path=db_path, use_cache=use_cache, extra_rows=probe_rows)
+        back_hours=back_hours, db_path=db_path, use_cache=use_cache, extra_rows=probe_rows,
+        profiles=profiles)
     if dropped_models:
         notes.insert(0, f"{', '.join(dropped_models)} skipped: no coordinate in CONUS "
                         f"(GFS-only OCONUS; HRRR/NBM are CONUS-domain on GRIBStream)")
@@ -735,8 +1133,10 @@ def prefetch_many(
         "oriented_stations": oriented,
         "coords": len(surface_coords),
         "hazard_coords": len(hazard_coords_all),
+        "profiles": bool(profiles),
         "requests": len(models_eff) * (len(list(_chunk(surface_coords)))
-                                       + (len(list(_chunk(hazard_coords_all))) if hazards else 0))
+                                       + (len(list(_chunk(hazard_coords_all)))
+                                          if (hazards or profiles) else 0))
                     + (len(stations) if flow_relative else 0),   # + steering probes
         "rows_flattened": flattened,
         "rows_inserted": inserted,
