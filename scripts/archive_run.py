@@ -61,7 +61,14 @@ STATIC_UTC = datetime(1970, 1, 1)
 # GFS panels a forecaster actually reaches for on a 30-hour TAF. Deliberately NOT the full
 # 0..384 ladder: every fhr is a separate fetch on every domain, and nothing in a TAF turns on
 # day 7. Override with --fhrs.
-DEFAULT_FHRS = (0, 6, 12, 24, 36)
+#
+# f018 and f030 added 2026-07-29 (owner). Without them the ladder ran 12 -> 24 -> 36, leaving
+# TWELVE-HOUR HOLES either side of f024 -- and the f012-f024 gap is exactly the peak diurnal
+# convection window a 30-hour TAF turns on. Panels are free (Tropical Tidbits is not metered)
+# and dedup across every station sharing a domain, so the cost is ~10-15 MB a sweep before
+# dedup, against a hole no amount of point data fills: a chart shows the SHAPE of a trough that
+# a column of numbers at one point cannot.
+DEFAULT_FHRS = (0, 6, 12, 18, 24, 30, 36)
 
 # LOOP CADENCE -- capture the finest STEP, and let SPAN come from accumulation.
 #
@@ -97,6 +104,36 @@ DEFAULT_WORKERS = 6
 # timeout so the second attempt is not simply the first one again.
 RETRY_ATTEMPTS = 2
 RETRY_DELAY_S = 4.0
+
+# How long to WAIT for the index instead of dying on it. DuckDB takes an exclusive file lock,
+# so any other process holding it -- a replay serving from the archive, an inspection query,
+# a QC pass -- makes `connect_archive` raise. That happened for real on 2026-07-29 at the 23Z
+# cycle: a read-only reporting script held the index, the sweep's FIFTH station could not open
+# it, the exception escaped `archive_station`, and the whole run died having captured 4 of 71
+# stations. **67 stations lost an hour of imagery that cannot be re-fetched.**
+#
+# Waiting is the right answer because the collision is transient BY CONSTRUCTION now: the
+# sweep's own windows are milliseconds (see the three-phase split), so anything blocking us is
+# either another short window or a reader that will finish. 60 s is far longer than any
+# legitimate holder and still far short of the hourly cadence.
+LOCK_WAIT_S = 60.0
+LOCK_POLL_S = 1.0
+
+
+def connect_index(index_path: str, *, read_only: bool = False):
+    """`store.connect_archive`, but wait out a transient file lock rather than raise.
+
+    Only a LOCK error is retried. A corrupt file or a bad path still fails immediately -- those
+    do not clear by waiting, and pretending otherwise would turn a real fault into a 60 s stall
+    followed by the same error."""
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while True:
+        try:
+            return store.connect_archive(index_path, read_only=read_only)
+        except Exception as e:  # noqa: BLE001 -- classified by message, then re-raised
+            if "lock" not in str(e).lower() or time.monotonic() >= deadline:
+                raise
+            time.sleep(LOCK_POLL_S)
 
 # Held around every call into charts.py. Everything else a fetcher does is a download, which
 # threads fine; drawing does not, because pyplot's figure manager is process-global state.
@@ -352,7 +389,12 @@ def _radar_items(icao: str, lat: float, lon: float, cycle: datetime) -> list[Ite
     the tool serves them a station view, so the archive must hold one."""
     near = imagery.nearest_radar(lat, lon)
     region = imagery.radar_region_for_latlon(lat, lon)
-    local = bool(near and near[1] <= imagery.RADAR_STATION_GUARD_KM)
+    # Mirrors tools._radar_for_station INCLUDING the composite-coverage test: a real WSR-88D
+    # outside IEM's US mosaic (Kadena 0 km, Kunsan 3 km, Andersen 20 km) passes the distance
+    # guard but returns a picture with no reflectivity in it. Archiving those would freeze an
+    # empty raster that reads as "clear". See imagery.iem_composite_covers.
+    local = (bool(near and near[1] <= imagery.RADAR_STATION_GUARD_KM)
+             and imagery.iem_composite_covers(lat, lon))
     if not region and not local:
         return []                                  # out of network: the tool returns text only
     out: list[Item] = []
@@ -728,7 +770,7 @@ def archive_station(icao: str, cycle: datetime, *, index_path: str, root, refres
                 continue
             resolved += expanded
 
-    con = store.connect_archive(index_path)         # lock window 1: reads only
+    con = connect_index(index_path)         # lock window 1: reads only
     try:
         todo = select_all(con, resolved, res, refresh=refresh)
     finally:
@@ -736,7 +778,7 @@ def archive_station(icao: str, cycle: datetime, *, index_path: str, root, refres
 
     got = fetch_all(todo, workers=workers)          # no lock held: this is the slow part
 
-    con = store.connect_archive(index_path)         # lock window 2: writes only
+    con = connect_index(index_path)         # lock window 2: writes only
     try:
         for g in got:
             store_one(con, g, res, root=root)
@@ -819,7 +861,7 @@ def main() -> int:
     index_path = str(root / "index.duckdb")
     # Schema first, in its own short connection. Every later connection assumes the tables and
     # the fetched_utc migration are already there.
-    con = store.connect_archive(index_path)
+    con = connect_index(index_path)
     try:
         store.init_archive_schema(con)
     finally:
@@ -839,13 +881,13 @@ def main() -> int:
         # Before the stations, so a region a station also wants is fetched once here and
         # merely reused below rather than the other way round.
         extra = Result()
-        con = store.connect_archive(index_path)
+        con = connect_index(index_path)
         try:
             todo = select_all(con, all_region_items(cycle), extra, refresh=args.refresh)
         finally:
             con.close()
         got = fetch_all(todo, workers=args.workers)
-        con = store.connect_archive(index_path)
+        con = connect_index(index_path)
         try:
             for g in got:
                 store_one(con, g, extra, root=root)
@@ -861,8 +903,19 @@ def main() -> int:
               f"{len(extra.failed):2d} failed  {extra.bytes_new / 1e6:6.1f} MB new")
 
     for icao in icaos:
-        res = archive_station(icao, cycle, index_path=index_path, root=root,
-                              refresh=args.refresh, workers=args.workers, **plan_kw)
+        # ONE STATION MUST NEVER TAKE THE SWEEP DOWN. `archive_station` already turns a dead
+        # product or a failed plan into a recorded failure, but anything it did NOT anticipate
+        # -- an index lock it could not wait out, an unexpected provider type -- escaped here
+        # and aborted the run mid-roster. That is exactly what cost 67 of 71 stations at the
+        # 2026-07-29 23Z cycle. An hour of imagery cannot be re-fetched, so the remaining
+        # stations are worth far more than a clean stack trace.
+        try:
+            res = archive_station(icao, cycle, index_path=index_path, root=root,
+                                  refresh=args.refresh, workers=args.workers, **plan_kw)
+        except Exception as e:  # noqa: BLE001 -- log it loudly, keep sweeping
+            totals.failed.append(f"station {icao} ({type(e).__name__}: {e})")
+            print(f"{icao}: ABORTED ({type(e).__name__}: {e})")
+            continue
         totals.captured += res.captured
         totals.reused += res.reused
         totals.deduped += res.deduped
@@ -873,17 +926,24 @@ def main() -> int:
               f"{res.deduped:3d} deduped  {len(res.skipped):2d} skipped  "
               f"{len(res.failed):2d} failed  {res.bytes_new / 1e6:6.1f} MB new")
 
-    con = store.connect_archive(index_path)
+    # The closing summary is a NICETY. Every artifact is already on disk and indexed by here, so
+    # a lock collision reading the totals must not turn a successful sweep into a failed exit.
+    stats = None
     try:
-        stats = store.archive_stats(con)
-    finally:
-        con.close()
+        con = connect_index(index_path, read_only=True)
+        try:
+            stats = store.archive_stats(con)
+        finally:
+            con.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"(archive stats unavailable: {type(e).__name__}: {e})")
 
     print(f"\ncaptured {totals.captured}, reused {totals.reused}, deduped {totals.deduped}, "
           f"{totals.bytes_new / 1e6:.1f} MB new bytes")
-    print(f"archive now: {stats['blobs']} blobs, {stats['bytes'] / 1e9:.2f} GB, "
-          f"{stats['keys']} keys ({stats['dedup']}x dedup), "
-          f"{stats['manifest_rows']} manifest rows")
+    if stats:
+        print(f"archive now: {stats['blobs']} blobs, {stats['bytes'] / 1e9:.2f} GB, "
+              f"{stats['keys']} keys ({stats['dedup']}x dedup), "
+              f"{stats['manifest_rows']} manifest rows")
     for s in totals.skipped:
         print(f"  SKIP {s}")
     for f in totals.failed:

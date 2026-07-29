@@ -23,7 +23,7 @@ from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from forecaster import artifacts, awc, store  # noqa: E402
+from forecaster import artifacts, awc, imagery, store  # noqa: E402
 
 ar = None       # the script under test, loaded by path in __main__ (scripts/ is not a package)
 
@@ -38,6 +38,13 @@ POS = {
     "RJTY": (35.7486, 139.3486),     # Himawari via OSPO -- no geocolor
     "ETAR": (49.4367, 7.6003),       # Meteosat -- no water vapour
     "SAWC": (-45.7853, -67.4655),    # Patagonia -- no radar at all
+    # ON a real WSR-88D but OUTSIDE IEM's composite: the distance guard passes, the picture is
+    # empty. Kadena 0 km, Kunsan 3 km, Osan 26 km, Andersen 20 km, Humphreys 35 km.
+    "RKSO": (37.091, 127.03),
+    "PGUA": (13.583, 144.918),
+    "RODN": (26.356, 127.768),
+    "RKJK": (35.9, 126.618),
+    "RKSG": (36.962, 127.031),
 }
 
 
@@ -196,6 +203,24 @@ def test_planner() -> None:
           any("water_vapor" in i for i in etar["satellite"]), False)
     check("plan: Meteosat stills are station-centered, so they key per station",
           all(i.startswith("meteosat_point/ETAR/") for i in etar["satellite"]), True)
+
+    # A NEARBY RADAR IS NOT COVERAGE. Found by QC 2026-07-29: RKSO/PGUA/RODN/RKJK/RKSG all sit
+    # essentially ON a real WSR-88D (Kadena 0 km, Kunsan 3 km, Osan 26 km, Andersen 20 km,
+    # Humphreys 35 km), so the 150 km guard passed and they were archived a correctly-framed
+    # image with ZERO reflectivity -- captioned "NEXRAD Base Reflectivity" and therefore read as
+    # "no convection". RJTY was safe only because its nearest radar is 1,090 km away, i.e. by
+    # accident. Both the planner and tools._radar_for_station must apply the coverage test, or
+    # the archive drifts from what the agent is served.
+    check("imagery: the IEM composite covers CONUS/AK/HI/PR",
+          [imagery.iem_composite_covers(*ll)
+           for ll in ((40.0, -74.6), (61.2, -149.8), (21.5, -158.0), (18.4, -66.0))],
+          [True, True, True, True])
+    check("imagery: it does NOT cover Korea, Guam, Okinawa or Patagonia",
+          [imagery.iem_composite_covers(*ll)
+           for ll in ((37.1, 127.0), (13.6, 144.9), (26.4, 127.8), (-53.0, -70.8))],
+          [False, False, False, False])
+    check("plan: a station on an out-of-mosaic WSR-88D gets NO radar",
+          [_plan_kinds(i).get("radar", []) for i in ("RKSO", "PGUA")], [[], []])
 
     sawc = _plan_kinds("SAWC")
     check("plan: Patagonia gets no radar", sawc.get("radar", []), [])
@@ -434,6 +459,53 @@ def test_retry(root: Path, db: str) -> None:
 
 # --- 4c. the index lock is released around the fetches ----------------------------------
 
+def test_lock_is_waited_out(db: str) -> None:
+    """A held index must make the sweep WAIT, not die.
+
+    On 2026-07-29 at 23Z a read-only reporting script held index.duckdb, the sweep's fifth
+    station could not open it, the exception escaped `archive_station`, and the run aborted
+    having captured 4 of 71 stations -- 67 stations lost an hour of imagery that cannot be
+    re-fetched. Releasing the lock quickly (test_lock_released_during_fetch) is not enough on
+    its own: something else can still hold it while we need it."""
+    import multiprocessing as mp
+
+    con = store.connect_archive(db)
+    store.init_archive_schema(con)
+    con.close()
+
+    def _holder(q):
+        c = store.connect_archive(db)
+        q.put(1)
+        time.sleep(3)
+        c.close()
+
+    q = mp.Queue()
+    p = mp.Process(target=_holder, args=(q,))
+    p.start()
+    q.get()
+    time.sleep(0.3)
+    try:
+        store.connect_archive(db).close()
+        check("lock: a bare connect really is blocked (guard is meaningful)", True, False)
+    except Exception:  # noqa: BLE001
+        check("lock: a bare connect really is blocked (guard is meaningful)", True, True)
+    t0 = time.time()
+    got = ar.connect_index(db)
+    waited = time.time() - t0
+    got.close()
+    p.join()
+    check("lock: connect_index waits for the holder instead of raising", waited > 1.0,
+          True)
+    # A non-lock failure must NOT be retried -- waiting 60 s to report the same bad path is
+    # worse than failing at once.
+    t0 = time.time()
+    try:
+        ar.connect_index("/nonexistent-dir-xyz/i.duckdb")
+        check("lock: a non-lock error is not retried", "opened", "raised")
+    except Exception:  # noqa: BLE001
+        check("lock: a non-lock error is not retried", time.time() - t0 < 5.0, True)
+
+
 def test_lock_released_during_fetch(root: Path, db: str) -> None:
     """DuckDB takes an EXCLUSIVE file lock -- while it is held, nothing else can open the
     index, not even read_only=True (verified on the Pi, 2026-07-29). A connection wrapped
@@ -602,6 +674,7 @@ def main() -> int:
         test_capture(root, str(root / "capture.duckdb"))
         test_select_dedup(root, str(root / "dedup.duckdb"))
         test_retry(root, str(root / "retry.duckdb"))
+        test_lock_is_waited_out(str(root / "lockwait.duckdb"))
         test_lock_released_during_fetch(root, str(root / "lock.duckdb"))
         test_sounding_feeds()
         test_loop_cadence()

@@ -310,9 +310,28 @@ def fetch_profile(wmo: str, when: datetime, *, use_cache: bool = False,
         f = ln.split(",")
         if len(f) <= max(idx.values()):
             continue
-        try:
-            r = {k: float(f[i]) for k, i in idx.items()}
-        except ValueError:              # a blank/ragged trailing row -- skip, do not abort
+        # PER FIELD, not all-or-nothing. The old form built the whole dict in one
+        # comprehension inside a try, so ONE blank column discarded the entire level --
+        # and radiosonde humidity sensors stop reporting in the dry stratosphere, so the
+        # blank column is the DEWPOINT on most ascents. Measured on 47646 (2026-07-29 12Z):
+        # 120 rows reaching 6 hPa, 52 with a dewpoint (top 250 hPa) and 68 without
+        # (239 -> 6 hPa). We were throwing away good temperature, wind and height for 68 of
+        # 120 levels, so every observed sounding was truncated at the humidity ceiling and
+        # lost its tropopause and jet level.
+        #
+        # Missing becomes NaN rather than None: numpy and metpy take it natively, and
+        # matplotlib BREAKS a line at NaN instead of interpolating across the gap -- so the
+        # dewpoint trace now ends where the sonde stopped measuring humidity, which is what
+        # a real skew-T looks like, while temperature and wind carry on up.
+        r = {}
+        for k, i in idx.items():
+            try:
+                r[k] = float(f[i])
+            except ValueError:
+                r[k] = float("nan")
+        # A level with no PRESSURE has nowhere to go on the plot -- that one is still fatal
+        # to the row. Everything else is a gap, not a reason to drop the level.
+        if r["pres"] != r["pres"]:      # NaN
             continue
         if lat is None and len(f) > max(lat_i, lon_i):
             # Length-checked separately from the profile columns: latitude/longitude can sit

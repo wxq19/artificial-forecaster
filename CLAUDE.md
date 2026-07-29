@@ -307,22 +307,31 @@ For WHY a seam is shaped the way it is, and the bug each step surfaced, read
   dispatch), scripts/poll_tafs.py (human TAF archive), scripts/score_taf.py --pending,
   scripts/results_report.py (the ONLY correct way to derive a headline number).
 
-### Repository state -- READ THIS FIRST
-- **Everything since commit 8b7f107 is UNCOMMITTED** (20 modified + 4 untracked as of
-  2026-07-28), covering the model screen, the BUFKIT removal, the nowcast work, the whole
-  archive build and the imagery honesty pass. `pyproject.toml` and `uv.lock` joined the
-  modified set on 07-28d (the pillow declaration); no NEW untracked file has appeared since
-  07-28b, so every other edit landed in a file already on the list.
-- **AND FOUR COMMITS ARE UNPUSHED.** `origin/main` is at **50823b1**; local `main` is at
-  **8b7f107**. The Pi pulls from the REMOTE, so it can see none of this -- which is why it
-  still polls 63 stations instead of 71. Verified read-only 2026-07-28.
-- **`.env` has `llm_model` EMPTY** and points at OpenRouter, so any code path that
-  falls back to `settings.llm_model` returns a 400 ("No models provided"). Pass an
-  explicit `--model`.
-- **`MODEL_DATA_ENABLED` is still false**, so the GRIBStream tier bills nothing until
-  it is flipped. The Pi has its OWN `.env`. See PICK UP HERE item 0 for the detail --
-  do not restate it here, because a second copy drifts.
-- The Pi runs the poller and two scorers. No LLM billing since 2026-07-20.
+### Repository state -- READ THIS FIRST (rewritten 2026-07-29; the 07-28 version was stale
+### in four ways and is superseded -- do not restore it)
+- **EVERYTHING IS COMMITTED, PUSHED AND DEPLOYED.** `origin/main` = local `main` = the Pi =
+  **`a163170`** ("archiver fixes"). The long-running "20 modified + 4 untracked, 4 commits
+  unpushed" state is CLEARED. The Pi therefore polls **71** stations, not 63, and the SH 8 are
+  archiving TAFs (2,558 bulletins across 71 stations as of 18Z).
+- **THE PI IS AT `192.168.0.31`, not `.21`** -- DHCP moved it. `docs/pi_setup_log.md` still
+  says `.21` throughout and is wrong. A `.21` ssh gives "No route to host", which reads exactly
+  like the documented ICMP-blocking gotcha but is NOT it; scan for port 22 before concluding
+  the Pi is dead.
+- **`MODEL_DATA_ENABLED=true` ON THE PI** -- the GRIBStream tier IS billing, ~9,210 credits per
+  pull, 4 pulls/day. The 07-28 note saying it is still false described the LAPTOP's `.env` and
+  is superseded. There is no daily brake on either side of the wire (owner rejected a spend
+  table); watch the GRIBStream dashboard.
+- **FOUR CRONS RUN, AND THE TWO SCORERS ARE NOT AMONG THEM:** `poll_tafs.py` */5,
+  `archive_run.py` hourly at :02, `archive_model_data.py` at 05/11/17/23, `cloudsync.sh` 15 8.
+  The `score_taf.py --pending` and `--archive-difficulty` lines from the round-1 era are GONE
+  from the crontab. Round 1 is over so nothing is queuing up (evaluations: 414 scored, **1
+  pending**, stuck), but if round 2 needs live scoring those lines must be RESTORED, not
+  assumed present. Flagged 2026-07-29; not resolved.
+- **The LAPTOP's `.env` has `llm_model` EMPTY** and points at OpenRouter, so any code path
+  falling back to `settings.llm_model` returns a 400 ("No models provided"). Pass an explicit
+  `--model`. The Pi has its OWN `.env` and points at Together -- irrelevant there, since the Pi
+  is an ARCHIVER ONLY and runs no LLM calls (owner, 2026-07-29). No LLM billing since
+  2026-07-20.
 
 ## Where the rest of the record lives (read on demand, NOT by default)
 
@@ -355,16 +364,18 @@ Two things live in CODE, not in prose. Do not restate them here, because a copy 
 ## NEXT SESSION -- pick up here (paused 2026-07-29)
 
 ### SESSION 2026-07-29 -- FIRST LIVE ARCHIVER DAY INSPECTED; SWEEP OVERRUN TRACED AND FIXED
-UNCOMMITTED: **7 modified + 2 new.** Modified `.gitignore`, CLAUDE.md,
-`scripts/archive_run.py`, `scripts/test_archive_run.py`, `src/forecaster/awc.py`,
-`src/forecaster/imagery.py`, `src/forecaster/store.py`. NEW `scripts/build_station_sites.py`
-and the generated `src/forecaster/station_sites.py` (348 ids -- COMMIT IT, it is a frozen table
-like neighbors.py, not build output).
-ruff clean across `scripts/` and `src/forecaster/`. test_archive_run **79/79** (was 43), plus
-test_tool_stamps 5/5, test_tool_fallbacks 5/5, test_geo 29/29, test_worksheet 19/19,
-test_runlog 25/25, test_modeldata 124/124, test_tafstate 40/40, test_results_report 49/49,
-test_score_pending 29/29. Nothing reached the Pi -- it still runs `637c09e`, so every fix
-below is INERT until the owner commits, pushes and pulls.
+**COMMITTED, PUSHED AND DEPLOYED.** Owner pushed as `a163170` ("archiver fixes"); the Pi
+pulled it 2026-07-29 17:47Z (owner asked me to -- the standing no-git rule is unchanged, that
+was a one-off authorization). 9 files, +1476/-85, incl. NEW `scripts/build_station_sites.py`
+and the generated `src/forecaster/station_sites.py` (348 ids -- IT IS COMMITTED ON PURPOSE, a
+frozen table like neighbors.py, not build output).
+Verified ON THE PI after the pull: imports OK, **test_archive_run 79/79**, 348-id table loaded,
+`station_latlon` served without network, and `build_station_sites.py --check` PASSED *from the
+Pi* -- an independent rebuild against live AWC that reproduced the laptop's file byte for byte.
+On the laptop: ruff clean across `scripts/` and `src/forecaster/`, plus test_tool_stamps 5/5,
+test_tool_fallbacks 5/5, test_geo 29/29, test_worksheet 19/19, test_runlog 25/25,
+test_modeldata 124/124, test_tafstate 40/40, test_results_report 49/49, test_score_pending
+29/29.
 
 **THE PI MOVED: it is `192.168.0.31` now, not `.21`.** DHCP reassigned it; hostname is still
 `wx-collector`. `docs/pi_setup_log.md` names the old address throughout and is now wrong.
@@ -474,6 +485,140 @@ term -- 56 distinct x ~10 s, strictly serial, because `archive_station` resolved
 plain loop before the fetch pool. They now go through a `ThreadPoolExecutor` of the same size.
 `pool.map` preserves order, so the log and the manifest read exactly as they did serially.
 
+### INCIDENT 2026-07-29 23Z -- I DESTROYED 67 STATIONS OF IMAGERY, AND IT EXPOSED A PHASE-3.2
+### PREREQUISITE. Read this before running ANYTHING against the live archive.
+WHAT HAPPENED. The 23:02Z sweep started; at 23:04Z I ran a read-only QC/reporting script that
+held `index.duckdb` for its whole run (minutes -- it renders filmstrips and writes images with
+the connection open). The sweep's FIFTH station could not open the index, the `IOException`
+escaped `archive_station`, and `main()` died mid-roster: **4 of 71 stations captured, 234
+manifest rows against 3,818 the hour before.** Satellite and radar cannot be re-fetched for a
+past instant, so that hour is gone for 67 stations.
+
+TWO FIXES, both landed:
+- **`connect_index()` WAITS for the index** (60 s, polling 1 s) instead of raising. Legitimate
+  for exactly one reason: the sweep's own windows are milliseconds since the three-phase split,
+  so anything holding the lock is transient by construction. A NON-lock error still fails
+  immediately -- waiting 60 s to report a bad path would be worse than failing at once. All six
+  index connects in `archive_run.py` route through it. Pinned by `test_lock_is_waited_out`,
+  which asserts a bare connect really IS blocked first, so the guard cannot pass vacuously.
+- **One station can no longer take the sweep down.** `archive_station` is now wrapped per
+  station in `main()`: an unanticipated failure records `station <ICAO> (...)` and the sweep
+  CONTINUES. `archive_station` already handled dead products and failed plans; this catches what
+  it did not anticipate. An hour of imagery is worth far more than a clean stack trace.
+- Also made the two CLOSING SUMMARIES non-fatal (`archive_run`'s `archive_stats`,
+  `archive_model_data`'s location count). The 23Z model pull **billed 11,299 credits and
+  inserted 3,536,156 rows successfully, then tracebacked on a read-only summary connect**
+  because the 5-minutely TAF poller held `forecaster.duckdb`. Correct data, failing exit code,
+  alarming log -- the worst combination for an unattended cron.
+
+**THE PHASE 3.2 CONSEQUENCE, AND IT CHANGES A DECISION.** The three-phase split shortened the
+WRITER's lock windows, which solves writer-vs-writer. **It does nothing about a long-lived
+READER -- and a replay serving from the archive is exactly that.** My QC script starved the
+capturer for minutes; a round-2 serve session would do the same. So **serving from a SNAPSHOT
+copy of the index is a PREREQUISITE for Phase 3.2, not the optimisation this file previously
+called it** (see the "Do later" list, now superseded on that point). `connect_index` makes the
+capturer survive a collision; it does not make concurrent capture-and-serve a good design.
+
+### QC TRIAGE (2026-07-29) -- ALL 10 ITEMS CLOSED
+The 18Z QC produced a 10-item list. Every one is now resolved; three needed owner decisions and
+all three took the recommendation.
+1. **OBSERVED SOUNDINGS WERE TRUNCATED AT THE HUMIDITY CEILING -- the worst of the ten.**
+   `soundings.fetch_profile` built each level in ONE dict comprehension inside a `try`, so a
+   single blank column discarded the WHOLE level -- and the blank column is the DEWPOINT, because
+   radiosonde humidity sensors stop reporting in the dry stratosphere. Measured on 47646 (12Z):
+   **120 rows reaching 6 hPa; 52 with a dewpoint (top 250 hPa), 68 without (239 -> 6 hPa).** We
+   threw away good temperature, wind and height for 68 of 120 levels, so **every** observed
+   ascent lost its tropopause and jet level. FIXED: parse per field, missing -> NaN (numpy and
+   metpy take it natively and matplotlib BREAKS a line at NaN rather than interpolating). Only a
+   missing PRESSURE still drops a row. 47646 now reaches **12 hPa with 37 levels**; the dewpoint
+   trace ends where the sensor stopped while temperature carries on -- which is what a real
+   skew-T looks like.
+2. **Provider PNG is NOT an option.** `type=PNG:SKEWT` returns 2,507 bytes of `<!DOCTYPE` under
+   FM35 as well as BUFR -- an HTML wrapper, not an image. Rendering ourselves is the only path,
+   which is why item 1 mattered.
+3. **A third of the skew-T image was white space.** `suptitle` anchors near the FIGURE top while
+   MetPy's SkewT under-fills its gridspec cell, and `bbox_inches="tight"` then preserved the gap
+   because the title held the top edge. FIXED in one line: the title follows `sp`, the real chart
+   box already measured for the hodograph.
+4. **f018 and f030 added** (owner). The ladder ran 12 -> 24 -> 36, leaving twelve-hour holes
+   either side of f024 -- and f012-f024 is the peak diurnal convection window a 30h TAF turns on.
+   TT is unmetered and panels dedup across every station in a domain, so this is ~10-15 MB a
+   sweep for a hole no amount of point data fills.
+5. **The `--` rows are GONE, verified.** Surface was 2-hourly off an odd anchor while levels were
+   3-hourly@00Z, so 9 level-times had no surface row. Run-anchoring made surface HOURLY, which
+   contains every 3-hourly level time: **orphan level-times 9 -> 0 for every model.** Fell out of
+   the model-data work rather than being targeted.
+6. **get_hazard_scan no longer claims models it does not have** (owner). It hardcoded
+   "diagnosed from GFS + HRRR", printed an empty HRRR block at OCONUS stations, then wrote an
+   `agreement:` line derived from ONE model -- a confident claim of cross-model confirmation that
+   was never made. FIXED: header, both loops and the agreement line are built from the models with
+   NON-NULL level data. Verified live -- RJTY reads "diagnosed from GFS (HRRR does not cover this
+   station)" plus a single-model note **even though the archive still holds the null HRRR rows**,
+   because the test is for values and not for row presence. KWRI keeps its real two-model
+   agreement.
+7. **`get_nearby_model_data` was MY bug**, not the tool's: the QC script passed `variable=temp_c`,
+   which is not an alias, and the tool correctly refused and listed the real ones
+   (t2m td2m gust mslp vis ceil tcdc). Fixed in the script.
+8. **Text below its own image** -- also mine. `get_fcst_sounding`'s receipt ends "Skew-T image
+   follows.", and the generator emitted the PNG first. Receipt now precedes the image.
+9. **Radar refusal verified working** for SCCI and RJTY: 0 images, text naming the nearest
+   WSR-88D and its distance.
+10. **Hodograph resampled** (owner). The 1-second BUFR ascent is noisy and the thinning keeps ~4x
+    more points in the lowest 150 hPa -- right for the skew-T, wrong for the hodograph, where it
+    became a scribble around the origin. FIXED: `charts._hodo_sample` bins to ~25 hPa for THAT
+    PANEL ONLY (70 levels -> 23 points at KWRI). The skew-T keeps its fine low-level detail and
+    the barbs still carry level-by-level winds.
+
+**AND THE QC'S OWN HEADLINE FINDING, ALSO FIXED: A NEARBY RADAR IS NOT COVERAGE.**
+RKSO, PGUA, RODN, RKJK and RKSG sit essentially ON a real WSR-88D -- **Kadena 0 km, Kunsan 3 km,
+Andersen 20 km, Osan 26 km, Humphreys 35 km** -- so the 150 km guard passed and they were served
+a correctly-framed image with **ZERO reflectivity and no US boundary layers**, captioned "NEXRAD
+Base Reflectivity". A vision model reads that as "no convection near the station" when the truth
+is "no radar exists here": a false negative on the one hazard a TAF is written to catch, and
+strictly worse than the round-1 wrong-ocean bug because it does not LOOK wrong. RJTY was safe
+only by accident -- its nearest radar is 1,090 km away and failed the distance test.
+CAUSE: IEM composites the US network only. FIXED by `imagery.iem_composite_covers` (CONUS +
+Alaska + Hawaii + Puerto Rico), applied in BOTH `tools._radar_for_station` and the archiver's
+`_radar_items` so they cannot drift. Kept separate from `radar_region_for_latlon` because the
+curated regions have GAPS inside CONUS -- **KMIB and KRCA** fall between them while sitting
+squarely in the composite, and the station path exists for exactly those two; requiring a region
+would have refused them. Verified: 51 stations served, 20 refused, the five broken ones now
+refuse with the TRUE reason ("KSG is only 26 km from RKSO, but it is not part of the US NEXRAD
+mosaic that IEM composites"), and KMIB still gets its station view. Pinned by
+`test_archive_run`'s anti-drift planner checks.
+
+### QC PASS OVER THE 18Z ARCHIVE (2026-07-29) -- ORIGINAL FINDINGS (now all addressed above)
+Reports at `logs/qc_18Z/{ETAR,KWRI,SCCI,RJTY}.md` (gitignored, 63 MB): every product each
+station was entitled to, rendered from the frozen bytes with all three times, provider, sha and
+source URL; loops composed into filmstrips; model-data tools run for real so their receipts are
+verbatim. All manifest rows resolved to bytes at all four stations; no tool raised. Generator is
+`scratchpad/qc_report.py` (also copied to the Pi as `qc_report.py`) -- NOT added to the repo.
+
+1. **RADAR SERVED TO PACIFIC STATIONS IS EMPTY AND READS AS "CLEAR". Worst of the three.**
+   RKSO and PGUA get correctly-geolocated images (Korea, the Marianas) captioned "NEXRAD Base
+   Reflectivity" that contain **ZERO radar data**, because IEM's `nexrad` layer is a CONUS-only
+   mosaic. **A VLM reads that as "no convection near the station" when the truth is "no radar
+   exists here"** -- a false negative on the one hazard a TAF is written to catch, and strictly
+   worse than the round-1 wrong-ocean bug, which at least LOOKED wrong. Both are ALSO served the
+   `national` sector=conus mosaic containing neither station -- the round-1 RJTY bug, still live.
+   ROOT CAUSE: `_radar_items` gates on `nearest_radar` finding a WSR-88D within
+   `RADAR_STATION_GUARD_KM`. Kunsan and Andersen ARE real radars; **IEM just does not composite
+   them. A radar being nearby is not IEM serving its data.**
+   Enumerated: **8 of 71 stations pass the gate outside CONUS.** CONFIRMED BAD (no coverage, no
+   US boundary layers render, image empty): **PGUA, RODN, RKSO, RKJK, RKSG**. PROBABLY GENUINE
+   (real IEM sectors `alaska`/`hawaii`, boundaries render, plausibly just clear -- needs a check
+   at a time with KNOWN precipitation before calling it good): **PAED, PABI, PHHI**. The
+   `national` product is wrong for all 8.
+2. **`get_point_forecast` NAMES THE WRONG RUN.** `tools.py:1946` --
+   `run = next((r for _, r, _ in series if r), None)` -- labels the table with the run of the
+   EARLIEST valid time, which is the 9-row pre-anchor stub. ETAR's header read "run
+   2026-07-28T18Z" while ~19 of 20 rows came from the current 12Z run, so the guidance looks 24 h
+   stale when it is 6 h old. `get_fcst_sounding` cites 12Z for the same station, so the two tools
+   CONTRADICT each other on the same data.
+3. **A duplicate loop frame.** ETAR geocolor returned 6 frames not 7, and 17:40Z/17:50Z share one
+   sha (also the same as the 18:00Z still) -- EUMETSAT served one scan under three labels. The
+   archive recorded honestly; the loop just advertises motion it does not have.
+
 **FULL DUPLICATION AUDIT (2026-07-29), using the rule the loop bug taught: a download inside
 `plan` or `expand` BYPASSES `select`'s dedup; a download behind an Item's `fetch` is protected.**
 Every planner was checked against it.
@@ -517,15 +662,18 @@ updates 6-hourly and we re-request hourly. ~150 s of rate-limited sleep a sweep,
 thirds of it redundant. The run is already recorded in `served_utc`, so keying on the RUN rather
 than the cycle would remove it. NOT DONE.
 
-**END-TO-END, ALL FIXES IN, laptop, cold: 6 stations / 154 captured / 27.9 MB in 297 s, 0
-failed.** Like-for-like against the pre-fix baseline, which ran the SAME KWRI+ETAR+PHHI cold in
-**519 s** for 3 stations: roughly **3.5x better per station**, and the marginal cost of a
-station whose sector is already done collapsed to almost nothing (KDOV 4 captured / 55 reused,
-KADW 3 / 56). **DO NOT EXTRAPOLATE THIS TO THE PI.** It is different hardware (ARM, SD card),
-the station mix is not representative, and 6 -> 71 is not linear because cost tracks DISTINCT
-IDENTITIES, not station count. The only number that decides whether the hourly cadence holds is
-a real sweep on the Pi after the pull -- take it from `logs/archive_run.log` timestamps, not
-from this line.
+**SETTLED ON THE PI, 2026-07-29 18Z -- THE FIRST SWEEP ON THE NEW CODE: 14m 20s, ZERO
+FAILURES** (18:02:01Z -> 18:16:21Z, measured start-to-exit). **Was 56-66 min.** ~4x, and the
+hourly cadence now has 45 minutes of margin instead of overrunning.
+**IT CAPTURED MORE, NOT LESS: 716 artifacts / 179.9 MB**, against 671-728 / 135-157 MB on the
+old serial sweeps. That is the number that matters -- the speedup came from deleting redundant
+downloads, so nothing was traded away for it. Archive 1.74 GB, disk 105 GB free.
+Laptop figure for reference only: 6 cold stations / 154 captured in 297 s, vs a 519 s pre-fix
+baseline for 3 -- do not extrapolate laptop numbers, cost tracks DISTINCT IDENTITIES, not
+station count.
+**17Z was the last casualty of the old code** (the 16Z sweep ran ~60 min under it and blocked
+17:02). Cycles captured 2026-07-29: 04, 07-14, 16, 18 -- 05/06 to the cold-start sweep, 15 and
+17 to overruns. From 18Z on, no skip should occur.
 
 **MEASURED, and the honest answer is that PARALLELISM ALONE DOES NOT FIX THE OVERRUN.** Clean
 A/B, one cold station, render lock in place: **KWRI `--workers 6` = 92 s vs `--workers 1` =

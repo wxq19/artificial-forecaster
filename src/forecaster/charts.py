@@ -230,6 +230,24 @@ def _wx_legend(lax, families) -> None:
         spine.set_visible(False)
 
 
+def _hodo_sample(pres, *, step_hpa: float = 25.0) -> np.ndarray:
+    """Boolean mask keeping one level per `step_hpa` of pressure, plus the first and last.
+
+    Used ONLY for the hodograph. Pressure-binned rather than every-Nth so the result does not
+    depend on ascent rate -- same reasoning as soundings._thin, a coarser step."""
+    pres = np.asarray(pres, dtype=float)
+    keep = np.zeros(pres.size, dtype=bool)
+    if pres.size == 0:
+        return keep
+    keep[0] = keep[-1] = True
+    last = pres[0]
+    for i in range(1, pres.size - 1):
+        if np.isfinite(pres[i]) and last - pres[i] >= step_hpa:
+            keep[i] = True
+            last = pres[i]
+    return keep
+
+
 def skewt(profile) -> bytes:
     """Enriched forecast skew-T from a fcstsounding.FcstProfile -> PNG bytes.
 
@@ -279,11 +297,21 @@ def skewt(profile) -> bytes:
     ax_txt.axis("off")
 
     top = p >= 200 * units.hPa            # keep the hodograph to the troposphere
-    spd = np.hypot(u[top].m, v[top].m)
-    rng = max(30, int(np.ceil((spd.max() if spd.size else 30) / 10) * 10) + 10)
+    # SAMPLED COARSER THAN THE SKEW-T, on purpose (owner, 2026-07-29). A 1-second BUFR ascent
+    # is noisy, and the thinning deliberately keeps ~4x more points in the lowest 150 hPa
+    # because inversions and the LLJ live there -- which is right for the skew-T and wrong
+    # here: it turned the low-level hodograph into an unreadable scribble around the origin.
+    # The hodograph's job is the SHAPE of the shear profile; the wind barbs beside the skew-T
+    # already carry the level-by-level detail. So bin to ~25 hPa for this panel only, keeping
+    # the first and last points so the trace still spans the real profile.
+    keep = _hodo_sample(p[top].m, step_hpa=25.0)
+    hu, hv, hh_ = u[top][keep], v[top][keep], hght[top][keep]
+    spd = np.hypot(hu.m, hv.m)
+    finite = spd[np.isfinite(spd)]
+    rng = max(30, int(np.ceil((finite.max() if finite.size else 30) / 10) * 10) + 10)
     hod = Hodograph(ax_h, component_range=rng)
     hod.add_grid(increment=10 if rng <= 40 else 20)
-    hod.plot_colormapped(u[top], v[top], hght[top])
+    hod.plot_colormapped(hu, hv, hh_)
     ax_h.set_title("Hodograph (kt, by height)", fontsize=9)
 
     order = ("CAPE", "CINS", "LIFT", "SHOW", "KINX", "TOTL", "PWAT", "LCLP")
@@ -305,7 +333,7 @@ def skewt(profile) -> bytes:
     # they have no run/fhr, and labelling a radiosonde ascent "forecast skew-T" would be a
     # plain misstatement to the one reader who cannot check it. Duck-typed via getattr so
     # forecast profiles are untouched.
-    fig.suptitle(
+    suptitle = fig.suptitle(
         getattr(profile, "title", None)
         or (f"{profile.model.upper()} forecast skew-T  |  {profile.station}  "
             f"run {profile.run:%Y-%m-%d %HZ}  f{profile.fhr:03d}  valid {profile.valid}"),
@@ -322,6 +350,14 @@ def skewt(profile) -> bytes:
     ax_h.set_position([hp.x0, sp.y1 - hh, hp.width, hh])
     tp = ax_txt.get_position()
     ax_txt.set_position([tp.x0, sp.y0, tp.width, (sp.y1 - hh - 0.03) - sp.y0])
+
+    # Pull the title down onto the chart. `suptitle` anchors near the FIGURE top, but SkewT
+    # under-fills its gridspec cell (see above), so the axes sit well below that -- and
+    # `bbox_inches="tight"` then keeps the whole empty band because the title is holding the
+    # top edge. The result was roughly a third of the image being white space between the
+    # caption and the plot. `sp` is the real chart box, already measured for the hodograph, so
+    # the title just needs to follow it instead of the figure.
+    suptitle.set_y(min(0.98, sp.y1 + 0.035))
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")

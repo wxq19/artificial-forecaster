@@ -1052,11 +1052,17 @@ def _sounding_bufr(site: str) -> ToolResult:
     # Name the FEED, not just the provider: FM35 is the TEMP bulletin (mandatory + significant
     # levels, ~100-200) and BUFR is the ~1 s ascent (3,000-4,500), so the level count below
     # means something different in each and the receipt must not blur them.
+    # A missing value is now NaN rather than a dropped level (soundings.fetch_profile keeps a
+    # level whose humidity is absent, which is what un-truncated the ascent). Print "--" the
+    # way every other formatter here does: "nan C" in a receipt reads as a broken tool.
+    def _v(x, unit=""):
+        return f"{x:.1f}{unit}" if x == x else "--"
+
     return ToolResult(
         f"{note}OBSERVED radiosonde skew-T for site {site}, launched {t:%Y-%m-%dT%H:%MZ}"
         f"{off} Rendered from the raw ascent ({len(prof.pres)} levels thinned from "
-        f"{prof.n_raw}); surface {prof.pres[0]:.0f} hPa {prof.tmpc[0]:.1f}/"
-        f"{prof.dwpc[0]:.1f} C. (source: Wyoming {src}, {prof.url}); image follows.",
+        f"{prof.n_raw}); surface {prof.pres[0]:.0f} hPa {_v(prof.tmpc[0])}/"
+        f"{_v(prof.dwpc[0])} C. (source: Wyoming {src}, {prof.url}); image follows.",
         images=[img])
 
 
@@ -1356,16 +1362,29 @@ def _radar_for_station(icao: str, product: str | None) -> ToolResult:
     guard = imagery.RADAR_STATION_GUARD_KM
     reg = imagery.radar_region_for_latlon(lat, lon)
 
+    # A NEARBY RADAR IS NOT COVERAGE. IEM composites the US network only, so a station sitting
+    # on a real WSR-88D outside it (Kadena 0 km, Kunsan 3 km, Osan 26 km, Andersen 20 km,
+    # Humphreys 35 km) passed the distance guard and got a correctly-framed image with ZERO
+    # reflectivity in it -- captioned "NEXRAD Base Reflectivity" and therefore read as "no
+    # convection", which is a false negative on convection. See imagery.iem_composite_covers.
+    covered = imagery.iem_composite_covers(lat, lon)
+    local = bool(near and near[1] <= guard) and covered
+
     # OUT OF NETWORK: no credible local radar AND outside every curated region. Refuse for
     # EVERY product, including an explicit national_mosaic -- the station is not in the US
     # radar network at all, so no US product describes it. (An explicit `region` request,
     # which arrives via _get_imagery rather than here, is still honored: that is the model
     # deliberately asking to look at a named US area.)
-    if not reg and not (near and near[1] <= guard):
-        return _radar_no_coverage(
-            icao, near,
-            f"{icao} is outside the curated radar regions and has no WSR-88D within the "
-            f"{guard:.0f} km local-radar guard")
+    if not reg and not local:
+        why = (f"{icao} is outside the curated radar regions and has no WSR-88D within the "
+               f"{guard:.0f} km local-radar guard")
+        if near and near[1] <= guard and not covered:
+            # Say the true reason. "No radar nearby" would be a plain misstatement to the one
+            # reader who cannot check it -- there IS one, and it is 20 km away.
+            why = (f"{near[0]['id']} is only {near[1]:.0f} km from {icao}, but it is not part "
+                   "of the US NEXRAD mosaic that IEM composites, so no reflectivity product "
+                   "covers this station")
+        return _radar_no_coverage(icao, near, why)
 
     # Honor an explicit mosaic choice directly -- do NOT route it through the guard (which
     # would fabricate a distance reason and hand back the wrong product).
@@ -1377,7 +1396,9 @@ def _radar_for_station(icao: str, product: str | None) -> ToolResult:
         return _radar_no_coverage(icao, near, f"{icao} is outside the curated radar regions")
 
     # Default / station_reflectivity: a station-centered local view when a radar is credible.
-    if near and near[1] <= guard:
+    # `local` already folds in the composite-coverage test, so an out-of-network station falls
+    # through to the regional/refusal path below instead of being handed an empty raster.
+    if local:
         site, dist = near
         try:
             url = imagery.radar_url("station", center=(lat, lon))
@@ -2034,14 +2055,26 @@ def _fmt_hazard_scan(con, station: str, loc: tuple, want) -> str:
         return (f"(no pressure-level hazard data pre-fetched for {loc_id} -- the pressure-level "
                 f"bundle was not pulled for this cycle.)")
     valid = ref[0]
+    # NAME ONLY THE MODELS THAT CAN ACTUALLY CONTRIBUTE (owner, 2026-07-29). HRRR is CONUS-only,
+    # so at an OCONUS station it has no level rows -- but the header said "diagnosed from GFS +
+    # HRRR" regardless, printed an empty HRRR block, and then wrote an "agreement:" line
+    # derived from ONE model. That is a confident claim of cross-model confirmation where no
+    # second model exists, which is the label-over-content failure this file keeps meeting.
+    have = [m for m in ("gfs", "hrrr")
+            if any(e[2].get("cape") is not None or e[2].get("t650") is not None
+                   for e in piv.get(m, []))]
+    absent = [m for m in ("gfs", "hrrr") if m not in have]
+    who = " + ".join(m.upper() for m in have) or "no model"
+    why = (f" ({', '.join(m.upper() for m in absent)} does not cover this station)"
+           if absent else "")
     out = [f"Hazard scan for {loc_id}, valid {valid:%Y-%m-%dT%HZ} -- conditions diagnosed from "
-           "GFS + HRRR (no native icing/turbulence field; we confirm the ENVIRONMENT across "
+           f"{who}{why} (no native icing/turbulence field; we confirm the ENVIRONMENT across "
            "models). Reason over the evidence; the flags are a rule, not a verdict.", ""]
 
     # ICING: supercooled water (T in [-16,0] C, RH>=70%; GFS CLMR>0 confirms cloud liquid)
     out.append("ICING (T in -16..0 C with RH>=70%; GFS CLMR>0 confirms supercooled liquid):")
     ice: dict = {}
-    for model in ("gfs", "hrrr"):
+    for model in have:
         entry = _pick_valid_time(piv[model], valid)
         if entry is None:
             out.append(f"  {model.upper()}: no data at valid time")
@@ -2059,16 +2092,21 @@ def _fmt_hazard_scan(con, station: str, loc: tuple, want) -> str:
             ice.setdefault(lv, {})[model] = flag
             out.append(f"    {lv:<7} T={t:>5.1f}C RH={rh:>3.0f}%{clw_s:<16} "
                        f"{'ICING' if flag else '-'}")
-    if ice:
+    # An "agreement" line needs TWO models to agree. With one, "650 mb no icing" reads as a
+    # cross-model confirmation that was never made -- the per-level rows above already carry
+    # the flags, so say nothing rather than say it with false authority.
+    if ice and len(have) >= 2:
         out.append("  agreement: " + "; ".join(
             f"{lv} " + ("BOTH icing" if set(v.values()) == {True}
                         else "no icing" if set(v.values()) == {False} else f"DISAGREE {v}")
             for lv, v in ice.items() if v))
+    elif ice:
+        out.append(f"  (single model: {who} only -- no cross-model confirmation available here)")
 
     # TURBULENCE: convective (CAPE + ascent) and shear-driven (deep-layer bulk shear)
     out += ["", "TURBULENCE (convective: CAPE + ascent; mechanical/CAT: 850-300mb bulk shear):"]
     summ: dict = {}
-    for model in ("gfs", "hrrr"):
+    for model in have:
         entry = _pick_valid_time(piv[model], valid)
         if entry is None:
             continue

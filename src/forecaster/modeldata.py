@@ -525,6 +525,71 @@ def _chunk(coords: list, size: int = 500):
         yield coords[i:i + size]
 
 
+# NATIVE surface cadence, in hours, for the 0-48h range we archive. Measured off the live
+# archive 2026-07-29 by looking at the valid-time gaps each model actually RETURNED:
+#   gfs [1,2]  hrrr [1,2]  nbm [2]  ifsoper [3]
+# GFS/HRRR/NBM serve every hour asked for; IFS serves 3-hourly and NOTHING ELSE, so asking it
+# for 28 two-hourly times bought 17 rows and paid for 28. A per-model step is what stops that.
+# The value is the FINEST the model serves -- ask for less and we lose detail we are entitled
+# to; ask for more and we pay for hours that never arrive.
+NATIVE_STEP_H = {"gfs": 1, "hrrr": 1, "nbm": 1, "ifsoper": 3, "gefsatmos": 3}
+
+
+def archive_cycle(as_of: datetime | None = None) -> datetime:
+    """The 00/06/12/18Z run this pull is archiving.
+
+    Distinct from `archive_run_and_as_of`, which returns None for GFS and IFS -- that function
+    answers "must I pin as_of to make this model name a run", and for an already-6-hourly model
+    the answer is no. But the RUN is knowable for every model, and it is the right anchor for a
+    valid-time grid, so it gets its own helper rather than being inferred at each call site.
+
+    `as_of=None` means now, matching prefetch_many/estimate_prefetch_many -- callers pass the
+    raw CLI value through, which is None until those functions default it."""
+    t = ((as_of or _utcnow()) - timedelta(hours=_ARCHIVE_POST_LAG_H)).replace(
+        minute=0, second=0, microsecond=0)
+    return t - timedelta(hours=t.hour % _ARCHIVE_CYCLE_H)
+
+
+def _model_times(model: str, anchor: datetime, hours: int, step_h: int, hazard_step_h: int,
+                 back_hours: int, *, run: datetime | None) -> tuple[list, list]:
+    """(surface times, level times) for one model, anchored on its RUN where we know it.
+
+    WHY THE RUN AND NOT THE CLOCK. The grid used to be built once from `as_of` -- the cron
+    firing time -- before any model was considered. A 17:02Z cron gave a 17Z anchor, so we
+    asked for valid times 17/19/21Z... which is a window around our own wall clock and has no
+    meteorological meaning. It also matched none of IFS's 00Z-anchored 3-hourly times, which
+    is the whole reason `_snapped_grid` had to exist: an unsnapped request returns zero rows,
+    zero credits and NO error -- a silently empty archive that looks like a successful pull.
+
+    Anchoring on the run removes that class of failure instead of guarding it. Runs are always
+    00/06/12/18Z, every one a multiple of 3, so a coarse model lines up by construction. It
+    also makes coverage a sentence you can state: the 06Z run to f048 covers a 12Z TAF's 30h
+    validity with 12h spare and 6h of hindsight.
+
+    THE PRE-ANCHOR TAIL BECOMES FREE. `back_hours` existed so get_model_verification could
+    compare an archived forecast against obs already banked in the DB. A run-anchored ladder
+    starts at f000, which is already in the past by the time we fetch at run+5h, so those
+    hours arrive anyway -- and from the CORRECT run, instead of as the 9-row stub of an older
+    one that made get_point_forecast label its table with a 24h-stale run. `back_hours` is
+    still honoured when the run is unknown, so nothing regresses on that path.
+
+    `step_h` is a CEILING, not the step: a caller asking for 2-hourly gets 2-hourly, but a
+    caller asking for hourly gets the model's native cadence rather than a promise we cannot
+    keep."""
+    step = max(step_h, NATIVE_STEP_H.get(model, step_h))
+    lvl_step = max(hazard_step_h, NATIVE_STEP_H.get(model, 1))
+    if run is None:
+        # Caller could not name a run (a bare prefetch outside the archive path). Keep the old
+        # clock-anchored behaviour, snapped, so a coarse model still lines up.
+        return (_time_grid(anchor, hours, step, back_h=back_hours),
+                _snapped_grid(anchor, hours, lvl_step))
+    # `hours` is measured FROM THE RUN, so a 48h horizon is f000..f048 -- the model's own
+    # forecast ladder, not a 48h window around our clock. That is the whole point of anchoring
+    # here: the 06Z run to f048 covers a 12Z TAF's 30h validity with 12h spare and 6h of
+    # hindsight, which is a statement about the model rather than about the cron.
+    return _time_grid(run, hours, step), _time_grid(run, hours, lvl_step)
+
+
 def _dedupe(coord_lists: list[list]) -> list[tuple[float, float, str]]:
     """Union several coordinate lists, keeping the first name for a given (lat, lon)."""
     seen: dict = {}
@@ -532,6 +597,30 @@ def _dedupe(coord_lists: list[list]) -> list[tuple[float, float, str]]:
         for la, lo, name in lst:
             seen.setdefault((round(la, 4), round(lo, 4)), (round(la, 4), round(lo, 4), name))
     return list(seen.values())
+
+
+def model_coords(model: str, coords: list) -> list:
+    """The subset of `coords` this model can actually answer for.
+
+    A CONUS-only model asked about Ramstein does not error -- it returns a full set of rows
+    with NULL values, and we pay for them and store them. MEASURED 2026-07-29 over the live
+    archive: every OCONUS station held 5,715 HRRR rows and 624 NBM rows at **0% non-null**,
+    totalling **844,422 null HRRR rows (36.4%) and 612,096 null NBM rows (33.8%)**.
+
+    `_applicable_models` was written for this, but it only drops a CONUS-only model when NO
+    coordinate in the batch is in CONUS -- and we union all 71 stations into one batch, so a
+    CONUS coordinate is always present and the guard never fires. Its docstring calls the
+    OCONUS nulls "the lesser evil"; the cost was simply never measured. It is 952 credits a
+    pull, because credits are times x vars x ceil(coords/500) and 2,904 coords is 6 chunks
+    where the 2,000 CONUS ones are 4.
+
+    Filtering HERE rather than in `_applicable_models` keeps the model in play for the
+    stations it covers instead of dropping it for everyone. It also removes the empty HRRR
+    block `get_hazard_scan` prints at OCONUS stations -- that block exists only because the
+    null rows are there to be found."""
+    if model not in _CONUS_ONLY_MODELS:
+        return coords
+    return [c for c in coords if _in_conus(c[0], c[1])]
 
 
 def _fetch_and_insert(
@@ -550,11 +639,11 @@ def _fetch_and_insert(
     liquid, omega, CAPE/CIN/helicity). Merging matters because credits are
     valid_times x variables x ceil(coords/500) -- two requests over the same coordinates and
     the same time grid would bill the shared T/RH/u/v twice. Both readers use the same
-    aliases, so one set of rows serves the skew-T and the icing/turbulence scan alike."""
-    sfc_times = _time_grid(anchor, hours, step_h, back_h=back_hours)
-    # The pressure-level grid must sit on IFS's 00/03/06...Z cadence or it silently archives
-    # nothing; GFS/HRRR are hourly at these ranges, so snapping costs them nothing.
-    haz_times = _snapped_grid(anchor, hours, hazard_step_h)
+    aliases, so one set of rows serves the skew-T and the icing/turbulence scan alike.
+
+    COORDINATES AND TIMES ARE BOTH PER MODEL. The requests were always one per (model, chunk);
+    what used to be shared was the coordinate union and the valid-time grid, which is how a
+    CONUS-only model came to be billed for Japan. See `model_coords` and `_model_times`."""
     fetched_at = _utcnow()
     charged = 0
     to_insert: list[dict] = list(extra_rows or [])
@@ -567,7 +656,19 @@ def _fetch_and_insert(
         if run is not None:
             notes.append(f"{model} pinned to the {run:%Y-%m-%dT%HZ} synoptic run "
                          "(hourly model archived on the 6-hourly cycle)")
-        for chunk in _chunk(surface_coords):
+        # The GRID anchors on the cycle being archived, for EVERY model -- `run` above is only
+        # non-None for the hourly models that also need as_of pinned.
+        sfc_times, haz_times = _model_times(model, anchor, hours, step_h, hazard_step_h,
+                                            back_hours, run=archive_cycle(as_of))
+        model_surface = model_coords(model, surface_coords)
+        model_levels = model_coords(model, hazard_coords_all)
+        if not model_surface:
+            notes.append(f"{model} skipped: no requested coordinate is inside its domain")
+            continue
+        if len(model_surface) < len(surface_coords):
+            notes.append(f"{model} is CONUS-only: {len(model_surface)} of "
+                         f"{len(surface_coords)} coords requested (the rest would be null)")
+        for chunk in _chunk(model_surface):
             try:
                 ts = gribstream.fetch_points(model, chunk, _surface_vars(model),
                                              times=sfc_times, as_of=model_as_of,
@@ -579,8 +680,8 @@ def _fetch_and_insert(
         level_vars = (_profile_vars(model) if profiles else [])
         if hazards:
             level_vars += _hazard_vars(model, profiles=profiles)
-        if level_vars and hazard_coords_all:
-            for chunk in _chunk(hazard_coords_all):
+        if level_vars and model_levels:
+            for chunk in _chunk(model_levels):
                 try:
                     ts = gribstream.fetch_points(model, chunk, level_vars,
                                                  times=haz_times, as_of=model_as_of,
@@ -1047,23 +1148,28 @@ def estimate_prefetch_many(
     hazard_coords_all = (_dedupe([hazard_coords(s, flow_from=flow_from) for s in stations])
                          if want_levels else [])
 
-    # Same two grids _fetch_and_insert builds, including the 00Z-anchored level snap.
-    sfc_times = _time_grid(anchor, hours, step_h, back_h=back_hours)
-    haz_times = _snapped_grid(anchor, hours, hazard_step_h)
-
     models_eff, dropped = _applicable_models(surface_coords, models)
-    n_sfc_chunks = len(list(_chunk(surface_coords)))
-    n_lvl_chunks = len(list(_chunk(hazard_coords_all))) if hazard_coords_all else 0
+    cycle = archive_cycle(as_of)
 
     per_model, total = {}, 0
     for model in models_eff:
+        # PER MODEL, through the same helpers the fetch uses: its own run-anchored grids at its
+        # own native cadence (`_model_times`) over its own coordinate subset (`model_coords`).
+        # Restating any of that here is exactly how the previous estimator came to under-report
+        # by 5.4x -- it is not enough to share the variable bundles.
+        sfc_times, haz_times = _model_times(model, anchor, hours, step_h, hazard_step_h,
+                                            back_hours, run=cycle)
+        m_sfc = model_coords(model, surface_coords)
+        m_lvl = model_coords(model, hazard_coords_all)
+        n_sfc_chunks = len(list(_chunk(m_sfc))) if m_sfc else 0
+        n_lvl_chunks = len(list(_chunk(m_lvl))) if m_lvl else 0
         sfc = len(sfc_times) * len(_surface_vars(model)) * n_sfc_chunks
         level_vars = _profile_vars(model) if profiles else []
         if hazards:
             level_vars = level_vars + _hazard_vars(model, profiles=profiles)
-        lvl = (len(haz_times) * len(level_vars) * n_lvl_chunks
-               if (level_vars and hazard_coords_all) else 0)
-        per_model[model] = {"surface": sfc, "levels": lvl, "level_vars": len(level_vars)}
+        lvl = len(haz_times) * len(level_vars) * n_lvl_chunks if level_vars else 0
+        per_model[model] = {"surface": sfc, "levels": lvl, "level_vars": len(level_vars),
+                            "sfc_coords": len(m_sfc), "sfc_times": len(sfc_times)}
         total += sfc + lvl
     # The steering probe is one request per station: one valid time, the deep-layer u/v set.
     probe = len(stations) * len(_steer_vars()) if flow_relative else 0
@@ -1071,6 +1177,11 @@ def estimate_prefetch_many(
     notes = []
     if dropped:
         notes.append(f"{', '.join(dropped)} skipped: no coordinate in CONUS")
+    for model in models_eff:
+        n = per_model[model]["sfc_coords"]
+        if n and n < len(surface_coords):
+            notes.append(f"{model} is CONUS-only: billed over {n} of {len(surface_coords)} "
+                         "surface coords (the rest would return null)")
     for label, n in (("surface", len(surface_coords)), ("level", len(hazard_coords_all))):
         if n and n % 500 > 450:
             notes.append(f"{label} coords ({n}) are near a 500-point chunk boundary; a live "
@@ -1082,8 +1193,12 @@ def estimate_prefetch_many(
         "models": list(models_eff),
         "coords": len(surface_coords),
         "hazard_coords": len(hazard_coords_all),
-        "surface_times": len(sfc_times),
-        "level_times": len(haz_times),
+        # There is no single surface grid any more -- each model runs on its own cadence, so
+        # these are the WIDEST across models and exist only for a summary line. Reading them
+        # as "the grid" is what made the dry-run header print IFS's 17 times for every model:
+        # they used to be the leaked loop variable. Per-model truth is in `per_model[m]`.
+        "max_surface_times": max((p["sfc_times"] for p in per_model.values()), default=0),
+        "level_times": len(haz_times) if models_eff else 0,
         "notes": notes,
     }
 

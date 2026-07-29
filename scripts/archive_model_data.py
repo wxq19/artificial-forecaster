@@ -59,7 +59,11 @@ def main() -> None:
     ap.add_argument("--hours", type=int, default=48,
                     help="forecast horizon to archive (default 48h: covers every TAF issued "
                          "before the next run posts, +30h validity)")
-    ap.add_argument("--step", type=int, default=2, help="surface valid-time step (h)")
+    ap.add_argument("--step", type=int, default=1,
+                    help="surface valid-time step (h) -- a CEILING, not the step: each model "
+                         "uses the finer of this and its own native cadence, so 1 gets hourly "
+                         "GFS/HRRR/NBM while IFS stays 3-hourly instead of billing for hours "
+                         "it never returns")
     ap.add_argument("--hazard-step", type=int, default=3, help="pressure-level valid-time step (h)")
     ap.add_argument("--no-hazards", action="store_true")
     ap.add_argument("--ensemble", action="store_true",
@@ -94,12 +98,15 @@ def main() -> None:
         icaos, as_of=as_of, hours=args.hours, step_h=args.step,
         hazards=hazards, hazard_step_h=args.hazard_step)
     print(f"=== ARCHIVE model-data: {len(icaos)} station(s), {args.hours}h horizon ===")
-    print(f"surface {args.hours}h/{args.step}h grid ({est['surface_times']} valid times, "
-          f"{est['coords']} coords); levels {args.hazard_step}h grid "
-          f"({est['level_times']} valid times, {est['hazard_coords']} coords)")
+    # Anchored on the RUN being archived, not on the cron clock, and each model uses the finer
+    # of --step and its own native cadence -- so times and coords are per model, not shared.
+    print(f"anchored on the {modeldata.archive_cycle(as_of):%Y-%m-%dT%HZ} run; "
+          f"{args.hours}h horizon (f000..f{args.hours:03d}); "
+          f"{est['coords']} surface coords, {est['hazard_coords']} level coords")
     for model, m in est["per_model"].items():
-        print(f"  {model:9} surface {m['surface']:>6}  levels {m['levels']:>6} "
-              f"({m['level_vars']} vars)")
+        print(f"  {model:9} surface {m['surface']:>6} ({m['sfc_times']:>3} times x "
+              f"{m['sfc_coords']:>4} coords)  levels {m['levels']:>6} "
+              f"({est['level_times']} times x {m['level_vars']} vars)")
     if est["steering_probe"]:
         print(f"  {'steering':9} probe   {est['steering_probe']:>6}")
     total = est["credits"]
@@ -143,11 +150,20 @@ def main() -> None:
         for n in ens["notes"]:
             print(f"  - {n}")
 
-    con = store.connect(args.db, read_only=True)
+    # A NICETY, AFTER THE MONEY IS ALREADY SPENT. The pull has inserted and committed by here,
+    # so this read-only summary must not be able to fail the run: on 2026-07-29 the 23Z pull
+    # billed 11,299 credits, inserted 3,536,156 rows, and then tracebacked on THIS line because
+    # the 5-minutely TAF poller held forecaster.duckdb. The data was fine; the exit code and the
+    # log said otherwise, which is the worst possible combination for an unattended cron.
     try:
-        print(f"archive now holds {len(store.model_data_locations(con))} distinct locations")
-    finally:
-        con.close()
+        con = store.connect(args.db, read_only=True)
+        try:
+            print(f"archive now holds {len(store.model_data_locations(con))} distinct locations")
+        finally:
+            con.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"(location count unavailable -- the pull itself succeeded: "
+              f"{type(e).__name__}: {e})")
 
 
 if __name__ == "__main__":

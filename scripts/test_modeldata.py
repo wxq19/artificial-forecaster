@@ -496,6 +496,33 @@ def test_profiles():
     con.close()
 
 
+def test_conus_only_coords():
+    """A CONUS-only model must be billed over CONUS coordinates ONLY.
+
+    Asked about Ramstein, HRRR does not error -- it returns a full set of NULL-valued rows that
+    we pay for and store. Measured live 2026-07-29: every OCONUS station held 5,715 HRRR rows
+    and 624 NBM rows at 0% non-null, 844,422 + 612,096 null rows archive-wide, ~952 credits a
+    pull. `_applicable_models` was meant to catch this but only fires when NO coordinate is in
+    CONUS, and the real batch unions all 71 stations, so it never fired."""
+    mixed = [(40.0, -75.0, "KAAA"),        # CONUS
+             (49.4, 7.6, "ETAR"),          # Germany
+             (35.7, 139.3, "RJTY"),        # Japan
+             (-53.0, -70.8, "SCCI")]       # Patagonia
+    for m in ("hrrr", "nbm"):
+        got = modeldata.model_coords(m, mixed)
+        check(f"{m} is billed over CONUS coords only",
+              [c[2] for c in got] == ["KAAA"], f"got {[c[2] for c in got]}")
+    for m in ("gfs", "ifsoper"):
+        check(f"{m} is global and keeps every coord",
+              len(modeldata.model_coords(m, mixed)) == 4,
+              f"got {len(modeldata.model_coords(m, mixed))}")
+    # An all-OCONUS batch leaves a CONUS-only model with nothing -- it must be skipped, not
+    # sent an empty request.
+    oconus = [c for c in mixed if c[2] != "KAAA"]
+    check("a CONUS-only model gets NO coords in an all-OCONUS batch",
+          modeldata.model_coords("hrrr", oconus) == [], "got rows")
+
+
 def test_credit_estimate():
     """The estimator's whole job is not drifting from the fetch, so pin the four ways it
     drifted before: the profile ladder, the pre-anchor tail, the merged-hazard subtraction,
@@ -508,9 +535,40 @@ def test_credit_estimate():
             ["KAAA"], as_of=datetime(2026, 7, 28, 11), hours=48, step_h=2, hazard_step_h=3,
             flow_relative=False)
 
-        # (a) surface grid includes the pre-anchor tail: (back_hours + hours)//step + 1.
-        check("estimate counts the pre-anchor surface tail",
-              e["surface_times"] == (6 + 48) // 2 + 1, f"got {e['surface_times']}")
+        # (a) The grid is RUN-ANCHORED at the model's own cadence, so `surface_times` is now
+        # per model rather than one shared number. GFS is hourly (step_h is a CEILING, and
+        # NATIVE_STEP_H['gfs'] is 1), IFS is 3-hourly and NOTHING ELSE -- asking it for the
+        # global step is what used to buy 17 rows and pay for 28.
+        cyc = modeldata.archive_cycle(datetime(2026, 7, 28, 11))
+        check("estimate: the cycle is a 00/06/12/18Z run",
+              cyc.hour % 6 == 0 and cyc.minute == 0, f"got {cyc}")
+        # This call passes step_h=2, and a COARSER request is honoured: the effective step is
+        # max(requested, native), i.e. never finer than the model serves and never finer than
+        # asked for. So GFS here is 2-hourly, f000..f048.
+        check("estimate: run-anchored grid is f000..f048 at the requested step",
+              e["per_model"]["gfs"]["sfc_times"] == 48 // 2 + 1,
+              f"got {e['per_model']['gfs']['sfc_times']}")
+        # ...but IFS cannot go finer than 3-hourly whatever is asked, which is the waste this
+        # replaced: 28 two-hourly times requested, 17 rows returned, 28 paid for.
+        if "ifsoper" in e["per_model"]:
+            check("estimate: IFS stays 3-hourly even when a finer step is requested",
+                  e["per_model"]["ifsoper"]["sfc_times"] == 48 // 3 + 1,
+                  f"got {e['per_model']['ifsoper']['sfc_times']}")
+        hourly = modeldata.estimate_prefetch_many(
+            ["KAAA"], as_of=datetime(2026, 7, 28, 11), hours=48, step_h=1, hazard_step_h=3,
+            flow_relative=False)
+        check("estimate: step_h=1 gets GFS its native HOURLY ladder",
+              hourly["per_model"]["gfs"]["sfc_times"] == 49,
+              f"got {hourly['per_model']['gfs']['sfc_times']}")
+        check("estimate: step_h=1 does NOT make IFS hourly",
+              hourly["per_model"].get("ifsoper", {}).get("sfc_times", 17) == 17,
+              f"got {hourly['per_model'].get('ifsoper')}")
+        # No pre-anchor tail is needed any more: a run-anchored ladder starts at f000, which is
+        # already past by the time the cron fires, so the verification hours arrive anyway --
+        # and from the correct run rather than as an older run's 9-row stub.
+        s, _h = modeldata._model_times("gfs", datetime(2026, 7, 28, 11), 48, 1, 3, 6, run=cyc)
+        check("estimate: the run-anchored grid needs no separate back_h tail",
+              s[0] == cyc, f"got {s[0]} want {cyc}")
         # (b) the profile ladder dominates and must be present for every profile model.
         for m in modeldata.PROFILE_MODELS:
             if m in e["per_model"]:
@@ -523,8 +581,9 @@ def test_credit_estimate():
         check("estimate uses the MERGED level bundle (no double-counted T/RH)",
               e["per_model"]["gfs"]["level_vars"] == want,
               f"got {e['per_model']['gfs']['level_vars']} want {want}")
-        # (d) credits are the sum of the parts, and each part is times x vars x chunks.
-        gfs_sfc = e["surface_times"] * len(modeldata._surface_vars("gfs"))
+        # (d) credits are the sum of the parts, and each part is times x vars x chunks -- with
+        # times and coords BOTH taken per model now.
+        gfs_sfc = e["per_model"]["gfs"]["sfc_times"] * len(modeldata._surface_vars("gfs"))
         check("estimate surface term is times x vars x chunks",
               e["per_model"]["gfs"]["surface"] == gfs_sfc,
               f"got {e['per_model']['gfs']['surface']} want {gfs_sfc}")
@@ -611,6 +670,7 @@ def main():
     test_collect_path()
     test_grid_flow_batch_ifs()
     test_profiles()
+    test_conus_only_coords()
     test_credit_estimate()
     test_ensemble_batch()
     npass = sum(1 for _, ok, _ in checks if ok)

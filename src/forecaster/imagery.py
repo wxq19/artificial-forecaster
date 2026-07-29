@@ -574,6 +574,41 @@ def radar_region_for_latlon(lat: float, lon: float) -> str | None:
     return None
 
 
+# IEM composites the US NEXRAD network ONLY: the contiguous states plus Alaska, Hawaii and
+# Puerto Rico. Anything else gets a correctly-geolocated picture with NO radar in it -- see
+# iem_composite_covers. Generous boxes on purpose: this decides whether a station is EVER
+# offered radar, and the curated RADAR_REGIONS handle the framing once it is.
+_IEM_NEXRAD_FOOTPRINT = (
+    (-125.0, 24.0, -66.0, 50.0),      # contiguous US
+    (-170.0, 51.0, -129.0, 72.0),     # Alaska
+    (-161.0, 18.0, -154.0, 23.0),     # Hawaii
+    (-68.0, 17.0, -64.0, 19.0),       # Puerto Rico / USVI
+)
+
+
+def iem_composite_covers(lat: float, lon: float) -> bool:
+    """Is this point inside the radar network IEM actually composites?
+
+    WHY THIS IS NOT THE SAME AS "a WSR-88D is nearby". Found by QC on 2026-07-29: RKSO, PGUA,
+    RODN, RKJK and RKSG all sit essentially ON a real WSR-88D -- Kadena 0 km, Kunsan 3 km,
+    Osan 26 km, Andersen 20 km, Humphreys 35 km -- so the 150 km local-radar guard passed and
+    they were served a station-scale image. Those radars are real, but IEM does not composite
+    them into its `nexrad` product, so the image came back correctly framed on Korea or the
+    Marianas with **zero reflectivity and no US boundary layers**.
+
+    That is worse than a missing product. The picture is captioned "NEXRAD Base Reflectivity"
+    and shows clear conditions everywhere, so a vision model reads "no convection near the
+    station" when the truth is "no radar coverage exists here" -- a false negative on the one
+    hazard a TAF is written to catch. RJTY was already safe only because its nearest WSR-88D is
+    1,090 km away and failed the distance guard by accident, not by design.
+
+    Kept separate from `radar_region_for_latlon` because the curated regions have GAPS inside
+    CONUS: KMIB and KRCA fall between `northern_rockies` and `upper_mississippi` while sitting
+    squarely in the composite, and the station-scale path exists precisely for them. Requiring
+    a curated region would have refused those two."""
+    return any(w <= lon <= e and s <= lat <= n for w, s, e, n in _IEM_NEXRAD_FOOTPRINT)
+
+
 def _radmap_bbox_url(bbox: tuple[float, float, float, float], *, w: int, h: int) -> str:
     west, south, east, north = bbox
     return (f"{_IEM}/GIS/radmap.php?bbox={west:.2f},{south:.2f},{east:.2f},{north:.2f}"
