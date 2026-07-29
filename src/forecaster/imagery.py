@@ -339,6 +339,22 @@ def _slider_tile_url(sector: str, prod: str, ts: str, *, sat: str = _SLIDER_SAT)
             f"/{sat}---{sector}/{prod}/{ts}/00/000_000.png")
 
 
+def slider_time_from_url(url: str) -> datetime | None:
+    """The EXACT scan time a SLIDER tile URL names, or None if it is not one.
+
+    SLIDER is the only "latest" provider that puts the served timestamp in the path it
+    hands back, so its stills can record a true `served_utc` instead of being bounded by
+    our fetch clock the way GOES STAR and OSPO must be. Parsed HERE because this module
+    owns the URL shape; a caller reproducing the layout would drift the moment it changed."""
+    m = re.search(r"/(\d{14})/\d\d/\d{3}_\d{3}\.png$", url)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+
+
 # --- SLIDER map overlays -------------------------------------------------------------
 # SLIDER serves RAW imagery. The coastlines, borders and graticule its web app shows are
 # SEPARATE tile layers composited in the BROWSER, so fetching a tile alone returns a picture

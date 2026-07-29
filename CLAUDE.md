@@ -352,7 +352,224 @@ Two things live in CODE, not in prose. Do not restate them here, because a copy 
   `poll_icaos()`).
 - The tool contracts are `src/forecaster/tools.py` (`TOOLS` plus the sinks).
 
-## NEXT SESSION -- pick up here (paused 2026-07-28)
+## NEXT SESSION -- pick up here (paused 2026-07-29)
+
+### SESSION 2026-07-29 -- FIRST LIVE ARCHIVER DAY INSPECTED; SWEEP OVERRUN TRACED AND FIXED
+UNCOMMITTED: **7 modified + 2 new.** Modified `.gitignore`, CLAUDE.md,
+`scripts/archive_run.py`, `scripts/test_archive_run.py`, `src/forecaster/awc.py`,
+`src/forecaster/imagery.py`, `src/forecaster/store.py`. NEW `scripts/build_station_sites.py`
+and the generated `src/forecaster/station_sites.py` (348 ids -- COMMIT IT, it is a frozen table
+like neighbors.py, not build output).
+ruff clean across `scripts/` and `src/forecaster/`. test_archive_run **79/79** (was 43), plus
+test_tool_stamps 5/5, test_tool_fallbacks 5/5, test_geo 29/29, test_worksheet 19/19,
+test_runlog 25/25, test_modeldata 124/124, test_tafstate 40/40, test_results_report 49/49,
+test_score_pending 29/29. Nothing reached the Pi -- it still runs `637c09e`, so every fix
+below is INERT until the owner commits, pushes and pulls.
+
+**THE PI MOVED: it is `192.168.0.31` now, not `.21`.** DHCP reassigned it; hostname is still
+`wx-collector`. `docs/pi_setup_log.md` names the old address throughout and is now wrong.
+A `.21` ssh fails with "No route to host", which reads exactly like the ICMP-blocking note
+already in this file -- it is NOT that. Scan for port 22 before concluding the Pi is dead.
+
+**WHAT IS HEALTHY (verified end to end):** git 0 ahead/0 behind origin; TAF poller covers all
+**71** stations with 258 bulletins in 24 h and the SH 8 all reporting (the round-1 delivery
+gap is CLOSED); model data fresh for gfs/hrrr/nbm/ifsoper at **9,210 credits/pull**, under the
+12,000 cap; `MODEL_DATA_ENABLED=true`; disk 7.1/118 GB; 51 C; load 0.00.
+
+**PRODUCT QC -- I OPENED THE IMAGES, and 10 of 11 product kinds are what they claim.** Correct:
+GOES geocolor/IR at the right sector, WV widened to the synoptic scope, SSA for Patagonia,
+Meteosat EGUN, IEM radar centred on the station with geography, WPC surface analysis, TT samer
+GFS panel naming its run, SLIDER loop frames (7 distinct sha256, overlay working), terrain with
+neighbours labelled, and a full AMD TAF with TX/TN. Meteosat still has no borders and no burned
+time -- the known dead `osmgray` layer, not a new defect.
+
+**FOUR DEFECTS FOUND AND FIXED. Ranked by what they cost.**
+1. **THE SWEEP OVERRUNS THE HOUR, so `flock -n` drops whole cycles.** Measured: 04Z ran to
+   06:14 and killed 05Z and 06Z; 14Z ran to 15:08 and killed 15Z. **3 of the first 12 hours
+   captured nothing, permanently.** The Pi was at load 0.00 the whole time -- the sweep is
+   network-bound and was fetching one item at a time. FIXED: `fetch_all` runs the items through
+   a `ThreadPoolExecutor` (`--workers`, default 6). Kept modest because a rate-limited provider
+   returns FEWER artifacts, not more.
+2. **THE INDEX LOCKED OUT EVERY READER FOR THE WHOLE SWEEP.** DuckDB takes an exclusive FILE
+   lock: while `archive_run.py` held its connection, a second open failed **even with
+   `read_only=True`** ("Could not set lock on file ... Conflicting lock is held", proven on the
+   Pi). One connection wrapped around the fetches meant the index was unreadable 56-66 minutes
+   of every 60. **That is a Phase 3.2 blocker** -- serve-from-archive cannot read the archive
+   while capture runs. FIXED: capture is now three phases, `select` -> `fetch` -> `store`, with
+   the connection opened and closed around the network instead of across it. Two short lock
+   windows per station. Measured cost of the extra opens: **16 ms each, 2.3 s per sweep** --
+   noise. Pinned by `test_lock_released_during_fetch`.
+3. **ONE TRANSIENT BLIP COST A WHOLE STATION-HOUR.** A DNS wobble at 08Z made `plan` raise for
+   **18 stations**, each returning with no items and no manifest row. FIXED: `_with_retry`
+   wraps `plan` and `expand` (the two multi-artifact losses) and `fetch_one` retries in place.
+   `_transient` retries DNS/timeouts/resets/5xx but NOT a 4xx or a ValueError -- 27 of the 29
+   failures that day were `AWC returned no current TAF`, a station between validity periods,
+   and retrying those buys a second identical refusal.
+4. **`.env.bak` WAS NOT GITIGNORED and held a live GRIBSTREAM key.** `.env` alone does not
+   cover its sidecars. FIXED: `.gitignore` now has `.env.*` with `!.env.example`; the file is
+   deleted from the Pi and its working tree is clean.
+
+**THE SECOND REGRESSION PARALLELISM CREATED: THE POOL WAS RUNNING MATPLOTLIB.** `_fetch_sounding`
+is the ONE fetcher that DRAWS rather than downloads -- it calls `charts.skewt`, which goes
+through pyplot, whose figure manager is process-global and not thread-safe. Making fetches
+concurrent put six threads into it at once. MEASURED, by stubbing the render and counting
+depth: **6 threads inside pyplot without the lock, 1 with it.** The realistic failure is not a
+crash, it is two figures interleaving into one -- a skew-T captioned for a different station,
+which is the confident-label-over-wrong-content class this file has already recorded three
+times (the Meteosat loop frames, the widened water-vapour receipt, the EUMETSAT frame labels).
+Fixed with `_RENDER_LOCK` around the one call site; it costs nothing because a sounding is one
+item per station out of ~60. Pinned by `test_render_is_serialized`, and the test was itself
+verified by removing the lock and watching it fail. **`terrain.py` was checked and is clear --
+it is PIL only. Its module docstring still claims `charts.hillshade` draws the relief; that
+function no longer exists, so the docstring is stale (not fixed, cosmetic).**
+**THE GENERAL RULE this leaves behind: before putting an existing call into a thread pool,
+check what it touches, not just how long it takes. `archive_run.py` fetchers are downloads
+except this one, and the exception is invisible from the call site.**
+
+**TWO CONSEQUENCES OF THE THREE-PHASE SPLIT, both deliberate, both worth knowing before the
+next change.** (a) A station's fetched bytes are held IN MEMORY until its store phase, so peak
+use is one station's worth -- the biggest is ~50 items at up to 1.7 MB, tens of MB against the
+Pi's 7.9 GB. Fine, but it scales with `--workers` and with items per station, not with the
+sweep. (b) Blob writes are now BURSTY: nothing lands on disk while a station is fetching, then
+all of it at once. Watching the blob count no longer tracks progress within a station, which
+looks exactly like a stall and fooled me twice in this session.
+
+**THE LONG POLE, FOUND BY PROFILING: `_expand_loop` RE-DOWNLOADED EVERY SECTOR ONCE PER
+STATION.** `imagery.satellite_loop` DOWNLOADS the frames -- `LoopFrame.data` is the image, not
+a promise of one -- and the expand runs per STATION while loop frames key per SECTOR. The dedup
+that makes the rest of the sweep cheap lives in `select`, which runs AFTER the expand has
+already pulled the bytes. So every station after the first in a sector fetched seven frames and
+then counted them "reused". That is what the Pi's "3,148 reused" per sweep really was: **3,146
+of 6,156 keys are loop frames, and nearly every reused one had been downloaded and thrown away.**
+MEASURED on KWRI: an expand is **9-12 s**, the sweep runs **213** of them (71 stations x 3
+products) for only **56** distinct identities -- **~35 minutes of a 56-66 minute sweep spent
+re-fetching bytes already on disk.** FIXED by memoizing the expand on
+(identity, cycle, frames, step_min) -- `_loop_expand_cache`, cleared by
+`reset_loop_expand_cache()`. Meteosat is deliberately NOT collapsed: its identity carries the
+ICAO because its loops are station-CENTERED crops. Pinned by `test_loop_expand_memo`.
+**THE GENERAL LESSON: the expand phase sat OUTSIDE the dedup, so the archive's whole economy --
+71 stations collapsing onto 56 identities -- did not apply to the most expensive product.
+Check that a cost-saving invariant actually covers the phase that spends the money.**
+
+**`station_sites.py` BUILT (2026-07-29) -- the station's own lat/lon is now FROZEN.** Owner
+asked why we fetch a static coordinate at all, and the answer was that every other static
+geography in this repo is committed (neighbors.py, upper_air_sites.py, radarsites.py) except
+the station's OWN position, which `awc.station_latlon` fetched live on every call.
+`scripts/build_station_sites.py` freezes **348 ids** = the 71 archived stations (one batched
+`stationinfo` request) plus the 277 distinct neighbours already carrying lat/lon in
+neighbors.py. Neighbours are IN because the agent passes them --
+`get_hazard_scan(station="KWRI", location="KNEL")` names one -- so a roster-only table would
+still hit the network on exactly those paths. `awc.station_latlon` reads the table first and
+falls back to AWC for an unknown id; `--check` passes; **71 lookups went 103 s -> 0.00 s and
+all 71 frozen positions match live AWC exactly.** EGLL still resolves via the network, ZZZZ
+still raises.
+**THE BIGGER POINT IS THE SEAL, NOT THE TIME: `station_latlon` is called from FIVE places in
+tools.py** (the geographic gates on get_map, get_imagery and the radar cascade), each a LIVE
+network call inside the agent loop. **So this file's earlier claim that `terrain.sample` was
+"the one live call left under an archive-only round" WAS WRONG** -- station_latlon was another,
+in more paths. Terrain pre-warm remains the last one.
+
+**EXPAND PHASE NOW RUNS CONCURRENTLY.** After the memo, expands were the largest remaining
+term -- 56 distinct x ~10 s, strictly serial, because `archive_station` resolved them in a
+plain loop before the fetch pool. They now go through a `ThreadPoolExecutor` of the same size.
+`pool.map` preserves order, so the log and the manifest read exactly as they did serially.
+
+**FULL DUPLICATION AUDIT (2026-07-29), using the rule the loop bug taught: a download inside
+`plan` or `expand` BYPASSES `select`'s dedup; a download behind an Item's `fetch` is protected.**
+Every planner was checked against it.
+- **CLEAN, because their fetches are all inside lambdas:** radar (`nearest_radar` /
+  `radar_region_for_latlon` are pure table+geometry), map (`latest_gfs_run` is pure arithmetic,
+  `charts_for_latlon` a table lookup), satellite, terrain, taf.
+- **`_expand_sounding` WAS duplicating** -- `resolve_source` ran per STATION though the 71
+  share ~50 sites. ~2.1 s each, ~2.5 min a sweep. Fixed by `_resolve_source_memo` on
+  (wmo, cycle). The profile DOWNLOAD was never affected: it hangs off the returned Item's
+  `fetch` under identity `{wmo}/{src}`, which `select` already deduped (87 keys / 50 identities).
+- **TAF was 71 REQUESTS, not duplication.** Each station needs its own bulletin, but
+  `awc.fetch_taf` has always accepted a LIST and `awc._get` spaces calls 1 s apart, so the
+  sweep spent ~71 s sleeping between calls the API would have batched. `prefetch_tafs` now
+  makes one request: **MEASURED 71 stations in 1.1 s, all 71 correctly filed, 0 misfiled.**
+  It files on the ICAO parsed OUT OF THE BULLETIN, never on request order -- one station with
+  no TAF would otherwise shift every later bulletin onto the wrong station. Falls back to
+  per-station on any failure. Bonus: every TAF is now pinned to ONE instant instead of being
+  smeared over the 40 minutes a sweep takes.
+- **TERRAIN IS ALREADY CORRECT and costs nothing** (owner asked). It keys on `STATIC_UTC`
+  (1970-01-01), so `select` finds it after the FIRST sweep ever and never re-fetches: the Pi's
+  archive holds **71 terrain keys, not 71 x sweeps.** The 0.1 s in the profile was a local
+  cache hit. Nothing to fix.
+- **OBS ARE NOT IN THE ARCHIVER AT ALL** -- deliberate, they live in the scoring DB. But
+  `poll_tafs.py:38` has the SAME one-call-per-station shape as the archiver did, 71 calls every
+  5 minutes = ~852/hour where 12 would do. NOT FIXED; the poller is not a bottleneck, but it is
+  the same one-line change.
+
+**FULL KWRI PROFILE (serial, cold, `scratchpad/profile_items.py`).** Fetch 43.6 s over 59
+items, plus 33.2 s of expand. Per group: **map 29 items / 31.2 s / mean 1.07 s** -- that mean IS
+`wxmaps._MIN_REQUEST_INTERVAL_S = 1.0`, so maps are almost pure SLEEP and no number of workers
+can shrink them; sounding 1 / 4.7 s; satellite 3 / 4.5 s; radar 3 / 2.7 s; taf 0.4 s; terrain
+**0.1 s** (so the terrain-tile theory was WRONG -- it is a non-issue). `wxmaps`, `terrain` and
+`awc` each hold a 1 req/s GLOBAL limiter, which is also why a per-group cron split would help:
+those three limiters are per-MODULE, so separate processes get separate budgets instead of
+queueing behind each other. That split needs the short lock windows to be safe.
+
+**TT MAPS: NOT duplicated per station** (they carry a direct `fetch`, so `select` dedups them
+before any download -- 143 identities, 143 fetches a sweep, not 48 x 29). **But they ARE
+duplicated per HOUR: 1,287 keys over 9 sweeps resolve to only 377 distinct blobs**, because GFS
+updates 6-hourly and we re-request hourly. ~150 s of rate-limited sleep a sweep, about two
+thirds of it redundant. The run is already recorded in `served_utc`, so keying on the RUN rather
+than the cycle would remove it. NOT DONE.
+
+**END-TO-END, ALL FIXES IN, laptop, cold: 6 stations / 154 captured / 27.9 MB in 297 s, 0
+failed.** Like-for-like against the pre-fix baseline, which ran the SAME KWRI+ETAR+PHHI cold in
+**519 s** for 3 stations: roughly **3.5x better per station**, and the marginal cost of a
+station whose sector is already done collapsed to almost nothing (KDOV 4 captured / 55 reused,
+KADW 3 / 56). **DO NOT EXTRAPOLATE THIS TO THE PI.** It is different hardware (ARM, SD card),
+the station mix is not representative, and 6 -> 71 is not linear because cost tracks DISTINCT
+IDENTITIES, not station count. The only number that decides whether the hourly cadence holds is
+a real sweep on the Pi after the pull -- take it from `logs/archive_run.log` timestamps, not
+from this line.
+
+**MEASURED, and the honest answer is that PARALLELISM ALONE DOES NOT FIX THE OVERRUN.** Clean
+A/B, one cold station, render lock in place: **KWRI `--workers 6` = 92 s vs `--workers 1` =
+115 s -- 1.25x.** (Reference: 3 cold stations serial = 519 s.) 59 items in 115 s is ~2 s each,
+so six workers should have given far more; it did not, which means the makespan is set by a few
+LONG-POLE ITEMS rather than by the item count. The suspects, none yet measured: `terrain` fetches
+many map tiles SERIALLY inside one item; the sounding does a network fetch plus a matplotlib
+render that now holds `_RENDER_LOCK`; loop frames are enumerated by a serial `expand` before any
+of them can be fetched. **Do not assume the hourly sweep now fits -- PROFILE PER PRODUCT GROUP
+FIRST** (`--include terrain`, `--include sounding`, ... one at a time) and fix the long pole,
+which may be inside `terrain.py` rather than here. Raising `--workers` will not move a makespan
+that one item dominates. Caveat on all laptop numbers: this session hammered these providers
+repeatedly, so some of the time may be their throttling, not our code. The Pi during a real
+cycle is the measurement that counts.
+
+**A REGRESSION I INTRODUCED AND CAUGHT BEFORE IT LANDED, worth remembering because the class
+will recur.** Selecting the whole batch BEFORE fetching removed a guard the serial loop gave
+for free: two items on the same key used to be absorbed because the first wrote the key and the
+rest read it back as reused. Under batch-select they all became outstanding and would have been
+fetched CONCURRENTLY onto one cache path. Not hypothetical -- `all_region_items` emits 65 items
+under 52 identities, and **`conus_east/water_vapor` appears 10 times** because WV widens many
+regions onto one synoptic scope. FIXED by `select_all`, pinned by `test_select_dedup`.
+**The lesson: moving a decision earlier can delete an invariant that nothing states out loud.**
+
+**A DEFECT I REPORTED AND THEN DISPROVED. The skew-T is fine.** I read the archived Fairbanks
+chart as truncating at 400 hPa and blamed `charts.py`'s x-limit. Measuring the actual transform
+killed that: the trace plots to **162 hPa**, and widening the x-limit changes nothing. The real
+cause is upstream and is a CAPTURE-TIMING issue -- the archived 12Z chart says "51 of 1335
+levels" while the same launch re-fetched later gives **70 of 4066**. **The Wyoming BUFR record
+is still filling in when we capture it, and `ON CONFLICT DO NOTHING` freezes the partial version
+forever.** Not fixed, not yet decided -- see the open item below.
+
+**STILL OPEN, and the numbers behind them:**
+- **STORAGE RUNS 2.3x OVER PLAN.** Measured 135-150 MB per sweep = **3.2-3.6 GB/day**, not the
+  1.54 in `docs/artifact_store.md`. A 30-day round needs ~100 GB against 106 GB free. Loop
+  frames are **954 MB of the first 1.40 GB (68%)**. Either cut frames 7 -> 5 (which reopens the
+  hourly gap that 7 was chosen to close) or prune weekly. Decide before the round starts.
+- **SOUNDING CAPTURE IS TOO EARLY** (the item above). Options: capture soundings on a later
+  offset, or allow a re-capture to REPLACE a partial ascent, which contract rule 5 currently
+  forbids. Rule 5 exists so a replay serves what the model saw -- but nothing has been served
+  yet, so the rule is not protecting anything here.
+- The cycle label still drifts from the bytes; shortening the sweep tightens it but does not
+  remove it. `fetched_utc` records the skew and is not yet on the Pi's index (its rows will
+  keep NULL -- the migration is written for exactly that).
 
 ### SESSION 2026-07-28e -- ARCHIVER BUILT (Phase 3.1), item 7 DECIDED
 UNCOMMITTED, now **21 modified + 7 untracked**. NEW: `src/forecaster/artifacts.py`,
@@ -422,16 +639,38 @@ captured without them is gone.
    artifacts, 15.7 -> 13.4 MB) and strictly MORE capable -- a 30-min capture can never answer a
    10-min request, a 10-min capture subsamples to any coarser one. Verified all three providers
    return DISTINCT frames at a 10-minute step.
-3. **`--all-regions`, default OFF.** `get_imagery` takes an explicit `region`, and only **16 of
-   23** regions are reachable from the 71 stations. The 7 unreachable (both full disks,
-   conus_west, puerto_rico, caribbean, middle_east, africa) would have no bytes at all under
-   an archive-only round. ~16 extra stills/hour, ~9% on the round. These get NO manifest row on
-   purpose: `run_manifest` answers "what was this STATION entitled to", and a named far region
-   is outside that, so the serve side resolves it through `artifact_keys` directly.
+3. **`--all-regions`, built then MEASURED AND LEFT OFF -- do not re-litigate without new
+   evidence.** `get_imagery` takes an explicit `region`, and only 16 of 23 satellite regions
+   are reachable from the 71 stations, so the flag captures every region for ~9% more storage.
+   Then the round-1 transcripts were actually read (468 runs under `data/benchmark/runs`, the
+   full 592-run harvest): models pass an explicit `region` in **185 of 364 get_imagery calls
+   (51%), in 27.6% of runs** -- NOT the rare path assumed. But **160 of those 185 are already
+   captured** by the station sweep, because models name regions near their own station, and
+   **the 7 unreachable regions were named ZERO times.** The flag rescues nothing measured.
+   THE REAL GAP IS SOMETHING ELSE, and no capture setting fixes it: **17 calls (9.2%) named a
+   region from the OTHER namespace** -- `kind=radar region=northern_rockies` (10),
+   `radar/pacific_southwest` (4), `satellite/southwest` (2), `satellite/midwest` (1) -- plus 8
+   outright invented names. That is **25 of 185 explicit-region calls (13.5%) spent on an
+   argument the tool rejects**, costing a turn each. It is a TOOL-DESCRIPTION problem
+   (SAT_REGIONS and RADAR_REGIONS are separate enums presented as one `region` field) and a
+   round-2 candidate, not an archiver blocker.
+   The flag stays in the code, defaulted off. Its artifacts get NO manifest row on purpose:
+   `run_manifest` answers "what was this STATION entitled to", and a named far region is
+   outside that, so the serve side resolves it through `artifact_keys` directly.
 
 **DEFERRED (owner, 2026-07-28): terrain pre-warm, to be done with the climo build.**
 `terrain.sample` still does a live elevation fetch, so it is the one live call left under an
 archive-only round. Static, so there is no fidelity risk and no capture deadline.
+
+**FOR PHASE 3.2 -- A MANIFEST ROW CAN EXIST WITH NO ARTIFACT BEHIND IT, BY DESIGN.** `select`
+writes the manifest row BEFORE the fetch is attempted, because `run_manifest` answers "what was
+this station ENTITLED to see" and a provider outage does not change the entitlement. Seen live
+2026-07-29: EUMETSAT 502'd for the 22Z geocolor at ETAR and ETAD, so both have a manifest row
+and no bytes (the failure IS logged -- contract rule 2 held). **The serve side must therefore
+treat manifest -> artifact as a LEFT JOIN and say "captured but the provider failed", not
+assume every row resolves.** Verified in the same run that sharing does NOT cause this: KWRI,
+KDOV and KADW each have the full 59 manifest rows and 21 loop frames despite KDOV and KADW
+being served the memoized expand.
 
 **Next: Phase 3.2**, the serve side, and it is the only piece that touches `tools.py`.
 

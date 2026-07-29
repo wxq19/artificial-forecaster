@@ -2003,6 +2003,7 @@ CREATE TABLE IF NOT EXISTS artifact_keys (
     identity        VARCHAR   NOT NULL,
     requested_utc   TIMESTAMP NOT NULL,
     served_utc      TIMESTAMP,
+    fetched_utc     TIMESTAMP,
     sha256          VARCHAR   NOT NULL,
     source_url      VARCHAR,
     provider        VARCHAR,
@@ -2027,9 +2028,14 @@ def connect_archive(path: str, *, read_only: bool = False) -> duckdb.DuckDBPyCon
 
 
 def init_archive_schema(con: duckdb.DuckDBPyConnection) -> None:
-    """Create the three archive tables if absent. Idempotent."""
+    """Create the three archive tables if absent. Idempotent.
+
+    The ADD COLUMN migrates an index created before `fetched_utc` existed -- the Pi began
+    capturing before it was added, and those rows keep NULL rather than a fabricated time.
+    Same pattern as init_schema/init_runs_schema."""
     for stmt in filter(str.strip, _ARCHIVE_DDL.split(";")):
         con.execute(stmt)
+    con.execute("ALTER TABLE artifact_keys ADD COLUMN IF NOT EXISTS fetched_utc TIMESTAMP")
 
 
 def insert_artifact(con: duckdb.DuckDBPyConnection, *, sha256: str, kind: str, mime: str,
@@ -2053,22 +2059,31 @@ def insert_artifact(con: duckdb.DuckDBPyConnection, *, sha256: str, kind: str, m
 def insert_artifact_key(con: duckdb.DuckDBPyConnection, *, kind: str, identity: str,
                         requested_utc: datetime, sha256: str,
                         served_utc: datetime | None = None,
+                        fetched_utc: datetime | None = None,
                         source_url: str | None = None, provider: str | None = None,
                         note: str | None = None) -> bool:
     """Map one request to one blob. Returns True if a new key row was written.
+
+    THREE times, and they are all different. `requested_utc` is the instant we asked for --
+    for most products the CYCLE label. `served_utc` is what the provider says it returned,
+    NULL when it will not say (GOES STAR serves an unstamped "latest"). `fetched_utc` is our
+    wall clock at the GET, and it exists because a sweep takes 30-40 minutes: an artifact
+    labelled 11:00Z may really have been pulled at 11:38Z, and with STAR's served_utc NULL
+    that skew would otherwise be unrecorded anywhere but burned into the pixels.
 
     ON CONFLICT DO NOTHING upholds contract rule 5: a re-capture at the same key that
     returned DIFFERENT bytes does not overwrite the original. The first capture is what a
     replay must serve, because that is what the model saw."""
     before = con.execute("SELECT count(*) FROM artifact_keys").fetchone()[0]
     con.execute(
-        "INSERT INTO artifact_keys (kind, identity, requested_utc, served_utc, sha256, "
-        "source_url, provider, note) VALUES ($kind, $identity, $requested_utc, "
-        "$served_utc, $sha256, $source_url, $provider, $note) "
+        "INSERT INTO artifact_keys (kind, identity, requested_utc, served_utc, fetched_utc, "
+        "sha256, source_url, provider, note) VALUES ($kind, $identity, $requested_utc, "
+        "$served_utc, $fetched_utc, $sha256, $source_url, $provider, $note) "
         "ON CONFLICT (kind, identity, requested_utc) DO NOTHING",
         {"kind": kind, "identity": identity,
          "requested_utc": _to_naive_utc(requested_utc),
          "served_utc": _to_naive_utc(served_utc) if served_utc else None,
+         "fetched_utc": _to_naive_utc(fetched_utc) if fetched_utc else None,
          "sha256": sha256, "source_url": source_url, "provider": provider, "note": note},
     )
     return con.execute("SELECT count(*) FROM artifact_keys").fetchone()[0] > before

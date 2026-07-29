@@ -1,4 +1,10 @@
 .env
+# Every sidecar of it too. `.env` alone does NOT cover `.env.bak`, and an editor backup or a
+# hand-made copy holds exactly the same keys: a real `.env.bak` with a live GRIBSTREAM key sat
+# untracked on the Pi on 2026-07-29, one `git add -A` away from being committed.
+# `.env.example` is the deliberate exception -- it is the committed template, blank by rule.
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.pyc

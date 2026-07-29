@@ -16,8 +16,10 @@ is a hole nobody notices until a replay is short an image.
 
 import sys
 import tempfile
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -116,6 +118,17 @@ def test_index(db: str) -> None:
     stats = store.archive_stats(con)
     check("index: dedup counts keys per blob", (stats["blobs"], stats["keys"]), (1, 1))
 
+    # THREE distinct times per row. fetched_utc is our wall clock at the GET and exists
+    # because a sweep runs 30-40 min: an artifact labelled 11:00Z may be pulled at 11:38Z,
+    # and GOES STAR's served_utc is NULL by design, so nothing else records that skew.
+    store.insert_artifact_key(con, kind="satellite", identity="northeast/geocolor",
+                              requested_utc=t, sha256="a" * 64, provider="goes_star",
+                              fetched_utc=datetime(2026, 7, 29, 1, 38))
+    row = store.artifact_key(con, "satellite", "northeast/geocolor", t)
+    check("index: fetched_utc records the real GET time, apart from the cycle label",
+          (row["requested_utc"], row["fetched_utc"], row["served_utc"]),
+          (t, datetime(2026, 7, 29, 1, 38), None))
+
     # Serve-time snapping: a loop cadence that was never captured on that exact grid.
     for m in (0, 20, 40):
         store.insert_artifact_key(con, kind="loop_frame", identity="northeast/geocolor",
@@ -208,6 +221,42 @@ def test_planner() -> None:
 
 # --- 4. capture bookkeeping (stubbed fetchers) -----------------------------------------
 
+def _capture(con, item, res, *, root, refresh: bool = False) -> None:
+    """The real three-phase sequence, in one call. Mirrors archive_station so these checks
+    stay honest about the order select -> fetch -> store actually runs in."""
+    for got in ar.fetch_all(ar.select_all(con, [item], res, refresh=refresh), workers=1):
+        ar.store_one(con, got, res, root=root)
+
+
+def test_select_dedup(root: Path, db: str) -> None:
+    """Two items on one key must be fetched ONCE.
+
+    The serial loop got this free -- the first capture wrote the key and the rest read it back
+    as reused. Selecting the whole batch before any fetch removes that guard, so the dedup has
+    to be explicit or `--all-regions` (where many regions widen onto one water-vapour scope)
+    would fetch the same image several times at once, racing on one cache path."""
+    con = store.connect_archive(db)
+    store.init_archive_schema(con)
+    calls = {"n": 0}
+
+    def fetch():
+        calls["n"] += 1
+        return b"wv-bytes", "http://x", None, None
+
+    dupes = [ar.Item(kind="satellite", identity="conus_east/water_vapor", requested_utc=CYCLE,
+                     provider="goes_star", fetch=fetch) for _ in range(4)]
+    res = ar.Result()
+    todo = ar.select_all(con, dupes, res, refresh=False)
+    check("select: four items on one key select once", len(todo), 1)
+    check("select: the other three count as reused, not dropped", res.reused, 3)
+    check("select: all four still reach the manifest", len(res.manifest), 4)
+    for got in ar.fetch_all(todo, workers=4):
+        ar.store_one(con, got, res, root=root)
+    check("select: the provider is hit exactly once", calls["n"], 1)
+    check("select: one key, one capture", (res.captured, res.deduped), (1, 0))
+    con.close()
+
+
 def test_capture(root: Path, db: str) -> None:
     con = store.connect_archive(db)
     store.init_archive_schema(con)
@@ -218,26 +267,204 @@ def test_capture(root: Path, db: str) -> None:
         return ar.Item(kind="satellite", identity=identity, requested_utc=CYCLE,
                        provider="goes_star", fetch=lambda: (data, "http://x", None, None))
 
-    ar.capture(con, item("a/geocolor", shared), res, root=root, refresh=False)
-    ar.capture(con, item("b/geocolor", shared), res, root=root, refresh=False)
-    ar.capture(con, item("a/geocolor", shared), res, root=root, refresh=False)
+    _capture(con, item("a/geocolor", shared), res, root=root)
+    _capture(con, item("b/geocolor", shared), res, root=root)
+    _capture(con, item("a/geocolor", shared), res, root=root)
     check("capture: two identities, one blob -> the second is deduped",
           (res.captured, res.deduped, res.reused), (2, 1, 1))
     check("capture: every item reaches the manifest even when reused",
           len(res.manifest), 3)
 
     bad = ar.Item(kind="map", identity="boom", requested_utc=CYCLE, provider="tt",
-                  fetch=lambda: (_ for _ in ()).throw(OSError("provider 500")))
-    ar.capture(con, bad, res, root=root, refresh=False)
+                  fetch=lambda: (_ for _ in ()).throw(ValueError("no such panel")))
+    _capture(con, bad, res, root=root)
     check("capture: a dead product is recorded, not raised", len(res.failed), 1)
 
     empty = ar.Item(kind="map", identity="empty", requested_utc=CYCLE, provider="tt",
                     fetch=lambda: (b"", "http://x", None, None))
-    ar.capture(con, empty, res, root=root, refresh=False)
+    _capture(con, empty, res, root=root)
     check("capture: zero bytes is a failure, not a capture (rule 2)", len(res.failed), 2)
     check("capture: a failed item writes no key",
           store.artifact_key(con, "map", "boom", CYCLE), None)
+
+    # fetched_utc is stamped around the GET, not at the top of the sweep. It is the only record
+    # of cycle-label drift for GOES STAR, whose served_utc is NULL by design.
+    row = con.execute("SELECT served_utc, fetched_utc FROM artifact_keys "
+                      "WHERE identity = 'a/geocolor'").fetchone()
+    check("capture: fetched_utc is recorded even when served_utc is NULL",
+          (row[0] is None, row[1] is not None), (True, True))
     con.close()
+
+
+# --- 3b. the loop expand must not re-download per station -------------------------------
+
+def test_loop_expand_memo() -> None:
+    """The expand DOWNLOADS the frames, and it runs per STATION while the frames key per
+    SECTOR. `select`'s dedup cannot save it -- that runs after the bytes are already pulled.
+    Measured before the memo: 213 expands a sweep for 56 distinct identities, ~35 min of a
+    56-66 min sweep spent re-fetching frames the archive already held."""
+    import forecaster.imagery as I
+
+    calls = {"n": 0}
+
+    class _F:
+        def __init__(self, t):
+            self.time, self.label, self.url, self.data = t, "l", "http://x", b"frame"
+
+    def fake_loop(lat, lon, product, *, frames, step_min, at):
+        calls["n"] += 1
+        return ([_F(CYCLE - timedelta(minutes=step_min * i)) for i in range(frames)],
+                "src", "cov")
+
+    real = I.satellite_loop
+    I.satellite_loop = fake_loop
+    ar.reset_loop_expand_cache()
+    try:
+        # Three CONUS stations in one sector: same identity, so ONE download between them.
+        for _ in range(3):
+            got = ar._expand_loop("northeast/geocolor", "geocolor", "goes_star",
+                                  40.0, -74.6, CYCLE, 7, 10)
+        check("loop memo: one sector expand serves every station in it", calls["n"], 1)
+        check("loop memo: the cached expand still yields every frame", len(got), 7)
+
+        # Meteosat identities carry the ICAO because its loops are station-CENTERED crops,
+        # so they must STILL fetch per station.
+        for icao in ("ETAR", "ETAD", "EGUN"):
+            ar._expand_loop(f"meteosat_point/{icao}/geocolor", "geocolor",
+                            "meteosat_eumetsat_wms", 49.4, 7.6, CYCLE, 7, 10)
+        check("loop memo: station-centred Meteosat loops are NOT collapsed", calls["n"], 4)
+
+        # A different cadence is a different product and must not be served from the memo.
+        ar._expand_loop("northeast/geocolor", "geocolor", "goes_star",
+                        40.0, -74.6, CYCLE, 10, 30)
+        check("loop memo: a different (frames, step) re-expands", calls["n"], 5)
+    finally:
+        I.satellite_loop = real
+        ar.reset_loop_expand_cache()
+
+
+# --- 4a. rendering must not run concurrently --------------------------------------------
+
+def test_render_is_serialized() -> None:
+    """charts.py is pyplot, and pyplot's figure manager is process-global.
+
+    `_fetch_sounding` is the one fetcher that DRAWS instead of downloading, so once fetches
+    became concurrent it became the one that can corrupt state. Two threads inside pyplot can
+    interleave into a single figure, which would hand a replay a skew-T captioned for another
+    station -- the confident-label-over-wrong-content failure this project keeps meeting."""
+    import threading
+
+    depth = {"now": 0, "max": 0}
+    guard = threading.Lock()
+
+    def fake_skewt(_profile):
+        with guard:
+            depth["now"] += 1
+            depth["max"] = max(depth["max"], depth["now"])
+        time.sleep(0.05)                       # long enough for a real overlap to show
+        with guard:
+            depth["now"] -= 1
+        return b"\x89PNG\r\n\x1a\nskewt"
+
+    class _Prof:
+        url = "http://sounding"
+
+    real_skewt, real_profile = ar.charts.skewt, ar.soundings.fetch_profile
+    ar.charts.skewt = fake_skewt
+    ar.soundings.fetch_profile = lambda *a, **k: _Prof()
+    try:
+        items = [ar.Item(kind="sounding", identity=f"7250{i}/bufr", requested_utc=CYCLE,
+                         provider="wyoming",
+                         fetch=lambda w=f"7250{i}": ar._fetch_sounding(w, CYCLE))
+                 for i in range(6)]
+        ar.fetch_all(items, workers=6)
+        check("render: never two threads inside pyplot at once", depth["max"], 1)
+    finally:
+        ar.charts.skewt, ar.soundings.fetch_profile = real_skewt, real_profile
+
+
+# --- 4b. retry: a transient blip must not cost the artifact -----------------------------
+
+def test_retry(root: Path, db: str) -> None:
+    """The 2026-07-29 08Z sweep lost 18 stations to one DNS blip. A retry is the difference
+    between a hiccup and an hour of data that never comes back."""
+    con = store.connect_archive(db)
+    store.init_archive_schema(con)
+    delay = ar.RETRY_DELAY_S
+    ar.RETRY_DELAY_S = 0.0                      # the pause is real; waiting for it in a test is not
+    try:
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("[Errno -3] Temporary failure in name resolution")
+            return b"recovered-bytes", "http://x", None, None
+
+        res = ar.Result()
+        _capture(con, ar.Item(kind="radar", identity="station/KDYS", requested_utc=CYCLE,
+                              provider="iem", fetch=flaky), res, root=root)
+        check("retry: a DNS blip is retried and the artifact survives",
+              (calls["n"], res.captured, len(res.failed)), (2, 1, 0))
+
+        # A 4xx and a ValueError are the provider saying the product is ABSENT. Retrying spends
+        # a request to be told the same thing -- 27 of 29 failures that day were exactly this.
+        check("retry: a 404 is not transient", ar._transient(HTTPError("u", 404, "x", None, None)),
+              False)
+        check("retry: a 503 is transient", ar._transient(HTTPError("u", 503, "x", None, None)),
+              True)
+        check("retry: 'no current TAF' is not transient", ar._transient(ValueError("no TAF")),
+              False)
+
+        seen = {"n": 0}
+
+        def dead():
+            seen["n"] += 1
+            raise ValueError("AWC returned no current TAF for KVBG")
+
+        res2 = ar.Result()
+        _capture(con, ar.Item(kind="taf", identity="KVBG", requested_utc=CYCLE,
+                              provider="awc", fetch=dead), res2, root=root)
+        check("retry: an absent product is attempted exactly once",
+              (seen["n"], len(res2.failed)), (1, 1))
+    finally:
+        ar.RETRY_DELAY_S = delay
+        con.close()
+
+
+# --- 4c. the index lock is released around the fetches ----------------------------------
+
+def test_lock_released_during_fetch(root: Path, db: str) -> None:
+    """DuckDB takes an EXCLUSIVE file lock -- while it is held, nothing else can open the
+    index, not even read_only=True (verified on the Pi, 2026-07-29). A connection wrapped
+    around the fetches therefore locks out the serve side for the whole sweep. This asserts
+    the index is openable at the moment a fetch runs, which is the property that lets capture
+    and replay coexist."""
+    con = store.connect_archive(db)
+    store.init_archive_schema(con)
+    con.close()
+
+    opened: list[bool] = []
+
+    def probe():
+        try:
+            other = store.connect_archive(db, read_only=True)
+            other.close()
+            opened.append(True)
+        except Exception:  # noqa: BLE001
+            opened.append(False)
+        return b"bytes", "http://x", None, None
+
+    res = ar.Result()
+    got = ar.fetch_all([ar.Item(kind="map", identity="probe", requested_utc=CYCLE,
+                                provider="tt", fetch=probe)], workers=2)
+    check("lock: the index is readable while a fetch is in flight", opened, [True])
+    con = store.connect_archive(db)
+    try:
+        ar.store_one(con, got[0], res, root=root)
+    finally:
+        con.close()
+    check("lock: the fetched item still indexes after the lock is retaken", res.captured, 1)
 
 
 # --- 5. sounding feed fallback + loop cadence + region coverage -------------------------
@@ -310,6 +537,48 @@ def test_all_regions() -> None:
           all(i.split("/")[0] in I.SAT_REGIONS for i in ids), True)
 
 
+def test_migration(db: str) -> None:
+    """An index created BEFORE fetched_utc existed must upgrade in place, keeping its rows.
+
+    Not hypothetical: the Pi started capturing at 04:19Z on 2026-07-28 and the column landed
+    after. Simulated by creating the old shape by hand, then running init_archive_schema."""
+    import duckdb
+    con = duckdb.connect(db)
+    con.execute("CREATE TABLE artifacts (sha256 VARCHAR PRIMARY KEY, kind VARCHAR, "
+                "mime VARCHAR, n_bytes BIGINT, first_seen_utc TIMESTAMP)")
+    con.execute("CREATE TABLE artifact_keys (kind VARCHAR, identity VARCHAR, "
+                "requested_utc TIMESTAMP, served_utc TIMESTAMP, sha256 VARCHAR, "
+                "source_url VARCHAR, provider VARCHAR, note VARCHAR, "
+                "PRIMARY KEY (kind, identity, requested_utc))")
+    con.execute("CREATE TABLE run_manifest (station VARCHAR, cycle_utc TIMESTAMP, "
+                "kind VARCHAR, identity VARCHAR, requested_utc TIMESTAMP, "
+                "PRIMARY KEY (station, cycle_utc, kind, identity, requested_utc))")
+    sha = "c" * 64
+    con.execute("INSERT INTO artifacts VALUES (?, 'satellite', 'image/png', 5, now())", [sha])
+    con.execute("INSERT INTO artifact_keys VALUES ('satellite', 'old/geocolor', "
+                "'2026-07-29 04:00:00', NULL, ?, NULL, 'goes_star', NULL)", [sha])
+
+    store.init_archive_schema(con)                        # the migration under test
+
+    check("migration: the pre-existing row survives",
+          con.execute("SELECT count(*) FROM artifact_keys").fetchone()[0], 1)
+    check("migration: the old row's fetched_utc is NULL, not fabricated",
+          store.artifact_key(con, "satellite", "old/geocolor",
+                             datetime(2026, 7, 29, 4))["fetched_utc"], None)
+    store.insert_artifact_key(con, kind="satellite", identity="new/geocolor",
+                              requested_utc=datetime(2026, 7, 29, 5), sha256="c" * 64,
+                              provider="goes_star",
+                              fetched_utc=datetime(2026, 7, 29, 5, 33))
+    check("migration: new rows record fetched_utc after the upgrade",
+          store.artifact_key(con, "satellite", "new/geocolor",
+                             datetime(2026, 7, 29, 5))["fetched_utc"],
+          datetime(2026, 7, 29, 5, 33))
+    store.init_archive_schema(con)                        # twice is a no-op
+    check("migration: re-running the migration is a no-op",
+          con.execute("SELECT count(*) FROM artifact_keys").fetchone()[0], 2)
+    con.close()
+
+
 def _load():
     """Import the script under test by path -- scripts/ is not a package."""
     import importlib.util
@@ -328,10 +597,16 @@ def main() -> int:
         test_blobs(root)
         test_index(db)
         test_planner()
+        test_loop_expand_memo()
+        test_render_is_serialized()
         test_capture(root, str(root / "capture.duckdb"))
+        test_select_dedup(root, str(root / "dedup.duckdb"))
+        test_retry(root, str(root / "retry.duckdb"))
+        test_lock_released_during_fetch(root, str(root / "lock.duckdb"))
         test_sounding_feeds()
         test_loop_cadence()
         test_all_regions()
+        test_migration(str(root / "legacy.duckdb"))
     print(f"\n{PASS}/{PASS + FAIL} passed.")
     return 1 if FAIL else 0
 

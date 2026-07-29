@@ -24,6 +24,15 @@ from functools import lru_cache
 
 from forecaster import store
 from forecaster.metar import MetarObs, parse
+
+try:
+    from forecaster import station_sites
+except ImportError:                                # pragma: no cover -- bootstrap only
+    # station_sites.py is GENERATED (scripts/build_station_sites.py). A hard import would make
+    # this module -- and therefore tools.py, and therefore the whole agent -- fail to import
+    # whenever the table is absent, including inside the generator that has to import awc to
+    # BUILD it. Degrade to the live lookup instead: slower, never broken.
+    station_sites = None
 from forecaster.tafarchive import build_taf_row
 
 _AWC_URL = "https://aviationweather.gov/api/data/{product}"
@@ -105,8 +114,21 @@ def station_latlon(station: str) -> tuple[float, float]:
     tools.py (get_map, get_imagery, radar) call this on EVERY invocation. Uncached it added a
     throttled round trip -- 1 s minimum, up to ~18 s through the 5xx retry ladder -- to the
     most-used tool in the loop, against a 30-min per-cell timeout that already killed 121
-    round-1 cells. A raised ValueError is not cached, so an unknown id is re-tried."""
+    round-1 cells. A raised ValueError is not cached, so an unknown id is re-tried.
+
+    READS THE FROZEN TABLE FIRST. `station_sites.py` holds the 71 archived stations plus every
+    neighbour, and a position does not change, so for those ids this never touches the network.
+    That is worth ~103 s on a 71-station archive sweep (measured 1.44 s per throttled cold
+    lookup), but the real reason is the seal: round 2 serves tools ONLY from the archive, and
+    this function is a LIVE call inside five tools.py paths -- the geographic gates on get_map,
+    get_imagery and the radar cascade. An id outside the table still falls through to AWC, so
+    an off-roster airfield the model invents is answered honestly rather than refused.
+
+    Yes, the live-client seam is answering some queries from a frozen table. That is deliberate:
+    the alternative is editing ten call sites, and this file still owns the network fallback."""
     icao = station.upper()
+    if station_sites is not None and (hit := station_sites.latlon(icao)) is not None:
+        return hit
     for r in _get("stationinfo", {"ids": icao, "format": "json"}) or []:
         lat, lon = r.get("lat"), r.get("lon")
         if lat is not None and lon is not None:

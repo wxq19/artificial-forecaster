@@ -29,9 +29,14 @@ addresses; changing one orphans every artifact already captured under it.
 
 import argparse
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.client import HTTPException
 from typing import Callable
+from urllib.error import HTTPError
 
 from forecaster import (
     artifacts,
@@ -76,6 +81,28 @@ DEFAULT_FHRS = (0, 6, 12, 24, 36)
 DEFAULT_LOOP_FRAMES = 7
 DEFAULT_LOOP_STEP_MIN = 10
 
+# Fetch concurrency. The sweep is network-bound, not CPU-bound: measured 2026-07-29 on the Pi,
+# a serial sweep ran 56-66 MINUTES at load 0.00, which is long enough that `flock -n` skipped
+# the next hour outright (04Z ran to 06:14 and killed 05Z and 06Z; 14Z ran to 15:08 and killed
+# 15Z). A missed hour cannot be re-fetched, so sweep duration is a DATA-LOSS term, not a
+# comfort one. It is also what makes the cycle label drift from the bytes: at 14:02 the first
+# station got a 13:56Z image and the last got 14:40Z, so shortening the sweep tightens the
+# label. Kept modest because these are shared public endpoints (NOAA STAR, IEM radmap.php,
+# EUMETSAT WMS) and a rate-limited provider returns FEWER artifacts, not more.
+DEFAULT_WORKERS = 6
+
+# One retry, then give up. A `plan` or `expand` failure is not one lost picture -- it loses the
+# whole station or the whole loop for an hour that never comes back: the 2026-07-29 08Z sweep
+# hit a DNS blip and 18 stations recorded NOTHING. The delay is deliberately longer than a DNS
+# timeout so the second attempt is not simply the first one again.
+RETRY_ATTEMPTS = 2
+RETRY_DELAY_S = 4.0
+
+# Held around every call into charts.py. Everything else a fetcher does is a download, which
+# threads fine; drawing does not, because pyplot's figure manager is process-global state.
+# See _fetch_sounding for what a race here would actually produce.
+_RENDER_LOCK = threading.Lock()
+
 
 @dataclass
 class Item:
@@ -90,6 +117,48 @@ class Item:
     # Loop frames are enumerated only by fetching the provider's index, so one Item can
     # expand into many. `expand` returns Items in place of this one.
     expand: Callable[[], list["Item"]] | None = None
+
+
+@dataclass
+class Fetched:
+    """One item's fetch outcome, carried from the PARALLEL phase into the SERIAL write.
+
+    This type exists so the network never runs while the index lock is held -- see
+    `archive_station`. `error` set means the item is lost for this cycle; every other field
+    is then meaningless."""
+
+    item: "Item"
+    fetched_utc: datetime | None = None
+    data: bytes | None = None
+    url: str | None = None
+    served: datetime | None = None
+    note: str | None = None
+    error: str | None = None
+
+
+def _transient(exc: BaseException) -> bool:
+    """Is this failure worth one more attempt?
+
+    YES for a dropped network: DNS, timeouts, resets, 5xx. Those are what cleared on their own
+    in the 08Z sweep. NO for a 4xx or a ValueError -- those are the provider telling us the
+    product is not there, and 27 of the 29 failures that day were `AWC returned no current TAF`,
+    a station between validity periods. Retrying those spends a request to be told the same
+    thing, and on a sweep this size that cost is real."""
+    if isinstance(exc, HTTPError):
+        return exc.code >= 500
+    return isinstance(exc, (OSError, HTTPException))     # URLError/socket errors subclass OSError
+
+
+def _with_retry(fn: Callable):
+    """Run `fn`, once more after a pause if it failed for a transient reason."""
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 -- classified by _transient, then re-raised
+            if attempt == RETRY_ATTEMPTS - 1 or not _transient(e):
+                raise
+            time.sleep(RETRY_DELAY_S)
+    raise AssertionError("unreachable")
 
 
 @dataclass
@@ -177,7 +246,12 @@ def all_region_items(cycle: datetime) -> list[Item]:
 
 def _fetch_satellite(region: str, product: str):
     data, url = imagery.fetch_satellite(region, product)
-    return data, url, None, None                   # STAR/SLIDER served time is not returned
+    # SLIDER names the exact scan in the tile path, so its stills get a true served_utc.
+    # GOES STAR and OSPO serve a fixed "latest" path with no time in it at all -- those stay
+    # NULL and are bounded by fetched_utc, which is the honest record. Do NOT guess their
+    # scan time from a frame index: "newest indexed" is not provably the same image the
+    # latest.jpg returned, and a confident wrong timestamp is worse than an absent one.
+    return data, url, imagery.slider_time_from_url(url), None
 
 
 def _fetch_meteosat_point(lat: float, lon: float, product: str, cycle: datetime):
@@ -214,15 +288,59 @@ def _loop_items(icao: str, lat: float, lon: float, cycle: datetime, *, frames: i
     return out
 
 
+_loop_expand_cache: dict[tuple, list["Item"]] = {}
+_loop_expand_lock = threading.Lock()
+
+
 def _expand_loop(identity: str, product: str, provider: str, lat: float, lon: float,
                  cycle: datetime, frames: int, step_min: int) -> list[Item]:
+    # MEMOIZED PER SWEEP, and this is the single biggest cost in the job.
+    #
+    # `satellite_loop` DOWNLOADS every frame's bytes -- `f.data` below is the image, not a
+    # promise of one. But loop frames key on the SECTOR (`{region}/{product}`), which the 71
+    # stations collapse onto just 56 identities, and this runs once per STATION. The dedup that
+    # makes the rest of the sweep cheap lives in `select`, which cannot help here because it
+    # only runs AFTER the expand has already pulled the bytes. So every station after the first
+    # in a sector re-downloaded seven frames and then counted them "reused" -- 3,148 reused
+    # keys a sweep, nearly all loop frames, every one fetched and discarded.
+    #
+    # Measured: an expand is 9-12 s, 213 of them run per sweep, and only 56 are distinct --
+    # roughly 35 minutes of a 56-66 minute sweep spent re-fetching bytes we already had. That
+    # is what was pushing sweeps past the hour and making `flock -n` drop whole cycles.
+    #
+    # Keyed on identity + cycle + cadence, so Meteosat (whose identity carries the ICAO because
+    # its loops are station-CENTERED crops) still fetches per station, exactly as it must.
+    key = (identity, cycle, frames, step_min)
+    with _loop_expand_lock:
+        if (hit := _loop_expand_cache.get(key)) is not None:
+            return hit
     fr, _source, _coverage = imagery.satellite_loop(
         lat, lon, product, frames=frames, step_min=step_min, at=cycle)
     # `f.data` is what the model saw -- for SLIDER that is the tile with the map layers
     # already composited, which is NOT what re-fetching f.url returns. Store the bytes.
-    return [Item(kind="loop_frame", identity=identity, requested_utc=f.time,
-                 provider=provider, fetch=lambda fr=f: (fr.data, fr.url, fr.time, None))
-            for f in fr]
+    out = [Item(kind="loop_frame", identity=identity, requested_utc=f.time,
+                provider=provider, fetch=lambda fr=f: (fr.data, fr.url, fr.time, None))
+           for f in fr]
+    with _loop_expand_lock:
+        _loop_expand_cache[key] = out
+    return out
+
+
+def reset_loop_expand_cache() -> None:
+    """Drop every per-sweep memo. One sweep is one process today, so this is for tests and for
+    any caller that runs two cycles in one process.
+
+    ALL THREE are cleared together because they do NOT fail the same way. The loop and
+    resolve-source memos key on the cycle, so a second cycle simply misses and re-fetches --
+    the only cost is unbounded growth. `_taf_batch` keys on ICAO ALONE, so a second cycle in
+    the same process would be served the FIRST cycle's bulletins. Nothing does that today;
+    this is what stops it becoming true quietly."""
+    with _loop_expand_lock:
+        _loop_expand_cache.clear()
+    with _resolve_source_lock:
+        _resolve_source_cache.clear()
+    with _taf_batch_lock:
+        _taf_batch.clear()
 
 
 def _radar_items(icao: str, lat: float, lon: float, cycle: datetime) -> list[Item]:
@@ -307,10 +425,32 @@ def _sounding_items(icao: str, cycle: datetime) -> list[Item]:
                  provider="wyoming", expand=lambda: _expand_sounding(icao, cycle))]
 
 
+_resolve_source_cache: dict[tuple, tuple | None] = {}
+_resolve_source_lock = threading.Lock()
+
+
+def _resolve_source_memo(wmo: str, cycle: datetime):
+    """`soundings.resolve_source`, asked once per (site, cycle) instead of once per station.
+
+    Same shape as the loop-expand problem, one order of magnitude smaller. The 71 stations
+    share only ~50 radiosonde sites, and several CONUS fields resolve to the same one, so the
+    inventory lookup was repeated for sites already resolved this sweep. Measured ~2.1 s per
+    station, so ~2.5 min a sweep. The PROFILE download is not affected -- that hangs off the
+    returned Item's `fetch`, whose identity is `{wmo}/{src}`, so `select` already deduped it."""
+    key = (wmo, cycle)
+    with _resolve_source_lock:
+        if key in _resolve_source_cache:
+            return _resolve_source_cache[key]
+    got = soundings.resolve_source(wmo, cycle)
+    with _resolve_source_lock:
+        _resolve_source_cache[key] = got
+    return got
+
+
 def _expand_sounding(icao: str, cycle: datetime) -> list[Item]:
     for wmo, name, dist, brg, _la, _lo in upper_air_sites.sites_for(icao):
         try:
-            got = soundings.resolve_source(wmo, cycle)
+            got = _resolve_source_memo(wmo, cycle)
         except Exception:  # noqa: BLE001 -- a dead inventory: try the next site out
             continue
         if got is None:
@@ -331,7 +471,18 @@ def _fetch_sounding(wmo: str, launched: datetime, src: str = "BUFR"):
     prof = soundings.fetch_profile(wmo, launched, src=src)
     # No `title=` kwarg: charts.skewt reads `profile.title`, which ObsProfile supplies, so an
     # observed ascent is not captioned "forecast". Same call `_sounding_bufr` makes.
-    return charts.skewt(prof), prof.url, launched, None
+    #
+    # RENDERED UNDER A LOCK, and this is not optional. charts.skewt goes through pyplot, whose
+    # figure manager is GLOBAL and not thread-safe -- and since the fetches became concurrent,
+    # this is the one fetcher in the archiver that draws rather than downloads. Two threads in
+    # pyplot at once can interleave into one figure, which would hand a replay a skew-T whose
+    # caption belongs to a different station. That is the confident-label-over-wrong-content
+    # class this file has already been bitten by three times (the Meteosat loop, the widened
+    # water-vapour receipt, the EUMETSAT frame labels). The lock costs nothing: soundings are
+    # ONE item per station out of ~60, so nothing meaningful ever waits on it.
+    with _RENDER_LOCK:
+        png = charts.skewt(prof)
+    return png, prof.url, launched, None
 
 
 def _static_items(icao: str, lat: float, lon: float) -> list[Item]:
@@ -352,8 +503,46 @@ def _taf_items(icao: str, cycle: datetime) -> list[Item]:
                  fetch=lambda: _fetch_taf(icao))]
 
 
+_taf_batch: dict[str, list] = {}
+_taf_batch_lock = threading.Lock()
+
+
+def prefetch_tafs(icaos: list[str]) -> None:
+    """Pull every station's current TAF in ONE request.
+
+    NOT a dedup -- 71 stations need 71 different bulletins. It is 71 REQUESTS collapsing to
+    one, and `awc._get` spaces requests 1 s apart, so the old way spent ~71 s a sweep sleeping
+    between calls that the API was always willing to batch (`fetch_taf` has taken a list since
+    it was written).
+
+    It also makes the capture MORE honest: every station's TAF now comes from a single instant
+    instead of being smeared across the 40 minutes a sweep takes, which is the same cycle-label
+    drift that `fetched_utc` exists to record."""
+    if not icaos:
+        return
+    got = awc.fetch_taf(list(icaos))
+    batch: dict[str, list] = {}
+    for issue, raw in got:
+        # The bulletin names its own station; trusting the request order would mis-file every
+        # TAF after the first station that had none.
+        parts = raw.split()
+        ident = next((p for p in parts[:3] if len(p) == 4 and p.isalpha()), None)
+        if ident:
+            batch.setdefault(ident.upper(), []).append((issue, raw))
+    with _taf_batch_lock:
+        _taf_batch.clear()
+        _taf_batch.update(batch)
+
+
 def _fetch_taf(icao: str):
-    got = awc.fetch_taf(icao)
+    with _taf_batch_lock:
+        got = _taf_batch.get(icao.upper())
+    if got is None:
+        # Covers BOTH "no batch ran" and "the batch had nothing for this station". The second
+        # costs one redundant request per TAF-less station (1-5 a sweep) to be told the same
+        # thing -- kept deliberately, because it also means a partially-successful batch
+        # degrades to the old per-station behaviour instead of inventing a missing bulletin.
+        got = awc.fetch_taf(icao)
     if not got:
         raise ValueError(f"AWC returned no current TAF for {icao}")
     issue, raw = got[0]
@@ -386,8 +575,17 @@ def plan(icao: str, cycle: datetime, *, fhrs: tuple[int, ...], loop_frames: int,
 # Capture
 # ---------------------------------------------------------------------------
 
-def capture(con, item: Item, res: Result, *, root, refresh: bool) -> None:
-    """Fetch one item unless the archive already holds it, then index it.
+# Capture runs in three phases, and the split is the whole point: SELECT and STORE touch the
+# index, FETCH touches the network, and they must never overlap. DuckDB takes an exclusive file
+# lock, so for as long as a connection is open NOTHING else can read the index -- not another
+# writer, not even `read_only=True` (verified on the Pi, 2026-07-29: "Could not set lock on
+# file ... Conflicting lock is held"). A single connection wrapped around the fetches held that
+# lock for 56-66 of every 60 minutes, which leaves no window for the serve side to read the
+# archive it is meant to serve from. Keeping the network outside the lock is what makes capture
+# and replay able to coexist.
+
+def select(con, item: Item, res: Result, *, refresh: bool) -> bool:
+    """Record the manifest row; say whether this item still needs fetching.
 
     The skip is what makes an hourly sweep affordable: the 22 stations issuing at 11Z share
     one CONUS water-vapour image and one GFS panel set, so the first station pays and the
@@ -395,27 +593,75 @@ def capture(con, item: Item, res: Result, *, root, refresh: bool) -> None:
     res.manifest.append((item.kind, item.identity, item.requested_utc))
     if item.fetch is None:
         res.skipped.append(f"{item.kind} {item.identity} ({item.note or 'no fetcher'})")
-        return
+        return False
     if not refresh and store.artifact_key(con, item.kind, item.identity,
                                           item.requested_utc) is not None:
         res.reused += 1
+        return False
+    return True
+
+
+def select_all(con, items: list[Item], res: Result, *, refresh: bool) -> list[Item]:
+    """Every item that still needs fetching, each one ONCE.
+
+    The in-batch dedup is load-bearing now that fetching is parallel. Two items can resolve to
+    the same key -- `all_region_items` is full of them, because water vapour widens many
+    regions onto one synoptic scope -- and the old serial loop absorbed that for free: the
+    first fetched, and the rest saw the key in the index and counted as reused. Selecting the
+    whole batch BEFORE any fetch removes that guard, so without this the duplicates would be
+    fetched concurrently, race on one cache path, and inflate the captured count."""
+    seen: set[tuple[str, str, datetime]] = set()
+    todo: list[Item] = []
+    for item in items:
+        if not select(con, item, res, refresh=refresh):
+            continue
+        if (key := (item.kind, item.identity, item.requested_utc)) in seen:
+            res.reused += 1                        # same key, already in this batch
+            continue
+        seen.add(key)
+        todo.append(item)
+    return todo
+
+
+def fetch_one(item: Item) -> Fetched:
+    """Fetch one item. Pure network and no DB handle, so this is what the thread pool runs."""
+    last: Exception | None = None
+    for attempt in range(RETRY_ATTEMPTS):
+        # Stamped per ATTEMPT, so it records the GET that actually returned the bytes. A sweep
+        # spans many minutes, so an artifact under a 14:00Z cycle label may really have been
+        # pulled at 14:40Z. For GOES STAR, whose served_utc is NULL by design, this is the only
+        # record of that skew outside the timestamp burned into the image.
+        t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+        try:
+            data, url, served, note = item.fetch()
+        except Exception as e:  # noqa: BLE001 -- one dead product must not lose the whole cycle
+            last = e
+            if attempt == RETRY_ATTEMPTS - 1 or not _transient(e):
+                break
+            time.sleep(RETRY_DELAY_S)
+            continue
+        if not data:
+            # Not retried: a 200 with an empty body is the provider answering, not failing.
+            return Fetched(item, error=f"{item.kind} {item.identity} (provider returned 0 bytes)")
+        return Fetched(item, fetched_utc=t0, data=data, url=url, served=served, note=note)
+    # Contract rule 2: a silent miss is not a capture. Record it loudly and move on.
+    return Fetched(item, error=f"{item.kind} {item.identity} ({type(last).__name__}: {last})")
+
+
+def store_one(con, got: Fetched, res: Result, *, root) -> None:
+    """Index one fetched item. Serial by construction -- artifacts.put writes the blob file,
+    and two threads racing on one content-addressed path is not worth the microseconds."""
+    if got.error:
+        res.failed.append(got.error)
         return
-    try:
-        data, url, served, note = item.fetch()
-    except Exception as e:  # noqa: BLE001 -- one dead product must not lose the whole cycle
-        # Contract rule 2: a silent miss is not a capture. Record it loudly and move on.
-        res.failed.append(f"{item.kind} {item.identity} ({type(e).__name__}: {e})")
-        return
-    if not data:
-        res.failed.append(f"{item.kind} {item.identity} (provider returned 0 bytes)")
-        return
-    sha, mime, n, is_new = artifacts.put(data, root=root)
+    item = got.item
+    sha, mime, n, is_new = artifacts.put(got.data, root=root)
     store.insert_artifact(con, sha256=sha, kind=item.kind, mime=mime, n_bytes=n,
                           first_seen_utc=datetime.now(timezone.utc))
     store.insert_artifact_key(con, kind=item.kind, identity=item.identity,
                               requested_utc=item.requested_utc, sha256=sha,
-                              served_utc=served, source_url=url, provider=item.provider,
-                              note=note or item.note)
+                              served_utc=got.served, fetched_utc=got.fetched_utc, source_url=got.url,
+                              provider=item.provider, note=got.note or item.note)
     res.captured += 1
     if is_new:
         res.bytes_new += n
@@ -423,31 +669,80 @@ def capture(con, item: Item, res: Result, *, root, refresh: bool) -> None:
         res.deduped += 1
 
 
-def archive_station(con, icao: str, cycle: datetime, *, root, refresh: bool,
-                    **plan_kw) -> Result:
+def fetch_all(todo: list[Item], *, workers: int) -> list[Fetched]:
+    """Fetch every outstanding item concurrently. Order is preserved so the log reads the
+    same as the serial version did."""
+    if not todo:
+        return []
+    with ThreadPoolExecutor(max_workers=min(workers, len(todo))) as pool:
+        return list(pool.map(fetch_one, todo))
+
+
+def archive_station(icao: str, cycle: datetime, *, index_path: str, root, refresh: bool,
+                    workers: int, **plan_kw) -> Result:
+    """One station's whole entitlement, as resolve -> select -> fetch -> store.
+
+    Takes an index PATH rather than a connection so it can open and close the index twice
+    around the fetches, instead of pinning it for the length of the sweep."""
     res = Result()
     try:
-        items = plan(icao, cycle, **plan_kw)
+        # Retried: `plan` resolves the station's lat/lon over the network, so a blip here
+        # loses all ~60 of its artifacts, not one.
+        items = _with_retry(lambda: plan(icao, cycle, **plan_kw))
     except Exception as e:  # noqa: BLE001 -- an unresolvable station is one station, not the run
         res.failed.append(f"plan {icao} ({type(e).__name__}: {e})")
         return res
-    for item in items:
-        if item.expand is None:
-            capture(con, item, res, root=root, refresh=refresh)
-            continue
+
+    # Resolve the deferred groups: a loop Item stands for `frames` artifacts and a sounding
+    # Item for at most one, and neither can be enumerated without asking the provider.
+    #
+    # RUN CONCURRENTLY, because an expand is not a lookup -- `satellite_loop` DOWNLOADS its
+    # frames, so this phase is 9-12 s of network per loop product and a station has three of
+    # them plus a sounding. Serially that is ~30 s per station before a single artifact is
+    # fetched, and after the memo it is the largest remaining term in the sweep. The pool is
+    # the same size as the fetch pool for the same reason: these are shared public endpoints.
+    #
+    # Order is preserved by `pool.map`, so the resulting item list -- and therefore the log and
+    # the manifest -- reads exactly as it did serially.
+    deferred = [i for i in items if i.expand is not None]
+    resolved: list[Item] = [i for i in items if i.expand is None]
+
+    def _run_expand(item: Item):
         try:
-            expanded = item.expand()
+            return item, _with_retry(item.expand), None    # retried: loses a whole loop
         except Exception as e:  # noqa: BLE001
-            res.failed.append(f"{item.kind} {item.identity} expand ({type(e).__name__}: {e})")
-            continue
-        if not expanded:
-            # Legitimately nothing to capture (no site flew, no frames indexed) -- a SKIP, not
-            # a failure, but never silent: rule 2 only forbids recording a miss as a capture.
-            res.skipped.append(f"{item.kind} {item.identity} (nothing available to capture)")
-            continue
-        for sub in expanded:
-            capture(con, sub, res, root=root, refresh=refresh)
-    store.insert_manifest(con, icao, cycle, res.manifest)
+            return item, None, f"{item.kind} {item.identity} expand ({type(e).__name__}: {e})"
+
+    if deferred:
+        with ThreadPoolExecutor(max_workers=min(workers, len(deferred))) as pool:
+            outcomes = list(pool.map(_run_expand, deferred))
+        for item, expanded, err in outcomes:
+            if err:
+                res.failed.append(err)
+                continue
+            if not expanded:
+                # Legitimately nothing to capture (no site flew, no frames indexed) -- a SKIP,
+                # not a failure, but never silent: rule 2 only forbids recording a miss as a
+                # capture.
+                res.skipped.append(f"{item.kind} {item.identity} (nothing available to capture)")
+                continue
+            resolved += expanded
+
+    con = store.connect_archive(index_path)         # lock window 1: reads only
+    try:
+        todo = select_all(con, resolved, res, refresh=refresh)
+    finally:
+        con.close()
+
+    got = fetch_all(todo, workers=workers)          # no lock held: this is the slow part
+
+    con = store.connect_archive(index_path)         # lock window 2: writes only
+    try:
+        for g in got:
+            store_one(con, g, res, root=root)
+        store.insert_manifest(con, icao, cycle, res.manifest)
+    finally:
+        con.close()
     return res
 
 
@@ -470,6 +765,9 @@ def main() -> int:
                     help="GFS forecast hours for the tt panels")
     ap.add_argument("--loop-frames", type=int, default=DEFAULT_LOOP_FRAMES)
     ap.add_argument("--loop-step-min", type=int, default=DEFAULT_LOOP_STEP_MIN)
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help=f"concurrent fetches per station (default {DEFAULT_WORKERS}); "
+                         "1 restores the serial behaviour")
     ap.add_argument("--include", default="terrain,taf,satellite,loop,radar,map,sounding",
                     help="comma-separated product groups to capture")
     ap.add_argument("--all-regions", action="store_true",
@@ -519,35 +817,64 @@ def main() -> int:
         return 0
 
     index_path = str(root / "index.duckdb")
+    # Schema first, in its own short connection. Every later connection assumes the tables and
+    # the fetched_utc migration are already there.
     con = store.connect_archive(index_path)
     try:
         store.init_archive_schema(con)
-        totals = Result()
-        if args.all_regions:
-            # Before the stations, so a region a station also wants is fetched once here and
-            # merely reused below rather than the other way round.
-            extra = Result()
-            for it in all_region_items(cycle):
-                capture(con, it, extra, root=root, refresh=args.refresh)
-            extra.manifest.clear()                  # deliberately no manifest rows -- see above
-            totals.captured += extra.captured
-            totals.reused += extra.reused
-            totals.deduped += extra.deduped
-            totals.bytes_new += extra.bytes_new
-            totals.failed += extra.failed
-            print(f"all-regions: {extra.captured:3d} captured  {extra.reused:3d} reused  "
-                  f"{len(extra.failed):2d} failed  {extra.bytes_new / 1e6:6.1f} MB new")
-        for icao in icaos:
-            res = archive_station(con, icao, cycle, root=root, refresh=args.refresh, **plan_kw)
-            totals.captured += res.captured
-            totals.reused += res.reused
-            totals.deduped += res.deduped
-            totals.bytes_new += res.bytes_new
-            totals.skipped += res.skipped
-            totals.failed += res.failed
-            print(f"{icao}: {res.captured:3d} captured  {res.reused:3d} reused  "
-                  f"{res.deduped:3d} deduped  {len(res.skipped):2d} skipped  "
-                  f"{len(res.failed):2d} failed  {res.bytes_new / 1e6:6.1f} MB new")
+    finally:
+        con.close()
+
+    # One batched TAF request for the whole roster, before the per-station loop. See
+    # prefetch_tafs: 71 rate-limited calls become one, and every bulletin is then pinned to the
+    # same instant. A failure here is not fatal -- _fetch_taf falls back to asking per station.
+    if "taf" in plan_kw["include"]:
+        try:
+            prefetch_tafs(icaos)
+        except Exception as e:  # noqa: BLE001
+            print(f"taf prefetch failed, falling back to per-station ({type(e).__name__}: {e})")
+
+    totals = Result()
+    if args.all_regions:
+        # Before the stations, so a region a station also wants is fetched once here and
+        # merely reused below rather than the other way round.
+        extra = Result()
+        con = store.connect_archive(index_path)
+        try:
+            todo = select_all(con, all_region_items(cycle), extra, refresh=args.refresh)
+        finally:
+            con.close()
+        got = fetch_all(todo, workers=args.workers)
+        con = store.connect_archive(index_path)
+        try:
+            for g in got:
+                store_one(con, g, extra, root=root)
+        finally:
+            con.close()
+        extra.manifest.clear()                      # deliberately no manifest rows -- see above
+        totals.captured += extra.captured
+        totals.reused += extra.reused
+        totals.deduped += extra.deduped
+        totals.bytes_new += extra.bytes_new
+        totals.failed += extra.failed
+        print(f"all-regions: {extra.captured:3d} captured  {extra.reused:3d} reused  "
+              f"{len(extra.failed):2d} failed  {extra.bytes_new / 1e6:6.1f} MB new")
+
+    for icao in icaos:
+        res = archive_station(icao, cycle, index_path=index_path, root=root,
+                              refresh=args.refresh, workers=args.workers, **plan_kw)
+        totals.captured += res.captured
+        totals.reused += res.reused
+        totals.deduped += res.deduped
+        totals.bytes_new += res.bytes_new
+        totals.skipped += res.skipped
+        totals.failed += res.failed
+        print(f"{icao}: {res.captured:3d} captured  {res.reused:3d} reused  "
+              f"{res.deduped:3d} deduped  {len(res.skipped):2d} skipped  "
+              f"{len(res.failed):2d} failed  {res.bytes_new / 1e6:6.1f} MB new")
+
+    con = store.connect_archive(index_path)
+    try:
         stats = store.archive_stats(con)
     finally:
         con.close()
