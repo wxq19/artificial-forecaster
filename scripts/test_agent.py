@@ -91,7 +91,7 @@ def _install_run_tool(mapping: dict):
     """Point agent.run_tool at a scripted dispatch; returns it so .calls can be asserted."""
     calls = []
 
-    def _rt(name, args, *, db_path=None, evidence_ids=None):
+    def _rt(name, args, *, db_path=None, evidence_ids=None, station=None):
         calls.append((name, args))
         rt = mapping[name]
         return rt(args) if callable(rt) else rt

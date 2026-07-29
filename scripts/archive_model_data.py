@@ -82,8 +82,12 @@ def main() -> None:
         print("model-data tier OFF (MODEL_DATA_ENABLED=false) -- skipping archive. Use --force to override.")
         return
 
+    # EVERY archived station, not just the 10-station model roster. The archive freezes
+    # inputs at all 71 (decision 2026-07-28) and coordinates are free below 500, so scoping
+    # this to `icaos()` would have silently left 61 stations with no model data at all --
+    # and unlike imagery, that gap is only visible when a tool comes back empty.
     icaos = ([s.strip().upper() for s in args.stations.split(",") if s.strip()]
-             if args.stations else stations.icaos())
+             if args.stations else stations.poll_icaos())
     hazards = not args.no_hazards
     as_of = _parse_asof(args.as_of)
     est = modeldata.estimate_prefetch_many(

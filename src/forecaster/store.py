@@ -1979,3 +1979,190 @@ def skill_cells(con: duckdb.DuckDBPyConnection, *, subject: str = "subject",
     cur = con.execute(sql + " GROUP BY w.event ORDER BY w.event", params)
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Artifact index -- the INDEX half of the archive (docs/artifact_store.md item 6).
+# The BYTES half is forecaster/artifacts.py; nothing image-shaped is stored here, only
+# records and references. Lives in its OWN DuckDB file (data/archive/index.duckdb) rather
+# than in forecaster.duckdb: the archive is harvested and pruned between rounds, and a
+# 165k-row index that ships and hashes separately from the scoring DB is what makes that
+# a file move instead of a migration.
+# ---------------------------------------------------------------------------
+
+_ARCHIVE_DDL = """
+CREATE TABLE IF NOT EXISTS artifacts (
+    sha256          VARCHAR PRIMARY KEY,
+    kind            VARCHAR NOT NULL,
+    mime            VARCHAR NOT NULL,
+    n_bytes         BIGINT  NOT NULL,
+    first_seen_utc  TIMESTAMP NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artifact_keys (
+    kind            VARCHAR   NOT NULL,
+    identity        VARCHAR   NOT NULL,
+    requested_utc   TIMESTAMP NOT NULL,
+    served_utc      TIMESTAMP,
+    sha256          VARCHAR   NOT NULL,
+    source_url      VARCHAR,
+    provider        VARCHAR,
+    note            VARCHAR,
+    PRIMARY KEY (kind, identity, requested_utc)
+);
+CREATE TABLE IF NOT EXISTS run_manifest (
+    station         VARCHAR   NOT NULL,
+    cycle_utc       TIMESTAMP NOT NULL,
+    kind            VARCHAR   NOT NULL,
+    identity        VARCHAR   NOT NULL,
+    requested_utc   TIMESTAMP NOT NULL,
+    PRIMARY KEY (station, cycle_utc, kind, identity, requested_utc)
+);
+"""
+
+
+def connect_archive(path: str, *, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+    """Open the archive index. Separate file, same seam rules as connect()."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    return duckdb.connect(path, read_only=read_only)
+
+
+def init_archive_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Create the three archive tables if absent. Idempotent."""
+    for stmt in filter(str.strip, _ARCHIVE_DDL.split(";")):
+        con.execute(stmt)
+
+
+def insert_artifact(con: duckdb.DuckDBPyConnection, *, sha256: str, kind: str, mime: str,
+                    n_bytes: int, first_seen_utc: datetime) -> bool:
+    """Register one distinct blob. Idempotent by sha256; returns True if new.
+
+    `kind` is whatever the blob was FIRST seen as and is never rewritten -- bytes that
+    recur under a second kind (OSPO serves byte-identical geocolor and infrared over
+    Japan) keep the first label, and `artifact_keys` carries the per-request truth."""
+    before = con.execute("SELECT count(*) FROM artifacts").fetchone()[0]
+    con.execute(
+        "INSERT INTO artifacts (sha256, kind, mime, n_bytes, first_seen_utc) "
+        "VALUES ($sha256, $kind, $mime, $n_bytes, $first_seen_utc) "
+        "ON CONFLICT (sha256) DO NOTHING",
+        {"sha256": sha256, "kind": kind, "mime": mime, "n_bytes": n_bytes,
+         "first_seen_utc": _to_naive_utc(first_seen_utc)},
+    )
+    return con.execute("SELECT count(*) FROM artifacts").fetchone()[0] > before
+
+
+def insert_artifact_key(con: duckdb.DuckDBPyConnection, *, kind: str, identity: str,
+                        requested_utc: datetime, sha256: str,
+                        served_utc: datetime | None = None,
+                        source_url: str | None = None, provider: str | None = None,
+                        note: str | None = None) -> bool:
+    """Map one request to one blob. Returns True if a new key row was written.
+
+    ON CONFLICT DO NOTHING upholds contract rule 5: a re-capture at the same key that
+    returned DIFFERENT bytes does not overwrite the original. The first capture is what a
+    replay must serve, because that is what the model saw."""
+    before = con.execute("SELECT count(*) FROM artifact_keys").fetchone()[0]
+    con.execute(
+        "INSERT INTO artifact_keys (kind, identity, requested_utc, served_utc, sha256, "
+        "source_url, provider, note) VALUES ($kind, $identity, $requested_utc, "
+        "$served_utc, $sha256, $source_url, $provider, $note) "
+        "ON CONFLICT (kind, identity, requested_utc) DO NOTHING",
+        {"kind": kind, "identity": identity,
+         "requested_utc": _to_naive_utc(requested_utc),
+         "served_utc": _to_naive_utc(served_utc) if served_utc else None,
+         "sha256": sha256, "source_url": source_url, "provider": provider, "note": note},
+    )
+    return con.execute("SELECT count(*) FROM artifact_keys").fetchone()[0] > before
+
+
+def insert_manifest(con: duckdb.DuckDBPyConnection, station: str, cycle_utc: datetime,
+                    entries: Sequence[tuple[str, str, datetime]]) -> int:
+    """Record what one (station, cycle) is entitled to see: (kind, identity, requested_utc)
+    per artifact. Returns rows newly written.
+
+    WRITTEN AT CAPTURE TIME, never derived at replay. The KMIB case settles it: that station
+    resolved to `conus_west` (PACUS -- it is not in the frame) until 2026-07-28. Deriving
+    entitlement at replay asks TODAY's resolver, gets `northern_rockies`, and serves a better
+    image than the model had -- inflating a replayed score with no error anywhere. Our own
+    bugs are part of the input a score was earned against."""
+    n = 0
+    for kind, identity, requested_utc in entries:
+        before = con.execute("SELECT count(*) FROM run_manifest").fetchone()[0]
+        con.execute(
+            "INSERT INTO run_manifest (station, cycle_utc, kind, identity, requested_utc) "
+            "VALUES ($station, $cycle_utc, $kind, $identity, $requested_utc) "
+            "ON CONFLICT (station, cycle_utc, kind, identity, requested_utc) DO NOTHING",
+            {"station": station.upper(), "cycle_utc": _to_naive_utc(cycle_utc),
+             "kind": kind, "identity": identity,
+             "requested_utc": _to_naive_utc(requested_utc)},
+        )
+        n += con.execute("SELECT count(*) FROM run_manifest").fetchone()[0] > before
+    return n
+
+
+def artifact_key(con: duckdb.DuckDBPyConnection, kind: str, identity: str,
+                 requested_utc: datetime) -> dict | None:
+    """One key row joined to its blob record -- the exact-hit lookup a replay makes."""
+    cur = con.execute(
+        "SELECT k.*, a.mime, a.n_bytes FROM artifact_keys k JOIN artifacts a USING (sha256) "
+        "WHERE k.kind = ? AND k.identity = ? AND k.requested_utc = ?",
+        [kind, identity, _to_naive_utc(requested_utc)])
+    row = cur.fetchone()
+    return dict(zip([d[0] for d in cur.description], row)) if row else None
+
+
+def nearest_artifact_key(con: duckdb.DuckDBPyConnection, kind: str, identity: str,
+                         requested_utc: datetime, *, max_minutes: float | None = None
+                         ) -> dict | None:
+    """The closest capture in time for an identity, with the gap in `snap_minutes`.
+
+    Serve-from-archive needs this because an agent may ask for a loop cadence that was never
+    captured on exactly that grid. The caller must put `snap_minutes` in the receipt -- a
+    snapped artifact served silently is the mislabelling class this store exists to stop."""
+    want = _to_naive_utc(requested_utc)
+    sql = ("SELECT k.*, a.mime, a.n_bytes, "
+           "abs(date_diff('second', k.requested_utc, ?)) / 60.0 AS snap_minutes "
+           "FROM artifact_keys k JOIN artifacts a USING (sha256) "
+           "WHERE k.kind = ? AND k.identity = ?")
+    params: list = [want, kind, identity]
+    if max_minutes is not None:
+        sql += " AND abs(date_diff('second', k.requested_utc, ?)) <= ?"
+        params += [want, int(max_minutes * 60)]
+    cur = con.execute(sql + " ORDER BY snap_minutes, k.requested_utc DESC LIMIT 1", params)
+    row = cur.fetchone()
+    return dict(zip([d[0] for d in cur.description], row)) if row else None
+
+
+def manifest_for(con: duckdb.DuckDBPyConnection, station: str,
+                 cycle_utc: datetime) -> list[dict]:
+    """Everything one (station, cycle) was shown, resolved to blobs. The replay join."""
+    cur = con.execute(
+        "SELECT m.kind, m.identity, m.requested_utc, k.served_utc, k.sha256, k.source_url, "
+        "k.provider, k.note, a.mime, a.n_bytes "
+        "FROM run_manifest m LEFT JOIN artifact_keys k "
+        "  ON m.kind = k.kind AND m.identity = k.identity "
+        " AND m.requested_utc = k.requested_utc "
+        "LEFT JOIN artifacts a ON k.sha256 = a.sha256 "
+        "WHERE m.station = ? AND m.cycle_utc = ? ORDER BY m.kind, m.identity, m.requested_utc",
+        [station.upper(), _to_naive_utc(cycle_utc)])
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def archive_cycles(con: duckdb.DuckDBPyConnection) -> list[dict]:
+    """(station, cycle_utc, n_artifacts) for every captured cycle -- the archive's contents."""
+    cur = con.execute(
+        "SELECT station, cycle_utc, count(*) AS n_artifacts FROM run_manifest "
+        "GROUP BY station, cycle_utc ORDER BY cycle_utc DESC, station")
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def archive_stats(con: duckdb.DuckDBPyConnection) -> dict:
+    """Blob count, total bytes, key count and dedup factor -- what a capture actually cost."""
+    n_blobs, n_bytes = con.execute(
+        "SELECT count(*), coalesce(sum(n_bytes), 0) FROM artifacts").fetchone()
+    n_keys = con.execute("SELECT count(*) FROM artifact_keys").fetchone()[0]
+    n_manifest = con.execute("SELECT count(*) FROM run_manifest").fetchone()[0]
+    return {"blobs": n_blobs, "bytes": int(n_bytes), "keys": n_keys,
+            "manifest_rows": n_manifest,
+            "dedup": round(n_keys / n_blobs, 2) if n_blobs else 0.0}

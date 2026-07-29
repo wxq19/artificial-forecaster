@@ -351,7 +351,7 @@ def _run_and_persist(args, st, icao, issue, valid_from, valid_to,
     cfg = AgentConfig(
         model=args.model, toolset=toolset, max_steps=args.max_steps, max_tokens=args.max_tokens,
         temperature=args.temperature, tool_caps=TOOL_CAPS, worksheet_mode=args.mode,
-        step_budget_nudge=True, db_path=run_db,
+        step_budget_nudge=True, db_path=run_db, station=icao,
     )
 
     print(f"[{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}] collect {icao} valid {valid_from:%d%H%M}Z "

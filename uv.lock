@@ -114,6 +114,7 @@ dependencies = [
     { name = "metpy" },
     { name = "openai" },
     { name = "pandas" },
+    { name = "pillow" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
 ]
@@ -135,6 +136,7 @@ requires-dist = [
     { name = "metpy", specifier = ">=1.7.1" },
     { name = "openai", specifier = ">=2.43.0" },
     { name = "pandas", specifier = ">=3.0.3" },
+    { name = "pillow", specifier = ">=11.0.0" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
 ]

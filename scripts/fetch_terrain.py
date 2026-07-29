@@ -1,4 +1,4 @@
-"""Prewarm + review the Esri shaded-relief maps for the roster (or a given station).
+"""Prewarm + review the Esri shaded-relief maps for every archived station (or one station).
 
 Terrain is static, so we fetch each station's tiles ONCE into the permanent cache
 (data/terrain/esri_relief) and never again. Run this before a collection campaign so
@@ -7,8 +7,12 @@ tool uses, so the cache covers exactly the tiles get_terrain will need (sparse s
 the radius) and the review JPEG matches what the model sees. Writes each map to
 data/charts/temp/ for eyeballing.
 
-  uv run python scripts/fetch_terrain.py                 # all roster stations
+  uv run python scripts/fetch_terrain.py                 # every archived station (poll_icaos)
   uv run python scripts/fetch_terrain.py --station KVBG   # one station
+
+Run build_neighbors.py FIRST: the markers, the context sites and the adaptive radius all
+come from neighbors.py, and it degrades silently to an empty list for an unbuilt station --
+which renders a plausible-looking map with no airfields on it.
 """
 
 import argparse
@@ -18,10 +22,10 @@ from forecaster import awc, neighbors, stations, terrain, tools
 
 ap = argparse.ArgumentParser(description=__doc__,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument("--station", help="single ICAO (default: whole roster)")
+ap.add_argument("--station", help="single ICAO (default: every archived station)")
 args = ap.parse_args()
 
-icaos = [args.station.upper()] if args.station else stations.icaos()
+icaos = [args.station.upper()] if args.station else stations.poll_icaos()
 out = Path("data/charts/temp")
 out.mkdir(parents=True, exist_ok=True)
 

@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from forecaster import (
     awc, charts, imagery, modeldata, neighbors, soundings, store, tafgen,
-    tafparse, tafstate, terrain, worksheet, wxmaps,
+    tafparse, tafstate, terrain, upper_air_sites, worksheet, wxmaps,
 )
 from forecaster.config import settings
 from forecaster.tafgen import TafProduct
@@ -143,24 +143,32 @@ GET_SOUNDING = {
     "function": {
         "name": "get_sounding",
         "description": (
-            "Fetch an observed upper-air skew-T sounding (radiosonde) as an image to "
-            "judge vertical structure: stability/CAPE, inversions, moisture layers, "
-            "freezing level, and wind shear with height. Soundings are launched only "
-            "at 00Z and 12Z from upper-air sites (NOT every airport); you get the most "
-            "recent synoptic run at or before now. `site` is an upper-air station id "
-            "(e.g. OUN, MPX), which may differ from the nearest airport's ICAO."
+            "Fetch an observed upper-air skew-T sounding (radiosonde) to judge vertical "
+            "structure: stability/CAPE, inversions, moisture layers, freezing level, and "
+            "wind shear with height. Soundings come from upper-air sites (NOT every "
+            "airport), so `site` is an upper-air station id -- a 3-letter id like OUN/MPX "
+            "for spc, or a WMO number like 72649/87155 for wyoming and bufr. Most sites "
+            "launch at 00Z and/or 12Z, but many also fly OFF-CYCLE special ascents; the "
+            "bufr source looks up what was ACTUALLY launched and gives you the most recent "
+            "one, which spc/wyoming (fixed 00/12Z images) cannot. Use bufr outside the "
+            "United States -- the spc/wyoming image archives have little coverage there."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "site": {
                     "type": "string",
-                    "description": "Upper-air sounding site id, e.g. OUN or MPX",
+                    "description": ("Upper-air sounding site id (OUN/MPX for spc, a WMO "
+                                    "number like 87155 for wyoming/bufr) -- OR, for bufr, "
+                                    "just your station's ICAO: it resolves to the nearest "
+                                    "radiosonde and tells you which one and how far."),
                 },
                 "source": {
                     "type": "string",
-                    "enum": ["spc", "wyoming"],
-                    "description": "Provider: spc (default, richer analysis) or wyoming",
+                    "enum": ["spc", "wyoming", "bufr"],
+                    "description": ("Provider: spc (default, richest analysis, US), "
+                                    "wyoming (US image archive), or bufr (global, "
+                                    "off-cycle-aware, rendered from the raw ascent)"),
                 },
             },
             "required": ["site"],
@@ -315,7 +323,7 @@ GET_IMAGERY = {
             "structure, moisture, and precipitation coverage. Set `kind`: 'satellite' "
             "(geostationary imagery -- GOES over the Americas, Himawari over the W Pacific/"
             "E Asia, Meteosat over Europe/Africa/Middle East; `product` defaults to geocolor, "
-            "also visible, infrared, water_vapor. For a specific airport give its `station` "
+            "also infrared, water_vapor. For a specific airport give its `station` "
             "ICAO and the tool picks the sector that covers it -- do NOT guess a `region`; use "
             "`region` only for a broad or named area) or 'radar' (NEXRAD reflectivity, CONUS "
             "only; give a `station` ICAO for "
@@ -336,8 +344,8 @@ GET_IMAGERY = {
                 "product": {
                     "type": "string",
                     "enum": _IMG_PRODUCTS,
-                    "description": "satellite: geocolor (default)/visible/infrared/"
-                    "water_vapor; radar: station_reflectivity/regional_mosaic/national_mosaic",
+                    "description": "satellite: geocolor (default)/infrared/water_vapor; "
+                    "radar: station_reflectivity/regional_mosaic/national_mosaic",
                 },
                 "region": {
                     "type": "string",
@@ -370,9 +378,9 @@ GET_LOOP = {
             "`step_min` (minutes between frames, default 30) -- frames x step_min sets how far "
             "back the loop reaches, so 6 x 30 covers 2.5h of trend and 10 x 10 shows the last "
             "90 min in detail. Products: geocolor (default; true colour by day, IR-blended at "
-            "night), visible (sharpest cloud texture, DAYLIGHT ONLY), infrared (cloud-top "
-            "temperature -- use at night and to spot deepening convection), water_vapor "
-            "(mid-level moisture and flow, works day or night). GOES (Americas) and Himawari "
+            "night), infrared (cloud-top temperature -- use at night and to spot deepening "
+            "convection), water_vapor (mid-level moisture and flow, works day or night). "
+            "All three work day or night. GOES (Americas) and Himawari "
             "(Japan/W Pacific) loops cover the station's sector; Meteosat (Europe/Africa/"
             "Middle East) loops are station-centered."
         ),
@@ -381,7 +389,7 @@ GET_LOOP = {
             "properties": {
                 "station": {"type": "string", "description": "4-letter ICAO, e.g. KWRI"},
                 "product": {"type": "string", "enum": list(imagery.SAT_PRODUCTS),
-                            "description": "geocolor (default)/visible/infrared/water_vapor"},
+                            "description": "geocolor (default)/infrared/water_vapor"},
                 "frames": {"type": "integer", "description": "number of frames, 2-10 (default 6)"},
                 "step_min": {"type": "integer",
                              "description": "minutes between frames (default 30)"},
@@ -976,6 +984,82 @@ def _fetch_stamp() -> str:
     return f"{datetime.now(timezone.utc):%Y-%m-%dT%H:%MZ}"
 
 
+def _resolve_sounding_site(site: str) -> tuple[str, str]:
+    """(wmo, note) for a site id. A 4-letter ICAO is resolved to its NEAREST radiosonde via
+    upper_air_sites, so the model can ask for a station it knows instead of having to carry a
+    WMO number -- and the note states which site it actually got, and how far away, because
+    'the sounding near KWRI' is 174 km away and that materially changes how it should be read."""
+    s = str(site).strip().upper()
+    if s.isdigit():
+        return s, ""
+    rows = upper_air_sites.sites_for(s)
+    if not rows:
+        return s, ""
+    wmo, name, dist, brg, _la, _lo = rows[0]
+    others = ", ".join(f"{w} ({d:.0f} km {b})" for w, _n, d, b, _a, _o in rows[1:])
+    lead = (f"{wmo} {name} is on {s}'s own field ({dist:.0f} km)." if dist <= 25.0
+            else (f"{s} has no radiosonde of its own; using the nearest, {wmo} {name}, "
+                  f"{dist:.0f} km {brg} of the field."))
+    return wmo, lead + (f" Others nearby: {others}." if others else "") + " "
+
+
+def _sounding_bufr(site: str) -> ToolResult:
+    """Observed sounding via the BUFR source: look up what was ACTUALLY launched, fetch the
+    raw ascent, render it here (charts.py owns matplotlib; soundings.py returns a profile).
+
+    Deliberately does NOT snap to 00/12Z. It asks the provider's inventory for the newest
+    launch, so an off-cycle special ascent -- released precisely because something is
+    happening -- is served instead of being silently rounded away to the last synoptic hour."""
+    site, note = _resolve_sounding_site(site)
+    try:
+        # resolve_source, NOT latest_time: the provider carries a site under BUFR (~1 s ascent)
+        # or FM35 (the TEMP bulletin) and the sets differ. 47646 TATENO -- the nearest
+        # radiosonde to RJTY -- 400s under BUFR and has 462 launches under FM35, so a
+        # BUFR-only lookup reported Japan as having no upper-air data at all.
+        got = soundings.resolve_source(site)
+    except Exception as e:  # noqa: BLE001 -- unknown id / provider hiccup -> feedback
+        return ToolResult(f"error: could not read the sounding inventory for {site} "
+                          f"({type(e).__name__}: {e}); `site` must be a WMO number or a "
+                          "station ICAO on the archived roster, e.g. 87155 or KWRI.")
+    src, t = got if got else ("BUFR", None)
+    if t is None:
+        # An empty inventory means EITHER a quiet site OR an id the provider does not know --
+        # the scrape returns [] for both. Ask for the whole record before naming a cause: the
+        # SPC source takes 3-letter ids (OUN, MPX) that are a different namespace, so a model
+        # carrying one over to `bufr` is likely, and "the site is not reporting" would then be
+        # a confidently stated falsehood.
+        try:
+            ever = soundings.last_known_time(site)
+        except Exception:  # noqa: BLE001 -- the diagnosis is a nicety; never fail the reply on it
+            ever = None
+        if ever is None:
+            return ToolResult(f"error: site {site} has no launch record at all, so it is "
+                              "probably not a radiosonde site id (or the inventory is "
+                              "unreadable). `site` here must be a WMO number or a station "
+                              "ICAO on the archived roster, e.g. 87155 or KWRI -- the "
+                              "3-letter ids the `spc` source takes are a DIFFERENT namespace.")
+        return ToolResult(f"no sounding launched at site {site} in the last 48 h (the site is "
+                          f"real and the inventory was read successfully -- its most recent "
+                          f"ascent on record is {ever:%Y-%m-%dT%H:%MZ}). Try another site, or "
+                          "rely on the model soundings (get_fcst_sounding).")
+    try:
+        prof = soundings.fetch_profile(site, t, src=src)
+        img = charts.skewt(prof)
+    except Exception as e:  # noqa: BLE001 -- parse/render failure -> feedback, not a crash
+        return ToolResult(f"error: could not build the sounding for {site} at "
+                          f"{t:%Y-%m-%dT%H:%MZ} ({type(e).__name__}: {e}).")
+    off = "" if t.hour in (0, 12) else "  NOTE: this is an OFF-CYCLE (special) ascent."
+    # Name the FEED, not just the provider: FM35 is the TEMP bulletin (mandatory + significant
+    # levels, ~100-200) and BUFR is the ~1 s ascent (3,000-4,500), so the level count below
+    # means something different in each and the receipt must not blur them.
+    return ToolResult(
+        f"{note}OBSERVED radiosonde skew-T for site {site}, launched {t:%Y-%m-%dT%H:%MZ}"
+        f"{off} Rendered from the raw ascent ({len(prof.pres)} levels thinned from "
+        f"{prof.n_raw}); surface {prof.pres[0]:.0f} hPa {prof.tmpc[0]:.1f}/"
+        f"{prof.dwpc[0]:.1f} C. (source: Wyoming {src}, {prof.url}); image follows.",
+        images=[img])
+
+
 def _get_sounding(args: dict) -> ToolResult:
     """Fetch an observed skew-T image from a public provider (network, no DB) and
     hand it back for the model to read. Site ids live in the provider's namespace,
@@ -985,8 +1069,10 @@ def _get_sounding(args: dict) -> ToolResult:
     if not site:
         return ToolResult('error: get_sounding needs a "site" upper-air id, e.g. "site": "OUN"')
     source = str(args.get("source") or "spc").lower()
-    if source not in ("spc", "wyoming"):
-        return ToolResult(f'error: unknown source {source!r}; use "spc" or "wyoming"')
+    if source not in ("spc", "wyoming", "bufr"):
+        return ToolResult(f'error: unknown source {source!r}; use "spc", "wyoming" or "bufr"')
+    if source == "bufr":
+        return _sounding_bufr(str(site))
     t = soundings.synoptic_time()
     note = ""
     try:
@@ -1024,15 +1110,50 @@ def _get_sounding(args: dict) -> ToolResult:
     return ToolResult(receipt, images=[img])
 
 
-def _get_map(args: dict) -> ToolResult:
+def _get_map(args: dict, station: str | None = None) -> ToolResult:
     """Fetch a catalogued surface/upper-air chart image (network, no DB). A forecast
     chart gets its GFS forecast hour snapped to the 6h grid; an unknown chart name or a
-    fetch failure comes back as feedback, not a crash. Receipt cites the source URL."""
+    fetch failure comes back as feedback, not a crash. Receipt cites the source URL.
+
+    `station` is threaded by the harness, NOT taken from the model's arguments, so the
+    geographic gate cannot be skipped by omitting it. When present, charts that do not
+    depict this station's part of the world are WITHHELD and the TT forecast panels are
+    fetched on the station's own domain."""
     name = args.get("chart")
     if not name or name not in wxmaps.CATALOG:
         return ToolResult(
             'error: get_map needs a valid "chart"; choose from: ' + ", ".join(wxmaps.CATALOG)
         )
+    domain = "us"
+    if station:
+        located = True
+        try:
+            lat, lon = awc.station_latlon(str(station).upper())
+            allowed, dom, label = wxmaps.charts_for_latlon(lat, lon)
+        except Exception:  # noqa: BLE001 -- a lookup failure must not silently open the gate
+            allowed, dom, label, located = (), None, "position unavailable", False
+        if name not in allowed:
+            if not located:
+                # Withholding is still right -- but a failed lookup and a genuinely uncovered
+                # region reach this branch identically, and reporting the first as the second
+                # asserts a geographic fact about a CONUS station that is simply untrue.
+                why = ("this station's position could not be looked up just now, so the "
+                       "geographic gate cannot confirm the chart covers its region. This is "
+                       "a LOOKUP FAILURE, not a statement that no chart covers the station")
+                alt = " Retry the call -- the lookup failure is usually transient."
+            elif not allowed:
+                why = ("no catalogued chart source covers this station at all -- the A/B "
+                       "charts are US products and there is no forecast-panel domain for "
+                       "this region")
+                alt = (" Use get_imagery (satellite) and the model-data tools "
+                       "(get_model_state, get_hazard_scan) for synoptic context instead.")
+            else:
+                why = ("it depicts a different part of the world, so it is withheld rather "
+                       "than served as a confidently-labelled picture of the wrong region")
+                alt = f" Available here: {', '.join(allowed)}."
+            return ToolResult(f"chart {name!r} is not available for {station} "
+                              f"({label}): {why}.{alt}")
+        domain = dom or "us"
     spec = wxmaps.CATALOG[name]
     fhr = 0
     run = None
@@ -1045,13 +1166,16 @@ def _get_map(args: dict) -> ToolResult:
         fhr -= fhr % wxmaps.GFS_STEP_H          # snap down to the 6h GFS grid
         run = wxmaps.latest_gfs_run()           # resolve once so the receipt and image agree
     try:
-        url = wxmaps.map_url(name, fhr=fhr, run=run)
-        img = wxmaps.fetch_map(name, fhr=fhr, run=run)
+        url = wxmaps.map_url(name, fhr=fhr, run=run, domain=domain)
+        img = wxmaps.fetch_map(name, fhr=fhr, run=run, domain=domain)
     except Exception as e:  # noqa: BLE001 -- a fetch failure becomes feedback, not a dead loop
         # TT is third-party + URL-fragile; on failure fall back to the closest SPC
         # mesoanalysis ANALYSIS chart so the model keeps upper-air context. The receipt
         # states the degradation loudly -- it is NOW, not the forecast hour requested.
-        fb = wxmaps.TT_TO_SPC_MESO.get(name) if spec.source == "tt" else None
+        # GATED ON THE US DOMAIN: SPC mesoanalysis is CONUS-only, so outside it this
+        # fallback would answer a failed South American panel with a picture of Kansas.
+        fb = (wxmaps.TT_TO_SPC_MESO.get(name)
+              if spec.source == "tt" and domain == "us" else None)
         if fb:
             fb_spec = wxmaps.CATALOG[fb]
             try:
@@ -1068,8 +1192,16 @@ def _get_map(args: dict) -> ToolResult:
                 "image follows.", images=[fb_img])
         return ToolResult(f"error: could not fetch chart {name} ({type(e).__name__}: {e})")
     lead = f", GFS f{fhr:03d} run {run:%Y-%m-%dT%H:%MZ}" if spec.source == "tt" else ""
+    dom = f", domain {domain}" if spec.source == "tt" else ""
+    # A substituted panel is announced under what it ACTUALLY shows, not the catalogue
+    # label, so the model never reasons about a field it was not given.
+    label = spec.label
+    if spec.source == "tt":
+        var = wxmaps.tt_variant(name, domain)
+        if var.field != spec.params["field"]:
+            label = f"{var.label}  [substituted for {spec.label} -- unavailable on this domain]"
     return ToolResult(
-        f"{spec.label} [{name}]{lead} (source: {spec.source}, {url}); image follows.",
+        f"{label} [{name}]{lead}{dom} (source: {spec.source}, {url}); image follows.",
         images=[img],
     )
 
@@ -1107,10 +1239,17 @@ def _imagery_satellite(region: str | None, product: str | None,
     # OSPO Japan has no geocolor; its day/night default is enhanced IR, so relabel honestly.
     if imagery.SAT_REGIONS[region].provider == "himawari_ospo" and product == "geocolor":
         product = "infrared"
+    if (imagery.SAT_REGIONS[region].provider == "meteosat_eumetsat_wms"
+            and not imagery.meteosat_has_product(product)):
+        return _meteosat_no_product(product, imagery.SAT_REGIONS[region].label)
     # Meteosat takes an arbitrary bbox, so for a specific station we center a TIGHT local view
     # on it instead of the wide fixed region (the station-crop upgrade). Others use the sector.
     meteosat_point = center is not None and \
         imagery.SAT_REGIONS[region].provider == "meteosat_eumetsat_wms"
+    # Resolve the region the SAME way fetch_satellite will, BEFORE naming it. water_vapor is
+    # widened to a synoptic scope inside the fetch, so a receipt built from the tight sector
+    # names a sector -- and sometimes a satellite -- the delivered image is not.
+    region = imagery.synoptic_region(region, product)
     try:
         if meteosat_point:
             img, url = imagery.fetch_meteosat_point(center[0], center[1], product)
@@ -1153,11 +1292,41 @@ def _radar_regional(region: str) -> ToolResult:
                       f"(source: IEM NEXRAD composite, {url}); image follows.", images=[img])
 
 
-def _radar_degrade(icao: str, lat: float, lon: float, reason: str) -> ToolResult:
-    """Fall back from a station-local view: the containing regional mosaic, then national.
+def _meteosat_no_product(product: str, label: str) -> ToolResult:
+    """Meteosat cannot serve this product -- say so and return NOTHING.
+
+    Same rule as `_radar_no_coverage`: a text-only refusal beats a confidently labelled
+    picture of something else. Falling back to geocolour under the water_vapor name is what
+    round 1 actually did over Europe, and SHA-256 showed the three products were one image."""
+    return ToolResult(
+        f"{product} is not available from Meteosat ({label}). EUMETSAT publishes no "
+        f"comparable {product} product for this region, and serving a different channel "
+        f"under that name would misinform the analysis. No image is returned. Use "
+        f"get_imagery product=geocolor or product=infrared here, and the upper-level flow "
+        f"from get_map (500 mb / 300 mb panels) for the moisture and jet picture.")
+
+
+def _radar_no_coverage(icao: str, near: tuple | None, reason: str) -> ToolResult:
+    """No usable radar for this station -- say so and return NOTHING.
+
+    This deliberately does NOT fall back to the US national mosaic. Handing a Japanese or
+    Patagonian station a labelled picture of the United States is worse than handing it
+    nothing: the model cannot tell that the image is irrelevant, and round 1 shipped exactly
+    that (RJTY's 'radar' was a CONUS composite, 1,090 km from the nearest WSR-88D). A
+    text-only refusal is honest and costs the model one turn."""
+    where = (f" The nearest WSR-88D is {near[0]['id']} {near[0]['name']}, {near[1]:,.0f} km away."
+             if near else "")
+    return ToolResult(
+        f"no radar coverage for {icao}: {reason}.{where} The WSR-88D network is US-only, so "
+        f"there is no radar product for this site -- use satellite imagery instead "
+        f"(get_imagery kind=satellite, or get_loop for motion). No image is returned.")
+
+
+def _radar_degrade(icao: str, lat: float, lon: float, reason: str,
+                   near: tuple | None = None) -> ToolResult:
+    """Fall back from a station-local view to the containing REGIONAL mosaic only.
     `reason` (guard miss or a station-fetch failure) is prepended so the receipt is honest.
-    If the regional fetch itself fails (e.g. IEM down), continue to national -- which can
-    degrade to the NWS GIF on a different host -- rather than dead-ending."""
+    Outside the curated regions there is no fallback -- see `_radar_no_coverage`."""
     reg = imagery.radar_region_for_latlon(lat, lon)
     if reg:
         r = _radar_regional(reg)
@@ -1165,11 +1334,10 @@ def _radar_degrade(icao: str, lat: float, lon: float, reason: str) -> ToolResult
             r.text = (f"{reason}; showing the {imagery.RADAR_REGIONS[reg][1]} regional "
                       f"mosaic instead. {r.text}")
             return r
-    nat = _radar_national("national radar mosaic")
-    tail = ("regional mosaic also unavailable -- " if reg else
-            f"{icao} is outside the curated radar regions -- ")
-    nat.text = f"{reason}; {tail}showing the national mosaic for broad context only. {nat.text}"
-    return nat
+        return _radar_no_coverage(icao, near, f"{reason}, and the "
+                                  f"{imagery.RADAR_REGIONS[reg][1]} regional mosaic "
+                                  f"could not be fetched either")
+    return _radar_no_coverage(icao, near, reason)
 
 
 def _radar_for_station(icao: str, product: str | None) -> ToolResult:
@@ -1184,22 +1352,31 @@ def _radar_for_station(icao: str, product: str | None) -> ToolResult:
             f"error: could not resolve a location for {icao} ({type(e).__name__}: {e}); "
             "give a radar `region` instead: " + ", ".join(imagery.RADAR_REGIONS))
 
+    near = imagery.nearest_radar(lat, lon)
+    guard = imagery.RADAR_STATION_GUARD_KM
+    reg = imagery.radar_region_for_latlon(lat, lon)
+
+    # OUT OF NETWORK: no credible local radar AND outside every curated region. Refuse for
+    # EVERY product, including an explicit national_mosaic -- the station is not in the US
+    # radar network at all, so no US product describes it. (An explicit `region` request,
+    # which arrives via _get_imagery rather than here, is still honored: that is the model
+    # deliberately asking to look at a named US area.)
+    if not reg and not (near and near[1] <= guard):
+        return _radar_no_coverage(
+            icao, near,
+            f"{icao} is outside the curated radar regions and has no WSR-88D within the "
+            f"{guard:.0f} km local-radar guard")
+
     # Honor an explicit mosaic choice directly -- do NOT route it through the guard (which
     # would fabricate a distance reason and hand back the wrong product).
     if product == "national_mosaic":
         return _radar_national("national radar mosaic (broad context only)")
     if product == "regional_mosaic":
-        reg = imagery.radar_region_for_latlon(lat, lon)
         if reg:
             return _radar_regional(reg)
-        nat = _radar_national("national radar mosaic")
-        nat.text = (f"{icao} is outside the curated radar regions -- showing the national "
-                    f"mosaic for broad context only. {nat.text}")
-        return nat
+        return _radar_no_coverage(icao, near, f"{icao} is outside the curated radar regions")
 
     # Default / station_reflectivity: a station-centered local view when a radar is credible.
-    near = imagery.nearest_radar(lat, lon)
-    guard = imagery.RADAR_STATION_GUARD_KM
     if near and near[1] <= guard:
         site, dist = near
         try:
@@ -1207,14 +1384,15 @@ def _radar_for_station(icao: str, product: str | None) -> ToolResult:
             img = imagery.fetch_radar("station", center=(lat, lon))
         except Exception as e:  # noqa: BLE001 -- degrade, don't dead-end (provider hiccup/outage)
             return _radar_degrade(icao, lat, lon,
-                                  f"station radar fetch for {icao} failed ({type(e).__name__}: {e})")
+                                  f"station radar fetch for {icao} failed ({type(e).__name__}: {e})",
+                                  near=near)
         receipt = (f"Station-scale radar around {icao}, fetched {_fetch_stamp()} "
                    f"(nearest WSR-88D: {site['id']} {site['name']}, {dist:.0f} km; "
                    f"source: IEM NEXRAD composite, {url}); image follows.")
         return ToolResult(receipt, images=[img])
     reason = (f"nearest WSR-88D to {icao} is {near[1]:.0f} km away (beyond the {guard:.0f} km "
               f"local-radar guard)" if near else f"no radar site found near {icao}")
-    return _radar_degrade(icao, lat, lon, reason)
+    return _radar_degrade(icao, lat, lon, reason, near=near)
 
 
 def _get_loop(args: dict) -> ToolResult:
@@ -1236,6 +1414,11 @@ def _get_loop(args: dict) -> ToolResult:
     except Exception as e:  # noqa: BLE001 -- unknown id becomes feedback, not a crash
         return ToolResult(f"error: could not resolve a location for {icao} "
                           f"({type(e).__name__}: {e}).")
+    # Same gate as the still: refuse rather than loop ten frames of the wrong channel.
+    reg = imagery.satellite_region_for_latlon(lat, lon)
+    if (reg and imagery.SAT_REGIONS[reg].provider == "meteosat_eumetsat_wms"
+            and not imagery.meteosat_has_product(product)):
+        return _meteosat_no_product(product, imagery.SAT_REGIONS[reg].label)
     try:
         fr, source, coverage = imagery.satellite_loop(lat, lon, product,
                                                       frames=frames, step_min=step)
@@ -1521,10 +1704,19 @@ def _get_nearby_obs(con, station: str, args: dict) -> ToolResult:
     nearest; pass `stations` (after reading the get_terrain map) to fetch a chosen subset."""
     roster = neighbors.neighbors_of(station)
     if not roster:
+        # The roster is built for EVERY archived station, so an empty list no longer means
+        # "not built" -- it means the search found no other METAR airfield within 150 km.
+        # Say that plainly: it is a real property of the site (SAWG and SAZN in Patagonia
+        # have literally none), and a forecaster there has no local network to reason over.
+        if station.upper() in neighbors.NEIGHBORS:
+            return ToolResult(
+                f"no obs in the local region: there is no other METAR-reporting airfield "
+                f"within {neighbors.MAX_KM:.0f} km of {station}, so there are no neighbour "
+                f"observations to compare against. Use the station's own obs (get_latest_obs "
+                f"/ get_trend) and the synoptic picture (get_imagery, get_map) instead.")
         return ToolResult(
             f"(no neighbor stations on file for {station}; the nearest-neighbor roster covers "
-            "the benchmark's forecast stations)"
-        )
+            "the archived stations -- regenerate with scripts/build_neighbors.py)")
     by_icao = {row[0]: row for row in roster}
     requested = args.get("stations")
     unknown: list[str] = []
@@ -1547,18 +1739,34 @@ def _get_nearby_obs(con, station: str, args: dict) -> ToolResult:
         f"{header} Distance/bearing are FROM your station; elev is the neighbor minus your field.",
         "decoded cols: UTC time (ISO) | type | wind | vis | ceiling | present-wx | T/Td(C)",
     ]
+    skipped = ""
     if unknown:
-        out.append(f"(not in {station}'s fetchable roster, skipped: {', '.join(unknown)}; "
+        skipped = (f"(not in {station}'s fetchable roster, skipped: {', '.join(unknown)}; "
                    f"fetchable are: {', '.join(by_icao)})")
+        out.append(skipped)
+    n_with_obs = 0
     for icao, dist, brg, de, _la, _lo in rows:
         head = f"{icao}  {dist:.0f} km {brg}  {de:+d} m"
         latest = store.latest(con, icao, 1)
         if not latest:
             out.append(f"{head}  | (no observation in store within the window)")
             continue
+        n_with_obs += 1
         r = latest[0]
         out.append(f"{head}  | {_decoded_line(r)}")
         out.append(f"    {r['raw']}")
+    if rows and not n_with_obs:
+        # Neighbours exist on the map but none of them reported -- distinct from having no
+        # neighbours at all, and the model should not be left inferring it from blank rows.
+        # Count CHECKED separately from ON FILE: `rows` is the requested subset when the
+        # model named stations, so reporting it as the roster size understates the site --
+        # asking about one quiet neighbour would read as "this station has one neighbour".
+        return ToolResult(
+            f"no obs in the local region: none of the {len(rows)} neighbour airfield(s) "
+            f"checked ({', '.join(r[0] for r in rows)}) has an observation in the window, so "
+            f"there is no local network to compare against. {station} has {len(roster)} "
+            f"neighbour airfield(s) on file in total."
+            + (f" {skipped}" if skipped else ""))
     return ToolResult("\n".join(out))
 
 
@@ -1806,15 +2014,25 @@ def _fmt_hazard_scan(con, station: str, loc: tuple, want) -> str:
         piv[model] = _pivot_series(rows)
     base = piv["gfs"] or piv["hrrr"]
     # The series carries the surface 6h back-tail too, whose early entries hold no pressure-
-    # level vars. When no valid time is asked, default to the earliest HAZARD-bearing entry
-    # (cape/t650 present), not the earliest overall -- else the scan lands on the back-tail and
-    # renders empty.
-    if want is None:
-        base = [e for e in base if e[2].get("cape") is not None or e[2].get("t650") is not None] or base
-    ref = _pick_valid_time(base, want)
+    # level vars. Restrict to HAZARD-BEARING entries (cape/t650 present) BEFORE choosing, for
+    # a requested valid time as well as for the default -- an entry with no levels renders an
+    # empty panel however it was picked, so the nearest level-bearing time is the honest answer.
+    ref = _pick_valid_time(
+        [e for e in base if e[2].get("cape") is not None or e[2].get("t650") is not None], want)
     if ref is None:
-        return (f"(no pressure-level hazard data pre-fetched for {loc_id} -- prefetch runs with "
-                f"hazards enabled for the site + grid only). {_md_locations_hint(con)}")
+        # The level bundle is SITE-COLUMN ONLY (modeldata.hazard_coords, config B), but this
+        # tool forwards `location`, so a neighbour or grid point resolves on its SURFACE row
+        # and has no levels at ANY time. That is why this tests for a level-bearing ENTRY and
+        # not for rows: `base` is non-empty at such a point, so a rows test never fires here
+        # and the scan renders a confident header over a blank panel. Name that limit instead
+        # of listing locations that would mostly repeat it.
+        if loc_id.upper() != station.upper():
+            return (f"(no pressure-level data for {loc_id}: the model-data archive pulls "
+                    f"pressure levels for the SITE COLUMN only, so neighbour and grid points "
+                    f"carry surface fields but no levels. Re-run this scan for "
+                    f"{station.upper()} itself for the hazard picture.)")
+        return (f"(no pressure-level hazard data pre-fetched for {loc_id} -- the pressure-level "
+                f"bundle was not pulled for this cycle.)")
     valid = ref[0]
     out = [f"Hazard scan for {loc_id}, valid {valid:%Y-%m-%dT%HZ} -- conditions diagnosed from "
            "GFS + HRRR (no native icing/turbulence field; we confirm the ENVIRONMENT across "
@@ -2394,7 +2612,8 @@ def _stamp_fetched(result: ToolResult) -> ToolResult:
 
 
 def run_tool(name: str, args: dict, *, db_path: str | None = None,
-             evidence_ids: list[str] | None = None) -> ToolResult:
+             evidence_ids: list[str] | None = None,
+             station: str | None = None) -> ToolResult:
     """Execute a model-issued tool call. The read tools run against a READ-ONLY
     connection; the sinks (emit_taf, check_taf, submit_taf_worksheet) and the network
     fetches (get_current_taf, get_sounding, get_map, get_imagery, get_loop, get_terrain)
@@ -2415,7 +2634,7 @@ def run_tool(name: str, args: dict, *, db_path: str | None = None,
     if name == "get_sounding":
         return _stamp_fetched(_get_sounding(args))
     if name == "get_map":
-        return _stamp_fetched(_get_map(args))
+        return _stamp_fetched(_get_map(args, station))
     if name == "get_imagery":
         return _stamp_fetched(_get_imagery(args))
     if name == "get_loop":

@@ -299,11 +299,34 @@ def coords_for(station: str, *, include_grid: bool = True,
     return coords[:500]
 
 
-def hazard_coords(station: str, *, flow_from: float | None = None) -> list[tuple[float, float, str]]:
-    """Coordinates the pressure-level hazard bundle is pulled for: the site + the ring grid
-    (NOT the neighbor airfields -- those exist for surface obs collocation). Free points, so
-    this is a focus/clarity choice, not a cost one."""
+def hazard_coords(station: str, *, flow_from: float | None = None,
+                  include_grid: bool = False) -> list[tuple[float, float, str]]:
+    """Coordinates the pressure-level bundle is pulled for. SITE COLUMN ONLY by default.
+
+    CONFIG B, decided 2026-07-28. Points are free below 500 -- but only 500 IN TOTAL across
+    the network, and the level bundle is the expensive tier (17 valid times x up to 112
+    variables per model). At 71 stations the ring grid pushed level coordinates to 2,627 =
+    6 chunks, and the level tier is ~84% of the bill: ~29,900 of 33,630 credits per pull.
+
+    It bought nothing. NOTHING READS PRESSURE LEVELS OFF-SITE IN PRACTICE: `get_fcst_sounding`
+    passes `None` and so always resolves to the station itself, and `get_nearby_model_data` --
+    the only tool that reads every point -- reads one SURFACE alias at a time. Dropping the
+    grid here takes the pull from 33,630 to 10,085 credits.
+
+    ONE tool can still ASK off-site: `get_hazard_scan` forwards its `location` argument, so a
+    model naming a neighbour resolves it (it is in the SURFACE set) and then finds no levels.
+    That path is handled explicitly in `tools._fmt_hazard_scan`, which says the level bundle
+    is site-only and sends the model back to the station -- a named limit, not a blank panel.
+
+    The SURFACE grid is untouched (see `coords_for`): that is the one the agent actually
+    sees, and it is what shows an advecting front before it reaches the neighbour obs.
+
+    `include_grid=True` restores the old behaviour for a station where upstream structure
+    ALOFT is genuinely wanted -- and levels stay recoverable later via `asOf`, so this is a
+    reversible economy, unlike the live-fetched imagery."""
     site = site_coord(station)
+    if not include_grid:
+        return [site]
     return [site] + _grid_points(site[0], site[1], flow_from=flow_from)
 
 

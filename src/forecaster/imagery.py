@@ -8,12 +8,15 @@ model the same imagery a human forecaster reads keeps the comparison honest.
 Two families:
   - Satellite: three providers behind one region catalog, dispatched per region.provider.
     * goes_star: NOAA/NESDIS STAR CDN (cdn.star.nesdis.noaa.gov). Direct sized JPEGs by
-      scope (CONUS / full disk / named sector) and product (geocolor / visible band 02 /
-      clean-IR band 13 / mid-level water-vapor band 09). GOES-East = GOES19, GOES-West =
+      scope (CONUS / full disk / named sector) and product (geocolor / clean-IR band 13 /
+      mid-level water-vapor band 09). GOES-East = GOES19, GOES-West =
       GOES18 -- operator-updatable per bird (the retired GOES16/17 URLs redirect).
     * himawari_slider: RAMMB/CIRA SLIDER (Western Pacific / East Asia -- e.g. Japan). One
       zoom-0 tile IS the whole disk/sector, so a single fetch returns a full image with no
-      stitching; timestamped, so the cache is reproducible.
+      stitching; timestamped, so the cache is reproducible. Its tiles are RAW pixels --
+      coastlines, borders and the graticule are separate layers its web app composites in
+      the browser -- so we fetch and composite them too (_slider_overlay). Unlike the other
+      two providers, a bare SLIDER tile shows a VLM no way to say WHERE a feature is.
     * meteosat_eumetsat_wms: EUMETSAT's own WMS (Europe / Africa / Middle East). One GetMap
       returns an already-colorized RGB (MTG geocolour) with a coastline/border overlay --
       NOT a bare raster. Used instead of SLIDER's Meteosat, whose feed is unreliable.
@@ -40,8 +43,15 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
+from typing import NamedTuple
+
+# Pillow, NOT matplotlib -- charts.py stays the only matplotlib file. This is used for ONE
+# job: alpha-compositing SLIDER's separate map layers onto its raw tiles (see
+# _slider_overlay). It is a plain-PyPI dependency, already present via matplotlib.
+from PIL import Image
 
 from forecaster.radarsites import RADARS
 
@@ -63,23 +73,38 @@ _STAR_CDN = "https://cdn.star.nesdis.noaa.gov"
 
 # Canonical product vocabulary (the model-facing enum keys). For GOES the value is the STAR
 # product/band token; the non-GOES providers map the SAME keys to their own tokens below.
-# geocolor is the day/night default.
+# geocolor is the day/night default. These keys drive the get_imagery/get_loop enums directly
+# (tools._IMG_PRODUCTS, GET_LOOP), so adding or removing one here changes the model's menu.
+#
+# DAYTIME VISIBLE (ABI band 2) WAS REMOVED 2026-07-28 (owner's call). Nothing anywhere gated
+# it on solar elevation, so a night request returned a black image -- and a night LOOP returned
+# ten of them, which the archiver would then freeze as ~7-8% of total storage in black pixels.
+# It bought little when it did work: geocolor is true colour by day and needs no daylight
+# check. A stale `visible` argument is not an error -- the callers already coerce an unknown
+# product to geocolor (tools.py _imagery_satellite / _get_loop), so an old transcript replays.
 SAT_PRODUCTS: dict[str, str] = {
     "geocolor": "GEOCOLOR",   # true-color by day, IR-blended at night (default)
-    "visible": "02",          # ABI band 2, 0.64 um red visible (daytime only)
     "infrared": "13",         # ABI band 13, 10.3 um clean-IR window (cloud-top temp)
     "water_vapor": "09",      # ABI band 9, 6.9 um mid-level water vapor
 }
+
+
+def _goes_band(product: str) -> str:
+    """STAR band token for a canonical product, falling back to geocolor for an unknown one.
+    The SLIDER/OSPO/EUMETSAT maps already fall back via .get; GOES subscripted the dict, so a
+    retired product name (`visible`) raised KeyError here while every other provider served an
+    image. Same coercion everywhere means a stale archive receipt replays instead of crashing."""
+    return SAT_PRODUCTS.get(product, SAT_PRODUCTS["geocolor"])
 
 # Himawari-9 via RAMMB/CIRA SLIDER. A single zoom-0 tile = the whole disk/sector (no stitch).
 # Third-party relative to STAR -- watched, not trusted (like TropicalTidbits in wxmaps).
 _SLIDER_BASE = "https://rammb-slider.cira.colostate.edu"
 _SLIDER_SAT = "himawari"     # the only SLIDER bird we use; Meteosat comes from EUMETSAT direct
-# canonical product -> SLIDER Himawari-9 slug (band_03 = 0.64um vis, band_13 = 10.4um clean-IR,
-# band_09 = 6.9um mid-WV; the AHI analogues of the GOES canonical bands).
+# canonical product -> SLIDER Himawari-9 slug (band_13 = 10.4um clean-IR, band_09 = 6.9um
+# mid-WV; the AHI analogues of the GOES canonical bands). band_03 (0.64um vis) is deliberately
+# absent -- see the visible note on SAT_PRODUCTS.
 _SLIDER_PRODUCTS: dict[str, str] = {
-    "geocolor": "geocolor", "visible": "band_03",
-    "infrared": "band_13", "water_vapor": "band_09",
+    "geocolor": "geocolor", "infrared": "band_13", "water_vapor": "band_09",
 }
 
 # Meteosat via EUMETSAT's own WMS (SLIDER's Meteosat feed is unreliable). One GetMap returns a
@@ -88,18 +113,90 @@ _SLIDER_PRODUCTS: dict[str, str] = {
 # East. Products without a mapping fall back to geocolour in v1.
 _EUMETSAT_WMS = "https://view.eumetsat.int/geoserver/wms"
 _EUMETSAT_BOUNDARIES = "osmgray:all_boundaries_light"
-_EUMETSAT_LAYERS: dict[str, str] = {
-    "geocolor": "mtg_fd:rgb_geocolour", "visible": "mtg_fd:rgb_truecolour",
+# mtg_fd:ir105_hrfi rejects the boundary layer above with LayerNotDefined -- deterministic,
+# and specific to that PAIR (geocolour and vis06_hrfi accept it). So the overlay is per
+# layer, not one constant.
+_EUMETSAT_BOUNDARIES_IR = "osmgray:ne_10m_admin_0_boundary_lines_land"
+
+
+class EumetsatLayer(NamedTuple):
+    """A WMS layer plus the overlay and style that actually work WITH it."""
+    layer: str
+    overlay: str
+    style: str = ""
+
+
+# Until 2026-07-28 this held ONE entry, geocolor, and every other product fell through to it.
+# The result was not a missing product but a MISLABELLED one: get_imagery reported
+# "water_vapor satellite -- Europe" over byte-identical geocolour, confirmed by SHA-256 at
+# europe/middle_east/africa. Same failure class as the KMIB/KRCA wrong-ocean bug.
+#
+# WATER VAPOUR IS THE 6.2 um CHANNEL, NOT 6.9 um. MTG publishes no water vapour layer on this
+# WMS at all (wv063/wv073 in either naming return LayerNotDefined), so the only source is MSG
+# SEVIRI. 6.2 um peaks HIGHER than the GOES band 9 / Himawari band_09 the other providers
+# serve, which suits the synoptic use this product is pinned to -- upper-level WV is the
+# classic jet-and-PV-anomaly view -- but it is NOT the same channel, so do not compare a
+# European WV image against a CONUS one as if they were.
+# RETIREMENT RISK: msg_fes rides the 0-degree MSG leg being wound down as MTG takes over
+# (MTG-I2 commissions 2026). It is the ONLY water vapour available here and has no announced
+# MTG replacement. Re-check before any long round.
+_EUMETSAT_LAYERS: dict[str, EumetsatLayer] = {
+    "geocolor": EumetsatLayer("mtg_fd:rgb_geocolour", _EUMETSAT_BOUNDARIES),
+    # MTG for IR (long-lived, 1 km, PT10M); style_01 enhances cold cloud tops, which the
+    # default flat greyscale does not.
+    "infrared": EumetsatLayer("mtg_fd:ir105_hrfi", _EUMETSAT_BOUNDARIES_IR,
+                              "mtg_fd_ir105_hrfi_style_01"),
 }
 _EUMETSAT_DEFAULT = "geocolor"
 
+# WATER VAPOUR IS DELIBERATELY ABSENT FOR METEOSAT (owner's call 2026-07-28), and callers
+# MUST refuse rather than fall back. The only candidate was msg_fes:wv062, and it failed three
+# ways at once: 6.2 um upper-level, not the 6.9 um mid-level band GOES/Himawari serve, so it is
+# not comparable across the roster; raw greyscale with no colour enhancement, against the STAR
+# products' blue-dry/yellow-moist scale; and NO usable overlay -- every boundary layer we tried
+# came back byte-identical to the bare image, leaving an unlabelled grey field with nothing to
+# locate a station against. It also rode the MSG leg being retired for MTG, which publishes no
+# water vapour at all. A silent fallback to geocolour is what produced the mislabelled imagery
+# this replaced, so `meteosat_has_product` gates it and the tool says "unavailable" instead.
+def meteosat_has_product(product: str) -> bool:
+    """False for a product Meteosat cannot honestly serve, so the caller can refuse.
+
+    The fallback in `_eumetsat_getmap_url` is a LAST RESORT for an unknown string, not a
+    licence to serve geocolour under another product's name -- that mislabelling is the bug
+    this function exists to prevent."""
+    return product in _EUMETSAT_LAYERS
+
+
+# MTG posts on a 10-minute grid. `nearestValue="1"` means the server SNAPS a requested time to
+# the nearest scan it holds instead of failing, so a request is never exact -- measured
+# 2026-07-28: at 00:14Z the newest held scan was 23:50Z, a request for 00:00Z snapped silently
+# back to it, and 00:10Z returned HTTP 502. So a caller can be wrong by at most one step, and
+# the receipt must SAY the instant it asked for rather than imply the instant it received.
+_EUMETSAT_CADENCE_MIN = 10
+# Measured lag was 15-24 min; 25 clears it with margin. Too small only costs a retry, because
+# `fetch_satellite` walks back a step at a time rather than trusting this constant.
+_EUMETSAT_POST_LAG_MIN = 25
+_EUMETSAT_MAX_STEPBACK = 6         # 6 x 10 min = an hour of outage tolerated before giving up
+
+
+def eumetsat_time(at: datetime | None = None) -> datetime:
+    """The scan slot to request: `at` (or now minus the post lag) snapped DOWN to the cadence.
+
+    Idempotent -- an already-snapped time returns unchanged. That property is what
+    soundings.synoptic_time lacked, where re-snapping stepped the product back a slot each
+    time it was applied and the receipt, the cited URL and the delivered image disagreed."""
+    t = at if at is not None else _utcnow() - timedelta(minutes=_EUMETSAT_POST_LAG_MIN)
+    return t.replace(minute=(t.minute // _EUMETSAT_CADENCE_MIN) * _EUMETSAT_CADENCE_MIN,
+                     second=0, microsecond=0)
+
 # Himawari-9 tight regional views via NOAA/OSPO (JMA relay): clean rectangular sector GIFs
-# with coastlines, a color scale, and a printed timestamp. Day/night enhanced-IR ("rb"), plus
-# daytime visible and water vapor -- NO geocolor, so geocolor falls back to enhanced IR (the
-# tool relabels it 'infrared'). scope = the OSPO sector path (e.g. "jma/japan").
+# with coastlines, a color scale, and a printed timestamp. Day/night enhanced-IR ("rb") plus
+# water vapor -- NO geocolor, so geocolor falls back to enhanced IR (the tool relabels it
+# 'infrared'). That makes geocolor and infrared the SAME bytes here; the archiver's content
+# hash is what collapses the duplicate. scope = the OSPO sector path (e.g. "jma/japan").
 _OSPO_BASE = "https://www.ospo.noaa.gov"
 _OSPO_PRODUCTS: dict[str, str] = {
-    "geocolor": "rb", "infrared": "rb", "visible": "vis", "water_vapor": "wv",
+    "geocolor": "rb", "infrared": "rb", "water_vapor": "wv",
 }
 
 # Human-readable source per provider, for receipts/provenance.
@@ -173,6 +270,14 @@ SAT_REGIONS: dict[str, SatRegion] = {
         # generously by design -- the nearest-center rule below arbitrates.
         SatRegion("northern_rockies", GOES_EAST, "SECTOR/nr", "1200x1200", "Northern Rockies",
                   (-117.0, 42.0, -99.0, 49.5)),
+        # Southern South America -- the Patagonia winter sites. Verified 2026-07-28: all four
+        # canonical products at 1800x1080 with national/provincial borders, covering ~15S-56S
+        # (Tierra del Fuego included). WITHOUT this row all 8 SH stations resolved to
+        # full_disk_east, where a Patagonian airfield is a few pixels -- not an error, a silent
+        # collapse to a useless zoom. Rides goes_star (no new provider), and its STAR directory
+        # index feeds _star_frame_index (1,445 frames / 10 days verified), so get_loop works too.
+        SatRegion("south_america_south", GOES_EAST, "SECTOR/ssa", "1800x1080",
+                  "Southern South America", (-95.0, -58.0, -30.0, -15.0)),
         # Himawari-9: full_disk is the wide SLIDER geocolor view (clean single tile). japan is
         # the TIGHT local view via OSPO (clean rectangular enhanced-IR GIF, coastlines + scale +
         # timestamp) -- SLIDER's japan tile is padded/irregular, so OSPO serves the tight one.
@@ -206,21 +311,95 @@ def satellite_source(region: str) -> str:
     return _PROVIDER_SOURCE[SAT_REGIONS[region].provider]
 
 
-def _eumetsat_getmap_url(r: SatRegion, product: str) -> str:
-    """Exact EUMETSAT WMS GetMap URL: colorized RGB layer + a coastline/border overlay over
-    the region bbox. TIME omitted -> the server returns the latest scan."""
-    layer = _EUMETSAT_LAYERS.get(product, _EUMETSAT_LAYERS[_EUMETSAT_DEFAULT])
+def _eumetsat_getmap_url(r: SatRegion, product: str, at: datetime | None = None) -> str:
+    """Exact EUMETSAT WMS GetMap URL: the product's layer + the overlay THAT LAYER accepts,
+    over the region bbox, at an EXPLICIT scan time.
+
+    TIME IS NEVER OMITTED. Omitting it does not return the latest scan -- it returns a server
+    default of unknown vintage. Measured 2026-07-28: a no-TIME fetch at 00:07Z returned a
+    BROAD DAYLIGHT scene over a Europe that was in darkness, while an explicit 23:20Z returned
+    the correct night image with city lights. Every Meteosat image served before this fix
+    carried an unknown valid time, stamped only with OUR fetch time.
+
+    `styles` carries one entry per requested layer, so the overlay's empty slot after the
+    comma is load-bearing -- dropping it styles the boundary layer with the product's style."""
+    spec = _EUMETSAT_LAYERS.get(product, _EUMETSAT_LAYERS[_EUMETSAT_DEFAULT])
     width, height = r.size.split("x")
     w, s, e, n = r.bbox
+    styles = f"&styles={spec.style}," if spec.style else ""
     return (f"{_EUMETSAT_WMS}?service=WMS&version=1.1.1&request=GetMap"
-            f"&layers={layer},{_EUMETSAT_BOUNDARIES}&srs=EPSG:4326"
-            f"&bbox={w},{s},{e},{n}&width={width}&height={height}&format=image/png")
+            f"&layers={spec.layer},{spec.overlay}{styles}&srs=EPSG:4326"
+            f"&bbox={w},{s},{e},{n}&width={width}&height={height}&format=image/png"
+            f"&time={eumetsat_time(at):%Y-%m-%dT%H:%M:%S}Z")
 
 
 def _slider_tile_url(sector: str, prod: str, ts: str, *, sat: str = _SLIDER_SAT) -> str:
     """Zoom-0 single-tile URL -- the whole disk/sector as one image (no stitching)."""
     return (f"{_SLIDER_BASE}/data/imagery/{ts[0:4]}/{ts[4:6]}/{ts[6:8]}"
             f"/{sat}---{sector}/{prod}/{ts}/00/000_000.png")
+
+
+# --- SLIDER map overlays -------------------------------------------------------------
+# SLIDER serves RAW imagery. The coastlines, borders and graticule its web app shows are
+# SEPARATE tile layers composited in the BROWSER, so fetching a tile alone returns a picture
+# with no geographic reference at all -- a full-disk water-vapour image where nothing says
+# which moisture plume sits over which country, which is not a readable product for a VLM.
+# GOES (STAR) burns its boundaries in and Meteosat IR composites one server-side; SLIDER is
+# the one provider where we have to draw the map ourselves.
+#
+# The layers are STATIC: their latest_times_all.json reports a single epoch stamp for every
+# sector, so the same bytes serve every scan and a process-lifetime memo turns a 10-frame
+# loop from 30 extra throttled requests into 3. Tuple order is DRAW order -- graticule
+# first, coastlines over it, national borders on top.
+_SLIDER_MAP_TS = "19700101010000"
+_SLIDER_MAPS = ("lat", "coastlines", "countries")
+# White reads on all three products: the WV orange/red enhancement, clean-IR greyscale, and
+# geocolor's bright day side (checked by eye 2026-07-28). SLIDER offers other colours.
+_SLIDER_MAP_COLOR = "white"
+_slider_map_cache: dict[tuple[str, str], bytes] = {}
+
+
+def _slider_map_url(sector: str, layer: str, *, sat: str = _SLIDER_SAT) -> str:
+    """Static map-overlay tile for a SLIDER sector (zoom 0, same grid as the imagery tile)."""
+    return (f"{_SLIDER_BASE}/data/maps/{sat}/{sector}/{layer}/{_SLIDER_MAP_COLOR}"
+            f"/{_SLIDER_MAP_TS}/00/000_000.png")
+
+
+def _slider_map_tile(sector: str, layer: str) -> bytes:
+    if (key := (sector, layer)) not in _slider_map_cache:
+        _slider_map_cache[key] = _get(_slider_map_url(sector, layer), referer=_SLIDER_BASE)
+    return _slider_map_cache[key]
+
+
+def _slider_overlay(data: bytes, sector: str) -> bytes:
+    """Draw SLIDER's map layers onto a raw tile. Returns PNG bytes.
+
+    Returns `data` UNCHANGED on any failure, and skips any single layer whose grid does not
+    match the tile. This runs inside the agent loop: a bare image is a degraded product but
+    still readable weather, while an exception here would cost the whole tool call."""
+    try:
+        src = Image.open(BytesIO(data))
+        was_paletted = src.mode == "P"
+        base = src.convert("RGBA")
+        for layer in _SLIDER_MAPS:
+            ov = Image.open(BytesIO(_slider_map_tile(sector, layer))).convert("RGBA")
+            if ov.size != base.size:
+                continue
+            base.alpha_composite(ov)
+        out = base.convert("RGB")
+        # SLIDER's IR and water-vapour tiles ship as 8-bit PALETTE PNGs; writing them back as
+        # true colour triples the file for no visible gain (measured: WV full disk 185 KB
+        # bare -> 563 KB RGB -> 222 KB requantized, and the three re-encodings are
+        # indistinguishable by eye). The overlay adds one colour plus antialiasing, so 256
+        # entries still hold it. Geocolor arrives as RGB and is left alone -- quantizing true
+        # colour to 256 would be a real loss, and it only grows 4% anyway.
+        if was_paletted:
+            out = out.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+        buf = BytesIO()
+        out.save(buf, "PNG")
+        return buf.getvalue()
+    except Exception:  # noqa: BLE001 -- an overlay failure must not cost the image
+        return data
 
 
 def _slider_latest_ts(sector: str, prod: str, *, sat: str = _SLIDER_SAT) -> str:
@@ -230,20 +409,20 @@ def _slider_latest_ts(sector: str, prod: str, *, sat: str = _SLIDER_SAT) -> str:
     return str(json.loads(raw)["timestamps_int"][0])
 
 
-def satellite_url(region: str, product: str) -> str:
+def satellite_url(region: str, product: str, at: datetime | None = None) -> str:
     """Provenance URL for a region+product (no network). GOES and EUMETSAT are exact and
     fetchable as-is; the SLIDER reference is the latest-times index (the tile URL needs the
     served timestamp, resolved in fetch_satellite)."""
-    r = SAT_REGIONS[region]
+    r = SAT_REGIONS[synoptic_region(region, product)]
     if r.provider == "goes_star":
-        return f"{_STAR_CDN}/GOES{r.sat}/ABI/{r.scope}/{SAT_PRODUCTS[product]}/{r.size}.jpg"
+        return f"{_STAR_CDN}/GOES{r.sat}/ABI/{r.scope}/{_goes_band(product)}/{r.size}.jpg"
     if r.provider == "himawari_slider":
         prod = _SLIDER_PRODUCTS.get(product, "geocolor")
         return f"{_SLIDER_BASE}/data/json/{_SLIDER_SAT}/{r.scope}/{prod}/latest_times.json"
     if r.provider == "himawari_ospo":
         return f"{_OSPO_BASE}/{r.scope}/{_OSPO_PRODUCTS.get(product, 'rb')}.gif"
     if r.provider == "meteosat_eumetsat_wms":
-        return _eumetsat_getmap_url(r, product)
+        return _eumetsat_getmap_url(r, product, at)
     raise ValueError(f"unknown satellite provider {r.provider!r}")
 
 
@@ -276,6 +455,42 @@ def satellite_region_for_latlon(lat: float, lon: float) -> str | None:
     if _GOES_LON[0] <= lon <= _GOES_LON[1] and _GOES_LAT[0] <= lat <= _GOES_LAT[1]:
         return "full_disk_west" if lon < _EAST_WEST_LON else "full_disk_east"
     return None
+
+
+# Water vapor is a BIG-PICTURE product: it shows the jet, the dry slot and the upper-level
+# wave, none of which fit in a station sector. So water_vapor is pinned to a synoptic parent
+# scope rather than the tight sector the cloud products use (owner's call 2026-07-28).
+#
+# This also clamps the archive. The 71 stations resolve to 16 sectors, but only to SIX
+# synoptic scopes, and the whole CONUS -- 48 stations across 8 sectors -- shares ONE image.
+# A region absent here is already synoptic (full disks, ssa at 1800x1080) and maps to itself.
+_SYNOPTIC_WV: dict[str, str] = {
+    "northeast": "conus_east", "southeast": "conus_east",
+    "southern_plains": "conus_east", "southern_rockies": "conus_east",
+    "upper_mississippi": "conus_east", "great_lakes": "conus_east",
+    "northern_rockies": "conus_east",
+    # The two Pacific-coast sectors are GOES-WEST, but their synoptic view is GOES-East
+    # CONUS for the same reason the fallback above is: GOES-West's "CONUS" is PACUS and
+    # does not contain the continental US. A west-coast forecaster tracking flow upstream
+    # over the Pacific wants full_disk_west instead -- change these two lines if so.
+    "pacific_northwest": "conus_east", "pacific_southwest": "conus_east",
+    # Hawaii's upstream IS the open Pacific, so PACUS is the correct synoptic scope here.
+    "hawaii": "conus_west",
+    # The tropics widen to the FULL DISK, not to CONUS: GOES-East's CONUS sector does not
+    # reliably reach 18 N, so widening a Caribbean request into it can return a picture that
+    # excludes the very area asked for -- and the full disk is the correct synoptic scope for
+    # a tropical site anyway (the upstream Atlantic and the ITCZ are in frame).
+    "puerto_rico": "full_disk_east", "caribbean": "full_disk_east",
+    "himawari_japan": "himawari_full_disk",
+}
+
+
+def synoptic_region(region: str, product: str) -> str:
+    """The scope to actually fetch for a region+product. Only water_vapor is widened; every
+    other product keeps the tight sector, so cloud detail at the field is unchanged."""
+    if product != "water_vapor":
+        return region
+    return _SYNOPTIC_WV.get(region, region)
 
 
 # --- Radar: Iowa Environmental Mesonet (pre-composited via radmap.php) ----------------
@@ -387,15 +602,56 @@ def _get(url: str, *, referer: str | None = None) -> bytes:
         return resp.read()
 
 
-def _cache_write(path: Path, data: bytes) -> None:
+def _get_eumetsat(build_url, at: datetime | None) -> tuple[bytes, str]:
+    """GET a EUMETSAT GetMap, stepping BACK a cadence slot when the slot is not posted yet.
+
+    The post lag varies, and a slot ahead of what the server holds returns HTTP 502 rather
+    than degrading -- measured 2026-07-28. Walking back beats trusting `_EUMETSAT_POST_LAG_MIN`
+    as a constant, because the constant is only ever right on average. The returned URL carries
+    the `&time=` actually requested, so the receipt cites the slot that was served, not the one
+    the caller first asked for."""
+    slot = eumetsat_time(at)
+    last: Exception | None = None
+    for _ in range(_EUMETSAT_MAX_STEPBACK):
+        url = build_url(slot)
+        try:
+            return _get(url), url
+        except Exception as e:  # noqa: BLE001 -- any failure means try the previous scan
+            last = e
+            slot -= timedelta(minutes=_EUMETSAT_CADENCE_MIN)
+    raise last
+
+
+def _cache_write(path: Path, data: bytes, url: str | None = None) -> None:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
+    if url is not None:
+        path.with_suffix(".url").write_text(url, encoding="utf-8")
 
 
-def fetch_satellite(region: str, product: str, *, use_cache: bool = False) -> tuple[bytes, str]:
+def _cache_read(path: Path) -> tuple[bytes, str] | None:
+    """Cached bytes plus the URL they were actually SERVED from, or None for a miss.
+
+    Only needed where the served URL is not derivable from the cache key. A EUMETSAT fetch
+    steps back to an earlier scan when the requested slot is not posted, so keying on the
+    REQUESTED slot and then rebuilding the URL from that key would cite a scan time the
+    stored image does not have -- the requested/served split the archive depends on."""
+    sidecar = path.with_suffix(".url")
+    if not (path.exists() and sidecar.exists()):
+        return None
+    return path.read_bytes(), sidecar.read_text(encoding="utf-8").strip()
+
+
+def fetch_satellite(region: str, product: str, *, use_cache: bool = False,
+                    at: datetime | None = None) -> tuple[bytes, str]:
     """Fetch one satellite image; returns (image bytes, exact fetched URL). Analysis-style
     'now' imagery: GOES/EUMETSAT cache on the fetch hour (like wxmaps analysis charts); SLIDER
-    caches on the served timestamp (reproducible). Dispatches on the region's provider."""
+    caches on the served timestamp (reproducible). Dispatches on the region's provider.
+
+    water_vapor is widened to its synoptic scope FIRST, so the cache key is the widened
+    region -- that is what makes eight CONUS sectors share one cached WV image instead of
+    storing eight crops of the same picture."""
+    region = synoptic_region(region, product)
     r = SAT_REGIONS[region]
     if r.provider == "himawari_slider":
         prod = _SLIDER_PRODUCTS.get(product, "geocolor")
@@ -404,12 +660,23 @@ def fetch_satellite(region: str, product: str, *, use_cache: bool = False) -> tu
         cache_file = _CACHE_DIR / f"sat_{region}_{prod}_{ts}.png"
         if use_cache and cache_file.exists():
             return cache_file.read_bytes(), url
-        data = _get(url, referer=_SLIDER_BASE)
+        # Overlay BEFORE caching, so a cache hit serves the same picture as a live fetch.
+        data = _slider_overlay(_get(url, referer=_SLIDER_BASE), r.scope)
         if use_cache:
             _cache_write(cache_file, data)
         return data, url
-    # goes_star / himawari_ospo / meteosat_eumetsat_wms: one deterministic GET (latest scan),
-    # cache on the fetch hour.
+    if r.provider == "meteosat_eumetsat_wms":
+        # Keyed on the SCAN SLOT, not the fetch hour: the slot is what the image actually is,
+        # so a replay for a past instant cannot collide with a live fetch made the same hour.
+        slot = eumetsat_time(at)
+        cache_file = _CACHE_DIR / f"sat_{region}_{product}_{slot:%Y%m%dT%H%M}.png"
+        if use_cache and (hit := _cache_read(cache_file)) is not None:
+            return hit
+        data, url = _get_eumetsat(lambda s: _eumetsat_getmap_url(r, product, s), at)
+        if use_cache:
+            _cache_write(cache_file, data, url)
+        return data, url
+    # goes_star / himawari_ospo: one deterministic GET (latest scan), cache on the fetch hour.
     url = satellite_url(region, product)
     ext = {"goes_star": "jpg", "himawari_ospo": "gif"}.get(r.provider, "png")
     cache_file = _CACHE_DIR / f"sat_{region}_{product}_{_utcnow():%Y%m%d%H}.{ext}"
@@ -425,27 +692,33 @@ _METEOSAT_PAD_DEG = 7.0   # half-width of a station-centered Meteosat view (~150
 
 
 def meteosat_point_url(lat: float, lon: float, product: str,
-                       *, pad: float = _METEOSAT_PAD_DEG) -> str:
+                       *, pad: float = _METEOSAT_PAD_DEG, at: datetime | None = None) -> str:
     """EUMETSAT WMS GetMap centered on a point -- a tight, station-local Meteosat view. The
-    WMS takes an arbitrary bbox, so no fixed sector is needed (the station-crop upgrade)."""
-    layer = _EUMETSAT_LAYERS.get(product, _EUMETSAT_LAYERS[_EUMETSAT_DEFAULT])
+    WMS takes an arbitrary bbox, so no fixed sector is needed (the station-crop upgrade).
+    Carries an explicit TIME for the same reason `_eumetsat_getmap_url` does."""
+    spec = _EUMETSAT_LAYERS.get(product, _EUMETSAT_LAYERS[_EUMETSAT_DEFAULT])
     w, s, e, n = lon - pad, lat - pad, lon + pad, lat + pad
+    styles = f"&styles={spec.style}," if spec.style else ""
     return (f"{_EUMETSAT_WMS}?service=WMS&version=1.1.1&request=GetMap"
-            f"&layers={layer},{_EUMETSAT_BOUNDARIES}&srs=EPSG:4326"
-            f"&bbox={w:.3f},{s:.3f},{e:.3f},{n:.3f}&width=900&height=900&format=image/png")
+            f"&layers={spec.layer},{spec.overlay}{styles}&srs=EPSG:4326"
+            f"&bbox={w:.3f},{s:.3f},{e:.3f},{n:.3f}&width=900&height=900&format=image/png"
+            f"&time={eumetsat_time(at):%Y-%m-%dT%H:%M:%S}Z")
 
 
 def fetch_meteosat_point(lat: float, lon: float, product: str,
-                         *, use_cache: bool = False) -> tuple[bytes, str]:
-    """Fetch a station-centered Meteosat view; returns (png bytes, exact URL). Analysis-style
-    'now' imagery, so the opt-in cache keys on the fetch hour + point."""
-    url = meteosat_point_url(lat, lon, product)
-    cache_file = _CACHE_DIR / f"sat_meteosat_{lat:.1f}_{lon:.1f}_{product}_{_utcnow():%Y%m%d%H}.png"
-    if use_cache and cache_file.exists():
-        return cache_file.read_bytes(), url
-    data = _get(url)
+                         *, use_cache: bool = False,
+                         at: datetime | None = None) -> tuple[bytes, str]:
+    """Fetch a station-centered Meteosat view; returns (png bytes, exact URL). Keyed on the
+    SCAN SLOT rather than the fetch hour, so a replay cannot collide with a live fetch."""
+    slot = eumetsat_time(at)
+    cache_file = (_CACHE_DIR /
+                  f"sat_meteosat_{lat:.1f}_{lon:.1f}_{product}_{slot:%Y%m%dT%H%M}.png")
+    if use_cache and (hit := _cache_read(cache_file)) is not None:
+        return hit
+    data, url = _get_eumetsat(
+        lambda s: meteosat_point_url(lat, lon, product, at=s), at)
     if use_cache:
-        _cache_write(cache_file, data)
+        _cache_write(cache_file, data, url)
     return data, url
 
 
@@ -501,7 +774,12 @@ class LoopFrame:
     or month ('28 15:56Z'), fine on a filmstrip tile and useless as a storage key, and the
     requested time is not the served time once `_select_times` snaps to a real scan. Frames
     are shared across stations sitting in the same satellite sector, so `url` doubles as the
-    natural de-duplication key."""
+    natural de-duplication key.
+
+    `data` is the frame AS DELIVERED, which for SLIDER means the raw tile with the map
+    layers already composited (see `_slider_overlay`) -- so re-fetching `url` returns the
+    bare tile, not these bytes. That is deliberate: an archive should hold what the model
+    saw, and the overlay layers are static, so the composite stays reproducible either way."""
     time: datetime
     label: str
     url: str
@@ -512,7 +790,7 @@ def _star_frame_index(sat: str, scope: str, product: str) -> dict[datetime, dict
     """{valid time -> {size -> url}} from the CDN's directory index for one bird/scope/
     product. The index IS the archive listing, so every frame named here is a frame that
     exists -- the empty-NAM-directory failure mode cannot happen silently."""
-    base = f"{_STAR_CDN}/GOES{sat}/ABI/{scope}/{SAT_PRODUCTS[product]}/"
+    base = f"{_STAR_CDN}/GOES{sat}/ABI/{scope}/{_goes_band(product)}/"
     html = _get(base).decode("utf-8", "replace")
     out: dict[datetime, dict[str, str]] = {}
     for name, stamp, size in _STAR_FRAME_RE.findall(html):
@@ -588,7 +866,9 @@ def _slider_loop_frames(sector: str, product: str, n: int, step_min: int,
     for t in _select_times(_slider_times(sector, prod), n, step_min, at):
         url = _slider_tile_url(sector, prod, f"{t:%Y%m%d%H%M%S}")
         if (data := _frame_get(url, referer=_SLIDER_BASE)) is not None:
-            out.append(LoopFrame(t, f"{t:%d %H:%MZ}", url, data))
+            # Every frame gets the map, not just the still: a night geocolor loop over open
+            # ocean is otherwise ten near-identical dark tiles with nothing to place them by.
+            out.append(LoopFrame(t, f"{t:%d %H:%MZ}", url, _slider_overlay(data, sector)))
     return out
 
 
@@ -602,10 +882,19 @@ def _eumetsat_loop_frames(lat: float, lon: float, product: str, n: int, step_min
     if at is None:
         base -= timedelta(minutes=20)
     out: list[LoopFrame] = []
-    for t in sorted(base - timedelta(minutes=step_min * k) for k in range(n)):
-        url = meteosat_point_url(lat, lon, product) + f"&time={t:%Y-%m-%dT%H:%M:00.000Z}"
+    for k in range(n):
+        # Snap HERE, then label and fetch off the same value. meteosat_point_url snaps its
+        # own `at` down to the 10-min cadence, so a step_min that is not a multiple of 10
+        # (the schema clamps the range but not the multiple) would otherwise label a frame
+        # 11:45Z over the 11:40Z scan -- the label-over-wrong-content class again.
+        t = eumetsat_time(base - timedelta(minutes=step_min * k))
+        # `at=t` and NOT a second appended &time=: the WMS honours the FIRST time it is
+        # given, so appending one after meteosat_point_url's own served every frame the
+        # same scan under a different label -- motion that was really a still.
+        url = meteosat_point_url(lat, lon, product, at=t)
         if (data := _frame_get(url)) is not None:
             out.append(LoopFrame(t, f"{t:%d %H:%MZ}", url, data))
+    out.sort(key=lambda f: f.time)
     return out
 
 
@@ -629,6 +918,7 @@ def satellite_loop(lat: float, lon: float, product: str, *, frames: int = LOOP_D
     region = satellite_region_for_latlon(lat, lon)
     if region is None:
         raise ValueError("no geostationary satellite coverage for this point")
+    region = synoptic_region(region, product)          # water_vapor loops the big picture
     r = SAT_REGIONS[region]
     if r.provider == "meteosat_eumetsat_wms":
         fr = _eumetsat_loop_frames(lat, lon, product, frames, step_min, at)

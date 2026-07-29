@@ -95,6 +95,10 @@ class AgentConfig:
     # (fatal + loop ends), so one stuck or endlessly-ruminating turn fails ITS cell instead
     # of hanging the whole matrix. None = the client default (10 min).
     request_timeout: float | None = None
+    # The station this run is forecasting. Threaded to run_tool so geographically-gated
+    # tools (get_map) know where they are WITHOUT trusting a model-supplied argument --
+    # a model that omits it must not thereby unlock the US chart set for a foreign site.
+    station: str | None = None
 
 
 @dataclass
@@ -285,7 +289,8 @@ def run_agent(messages: list[dict], cfg: AgentConfig, *, client=None) -> RunResu
             if name == "emit_taf" and res.first_emit_step is None:
                 res.first_emit_step = n     # first convergence attempt, clean or not
 
-            result = run_tool(name, args, db_path=cfg.db_path, evidence_ids=ev_ids or None)
+            result = run_tool(name, args, db_path=cfg.db_path, evidence_ids=ev_ids or None,
+                              station=cfg.station)
 
             # EVIDENCE THREADING: tag a data-tool receipt with a fresh id the model can cite.
             receipt = result.text

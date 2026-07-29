@@ -15,10 +15,12 @@ import. Parsing and persistence stay in the metar/taf + store seams.
 
 import json
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from forecaster import store
 from forecaster.metar import MetarObs, parse
@@ -31,18 +33,47 @@ _AWC_URL = "https://aviationweather.gov/api/data/{product}"
 _MIN_REQUEST_INTERVAL_S = 1.0
 _last_request = 0.0
 
+# AWC intermittently returns 502/504 under load (observed 2026-07-28 during a 142-request
+# station-catalog build, which it killed outright). Retry transient 5xx the same way iem.py
+# does. Deliberately SHORTER backoff than IEM's 15s*attempt: those are rate limits, these are
+# gateway blips, and callers like poll_tafs run on a 5-minute cron. A non-retryable code
+# (a real 400) still raises immediately.
+_MAX_HTTP_RETRIES = 4
+# 304 is here deliberately. We never send a conditional header, so "Not Modified" is not a
+# valid answer to our request -- it is the edge cache misbehaving under sustained load, and
+# urllib raises it as an HTTPError with no body. Observed 2026-07-28: it killed a
+# build_neighbors run on its FIRST call, minutes after an 800-request audit pass, while a
+# plain curl to the same URL returned 200. Transient, so retry it like the 5xx family.
+_RETRY_HTTP_CODES = (304, 429, 500, 502, 503, 504)
+
 
 def _get(product: str, params: dict) -> list[dict]:
-    """GET one AWC data product as a JSON list, spacing requests politely."""
+    """GET one AWC data product as a JSON list, spacing requests politely, retrying
+    transient 5xx. The throttle is re-applied before EVERY attempt, so a retry can never
+    fire back-to-back with the request that was just rejected."""
     url = f"{_AWC_URL.format(product=product)}?{urllib.parse.urlencode(params)}"
 
     global _last_request
-    if (wait := _MIN_REQUEST_INTERVAL_S - (time.monotonic() - _last_request)) > 0:
-        time.sleep(wait)
-    _last_request = time.monotonic()
-
-    with urllib.request.urlopen(url, timeout=60) as resp:
-        body = resp.read().decode().strip()
+    last_error: Exception | None = None
+    body = None
+    for attempt in range(1, _MAX_HTTP_RETRIES + 1):
+        if (wait := _MIN_REQUEST_INTERVAL_S - (time.monotonic() - _last_request)) > 0:
+            time.sleep(wait)
+        _last_request = time.monotonic()
+        try:
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                body = resp.read().decode().strip()
+            break
+        except urllib.error.HTTPError as e:
+            last_error = e
+            if e.code not in _RETRY_HTTP_CODES:
+                raise
+        except urllib.error.URLError as e:               # transient connection drop
+            last_error = e
+        if attempt < _MAX_HTTP_RETRIES:
+            time.sleep(3 * attempt)
+    if body is None:
+        raise last_error                                 # exhausted retries
     # AWC returns HTTP 204 / an empty body when a product has no rows for the query (e.g. a
     # station not currently reporting). That is "no data", not an error -- return an empty list
     # so callers see zero rows instead of a JSONDecodeError on the empty string.
@@ -63,11 +94,18 @@ def _from_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
 
 
+@lru_cache(maxsize=512)
 def station_latlon(station: str) -> tuple[float, float]:
     """(lat, lon) for an ICAO from AWC's station-info product. Keyed on the EXACT id
     (no K-stripping), so it resolves major airports and OCONUS sites that IEM's ASOS
     metadata lookup can miss (e.g. KMSP collides with a TDWR sid there). Raises
-    ValueError if the id is unknown."""
+    ValueError if the id is unknown.
+
+    CACHED for the process lifetime: an aerodrome does not move, and the geographic gates in
+    tools.py (get_map, get_imagery, radar) call this on EVERY invocation. Uncached it added a
+    throttled round trip -- 1 s minimum, up to ~18 s through the 5xx retry ladder -- to the
+    most-used tool in the loop, against a 30-min per-cell timeout that already killed 121
+    round-1 cells. A raised ValueError is not cached, so an unknown id is re-tried."""
     icao = station.upper()
     for r in _get("stationinfo", {"ids": icao, "format": "json"}) or []:
         lat, lon = r.get("lat"), r.get("lon")

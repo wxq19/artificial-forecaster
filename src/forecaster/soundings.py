@@ -19,8 +19,11 @@ cache-aware so a pre-staged image can replay offline. The cache is OPT-IN
 we actually want to keep.
 """
 
+import re
 import time
+import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -101,6 +104,236 @@ def cache_path(site: str, when: datetime | None = None, *, source: str = "spc") 
     can point a reviewer at the exact file the model will read."""
     _, ext = _SOURCES[source]
     return _CACHE_DIR / f"{source}_{site.upper()}_{synoptic_time(when):%Y%m%d%H}.{ext}"
+
+
+# --- BUFR source: availability-driven, not synoptic-snapped -------------------------
+#
+# WHY THIS EXISTS. The two image providers above serve only the sites they pre-render, and
+# `synoptic_time()` assumes every ascent is at 00Z or 12Z. Both assumptions fail outside
+# CONUS: the legacy Wyoming image index has no South American stations at all, and real
+# stations launch OFF-CYCLE. Measured 2026-07-28: 87155 Resistencia launched at 15Z, and its
+# yearly inventory shows 1500 recurring through the record. **An off-cycle ascent is
+# released BECAUSE something is happening** -- a special ascent ahead of severe weather, the
+# same reason CONUS sites add 06Z/18Z. Snapping to the nearest synoptic hour therefore does
+# not just miss a profile, it systematically discards the most informative ones.
+#
+# So this path never snaps. It asks the provider what exists (`inventory`, ONE request per
+# station-year, which is why enumerating is affordable) and takes the newest launch at or
+# before the cutoff. Note the endpoint also MOVED: the legacy `cgi-bin/sounding` now 404s.
+_BUFR_URL = "https://weather.uwyo.edu/wsgi/sounding"
+
+# BUFR serves TEXT only -- PNG:SKEWT/GIF:SKEWT return a 2.6 KB HTML wrapper with no image
+# (re-confirmed 2026-07-28), so we pull the CSV and render through charts.skewt, the same
+# text-in/chart-out path the BUFKIT profiles used before they were retired.
+_BUFR_CSV_COLS = {"pressure_hPa": "pres", "geopotential height_m": "hght",
+                  "temperature_C": "tmpc", "dew point temperature_C": "dwpc",
+                  "wind direction_degree": "drct", "wind speed_m/s": "wspd_ms"}
+_MS_TO_KT = 1.9438444924406
+
+
+@dataclass(frozen=True)
+class ObsProfile:
+    """An OBSERVED radiosonde ascent, duck-typed for charts.skewt (same field names as
+    modeldata.FcstProfile). `title` is set so the chart cannot be captioned 'forecast'."""
+    station: str
+    launched: datetime            # the ACTUAL launch time, naive UTC
+    lat: float
+    lon: float
+    pres: list[float]             # hPa
+    tmpc: list[float]             # C
+    dwpc: list[float]             # C
+    drct: list[float]             # deg
+    sknt: list[float]             # kt (CSV is m/s -- converted here)
+    hght: list[float]             # m
+    n_raw: int                    # levels before thinning (ascent data is ~1 s resolution)
+    indices: dict
+    url: str
+    model: str = "RAOB"
+    fhr: int = 0
+
+    @property
+    def title(self) -> str:
+        return (f"OBSERVED radiosonde skew-T  |  {self.station}  "
+                f"launched {self.launched:%Y-%m-%d %H:%MZ}  "
+                f"({len(self.pres)} of {self.n_raw} levels)")
+
+    @property
+    def valid(self) -> str:
+        return f"{self.launched:%y%m%d/%H%M}"
+
+    @property
+    def run(self) -> datetime:
+        return self.launched
+
+
+# The provider carries the SAME station under different upstream feeds, and a site present in
+# one can be absent from the other. `src=BUFR` is the high-resolution ~1 s ascent; `src=FM35`
+# is the traditional TEMP bulletin (mandatory + significant levels, ~100-200 of them). Both
+# answer TEXT:CSV with the same column names, so one parser reads either.
+#
+# THIS IS NOT A NICETY. Measured 2026-07-28: 47646 TATENO -- the nearest radiosonde to RJTY --
+# returns HTTP 400 under BUFR and 462 launches for 2026 under FM35. A BUFR-only client reports
+# Japan as having no upper-air data at all, which is false and looks exactly like a dead site.
+UWYO_SRCS = ("BUFR", "FM35")
+
+
+def _uwyo_url(wmo: str, when: datetime | None, kind: str, src: str = "BUFR") -> str:
+    q = {"id": str(wmo), "type": kind, "src": src}
+    q["datetime"] = (when or datetime.now(timezone.utc).replace(tzinfo=None)).strftime("%Y-%m-%d %H:00:00")
+    return f"{_BUFR_URL}?{urllib.parse.urlencode(q)}"
+
+
+def inventory(wmo: str, year: int, *, src: str = "BUFR") -> list[datetime]:
+    """Every launch time this station has on record for `year` under `src`, newest last.
+
+    ONE request per station-year. The inventory page embeds a full `datetime=` in every
+    cell's link, so this reads the provider's own index rather than probing a time grid --
+    which is what makes off-cycle ascents discoverable at all (probing 00/12Z can only ever
+    confirm 00/12Z)."""
+    html = _get(_uwyo_url(wmo, datetime(year, 1, 1), "INVENTORY", src)).decode("utf-8", "replace")
+    seen = {datetime.strptime(m, "%Y-%m-%d %H:%M:%S")
+            for m in re.findall(r"datetime=(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", html)}
+    return sorted(t for t in seen if t.year == year)
+
+
+def available_times(wmo: str, before: datetime | None = None, *,
+                    back_h: float = 48.0, src: str = "BUFR") -> list[datetime]:
+    """Launch times in (before - back_h, before], oldest first. Spans the new-year
+    boundary by reading the previous year's inventory too when the window crosses it."""
+    end = before or datetime.now(timezone.utc).replace(tzinfo=None)
+    start = end - timedelta(hours=back_h)
+    times = inventory(wmo, end.year, src=src)
+    if start.year != end.year:
+        times = inventory(wmo, start.year, src=src) + times
+    return [t for t in times if start < t <= end]
+
+
+def latest_time(wmo: str, before: datetime | None = None, *,
+                back_h: float = 48.0, src: str = "BUFR") -> datetime | None:
+    """The newest ascent at or before `before` (default now), or None inside the window.
+
+    Replaces `synoptic_time()` for this source. It applies NO post-lag: a launch only
+    appears in the inventory once the provider has it, so presence IS availability --
+    whereas the image providers need a lag precisely because nothing tells us."""
+    got = available_times(wmo, before, back_h=back_h, src=src)
+    return got[-1] if got else None
+
+
+def resolve_source(wmo: str, before: datetime | None = None, *,
+                   back_h: float = 48.0) -> tuple[str, datetime] | None:
+    """(src, launch time) for the newest ascent this site actually has, or None.
+
+    Tries the feeds in UWYO_SRCS order and returns the FIRST that answers. A site absent from
+    BUFR is not a site with no soundings -- 47646 TATENO 400s under BUFR and has 462 launches
+    under FM35 -- so every caller that wants 'the latest ascent here' must ask this, not
+    latest_time() alone. Costs one extra request only when the first feed is empty."""
+    for src in UWYO_SRCS:
+        try:
+            t = latest_time(wmo, before, back_h=back_h, src=src)
+        except Exception:  # noqa: BLE001 -- a 400/500 on one feed just means try the next
+            continue
+        if t is not None:
+            return src, t
+    return None
+
+
+def last_known_time(wmo: str, *, src: str | None = None) -> datetime | None:
+    """The newest launch ON RECORD for this site, ignoring the 48 h window (None = nothing).
+
+    Exists to tell 'this id is not a radiosonde site' apart from 'this site is quiet right
+    now'. `inventory()` scrapes the page and returns an empty list for BOTH, so `latest_time`
+    alone cannot distinguish them -- and reporting an unknown id as a real site that is not
+    reporting states a fact that is false. Reads last year too, so the first days of January
+    do not look like a dead site, and ALL feeds unless `src` pins one -- otherwise a site that
+    lives only in FM35 would be declared nonexistent."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for source in ((src,) if src else UWYO_SRCS):
+        for year in (now.year, now.year - 1):
+            try:
+                if got := inventory(wmo, year, src=source):
+                    return got[-1]
+            except Exception:  # noqa: BLE001 -- one dead feed must not mask a live one
+                continue
+    return None
+
+
+def _thin(rows: list[dict], *, sfc_step: float = 5.0, upper_step: float = 20.0,
+          boundary_depth: float = 150.0) -> list[dict]:
+    """Reduce ~1 s ascent data (3,000-4,500 levels) to a plottable profile.
+
+    Pressure-binned rather than every-Nth so the result does not depend on ascent rate.
+    The lowest `boundary_depth` hPa is kept ~4x finer: inversions, the fog/stratus layer
+    and the LLJ all live there, and they are exactly what a TAF turns on."""
+    if not rows:
+        return []
+    out = [rows[0]]
+    p0 = rows[0]["pres"]
+    for r in rows[1:]:
+        step = sfc_step if (p0 - r["pres"]) <= boundary_depth else upper_step
+        if out[-1]["pres"] - r["pres"] >= step:
+            out.append(r)
+    return out
+
+
+def fetch_profile(wmo: str, when: datetime, *, use_cache: bool = False,
+                  src: str = "BUFR") -> ObsProfile:
+    """Fetch + parse ONE observed ascent as a plottable profile. `when` must be an actual
+    launch time (see latest_time/resolve_source) -- passed through verbatim, never snapped.
+
+    `src` must be the feed the time came FROM: the two feeds carry different launch sets, so
+    a BUFR fetch at an FM35-only time returns no CSV. The cache key carries it for the same
+    reason."""
+    url = _uwyo_url(wmo, when, "TEXT:CSV", src)
+    cache_file = _CACHE_DIR / f"{src.lower()}_{wmo}_{when:%Y%m%d%H%M}.csv"
+    if use_cache and cache_file.exists():
+        text = cache_file.read_text()
+    else:
+        text = re.sub(r"<[^>]+>", "", _get(url).decode("utf-8", "replace"))
+        if use_cache:
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(text)
+
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    hdr_i = next((i for i, ln in enumerate(lines) if "pressure_hPa" in ln), None)
+    if hdr_i is None:
+        raise ValueError(f"no CSV profile for {wmo} at {when:%Y-%m-%dT%H:%MZ}")
+    cols = [c.strip() for c in lines[hdr_i].split(",")]
+    idx = {name: cols.index(col) for col, name in _BUFR_CSV_COLS.items() if col in cols}
+    missing = set(_BUFR_CSV_COLS.values()) - set(idx)
+    if missing:
+        raise ValueError(f"BUFR CSV for {wmo} is missing {sorted(missing)}")
+    lat_i, lon_i = cols.index("latitude"), cols.index("longitude")
+
+    rows: list[dict] = []
+    lat = lon = None
+    for ln in lines[hdr_i + 1:]:
+        f = ln.split(",")
+        if len(f) <= max(idx.values()):
+            continue
+        try:
+            r = {k: float(f[i]) for k, i in idx.items()}
+        except ValueError:              # a blank/ragged trailing row -- skip, do not abort
+            continue
+        if lat is None and len(f) > max(lat_i, lon_i):
+            # Length-checked separately from the profile columns: latitude/longitude can sit
+            # at a HIGHER index than any profile column, and an IndexError here escapes the
+            # ValueError guard and aborts the whole ascent over a position we can live without.
+            try:
+                lat, lon = float(f[lat_i]), float(f[lon_i])
+            except ValueError:
+                pass
+        r["sknt"] = r.pop("wspd_ms") * _MS_TO_KT
+        rows.append(r)
+    if not rows:
+        raise ValueError(f"BUFR CSV for {wmo} at {when:%Y-%m-%dT%H:%MZ} had no data rows")
+    rows.sort(key=lambda r: -r["pres"])
+    kept = _thin(rows)
+    return ObsProfile(
+        station=str(wmo), launched=when, lat=lat or 0.0, lon=lon or 0.0,
+        pres=[r["pres"] for r in kept], tmpc=[r["tmpc"] for r in kept],
+        dwpc=[r["dwpc"] for r in kept], drct=[r["drct"] for r in kept],
+        sknt=[r["sknt"] for r in kept], hght=[r["hght"] for r in kept],
+        n_raw=len(rows), indices={}, url=url)
 
 
 def _get(url: str) -> bytes:

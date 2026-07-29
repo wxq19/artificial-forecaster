@@ -301,9 +301,14 @@ def skewt(profile) -> bytes:
                     bbox=dict(boxstyle="round", facecolor="#f4f4f4", edgecolor="#bbb"))
     ax_txt.set_visible(bool(lines))
 
+    # A profile may supply its own title. OBSERVED soundings (soundings.ObsProfile) do:
+    # they have no run/fhr, and labelling a radiosonde ascent "forecast skew-T" would be a
+    # plain misstatement to the one reader who cannot check it. Duck-typed via getattr so
+    # forecast profiles are untouched.
     fig.suptitle(
-        f"{profile.model.upper()} forecast skew-T  |  {profile.station}  "
-        f"run {profile.run:%Y-%m-%d %HZ}  f{profile.fhr:03d}  valid {profile.valid}",
+        getattr(profile, "title", None)
+        or (f"{profile.model.upper()} forecast skew-T  |  {profile.station}  "
+            f"run {profile.run:%Y-%m-%d %HZ}  f{profile.fhr:03d}  valid {profile.valid}"),
         fontsize=11)
 
     # SkewT under-fills its gridspec cell; pin hodograph top -> chart top and indices

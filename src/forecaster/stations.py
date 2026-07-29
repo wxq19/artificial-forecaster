@@ -47,7 +47,7 @@ class ArchiveStation:
 
     icao: str
     name: str
-    branch: str                         # "AF" | "Army"
+    branch: str                         # "AF" | "Army" | ISO country code (civil non-US sites)
     regime: str                         # convective|fog|winter|terrain|tropical|monsoon
 
 
@@ -74,7 +74,8 @@ def icaos() -> list[str]:
     return [s.icao for s in STATIONS]
 
 
-# Human-TAF archive-only sites (53): confirmed military-format on the AWC feed 2026-07-17
+# Human-TAF archive-only sites (61 = 53 US military + 8 Southern Hemisphere civil):
+# the 53 were confirmed military-format on the AWC feed 2026-07-17
 # (marker QNH____INS + ~30h validity). The poller archives + the scorer TAFVERs these to map
 # forecast difficulty by site and hour; they never enter the billed model matrix. `regime`
 # is the dominant difficulty class. NOT gated on model coverage, so much wider than
@@ -137,6 +138,28 @@ ARCHIVE_STATIONS: tuple[ArchiveStation, ...] = (
     ArchiveStation("ETOU", "Wiesbaden AAF Germany", "Army", "fog"),
     ArchiveStation("PHHI", "Wheeler AAF Hawaii", "Army", "tropical"),
     ArchiveStation("RKSG", "Desiderio AAF, Camp Humphreys Korea", "Army", "monsoon"),
+    # --- Southern Hemisphere winter side-case (8), added 2026-07-28 ---
+    # Patagonia -- the only SH landmass that builds a mid-continental winter (Australia has
+    # no frozen precip at any METAR field and reports 100% AUTO; NZ is maritime). Lets the
+    # SAME models be scored in ACTIVE WINTER inside the same calendar window, so the
+    # winter-vs-summer TAFVER comparison needs no seasonal re-run.
+    # CIVIL format, unlike every site above: TX/TN present, but NO QNH____INS and 21-24h
+    # validity, not 30h. That is fine here -- `tafparse`/`tafarchive` handle civil natively
+    # (qnh_inhg is None) and the archive path never calls tafgen.validate. It does mean
+    # altimeter drops out of the human denominator, so these sites measure the MODEL's own
+    # winter-vs-summer TAFVER, not a human-vs-model gap. Keep TafProduct.military=True on
+    # the emit side so the model's scored element set stays comparable to round 1.
+    # The feed is visibly error-prone (0VC020, OVC0430 both caught in one sampling);
+    # awc.fetch_taf_rows already passes on_parse_error="quarantine", so a bad bulletin is
+    # archived with raw text rather than lost -- and the malformed rate is itself a finding.
+    ArchiveStation("SCBA", "Balmaceda, Chile", "CL", "winter"),
+    ArchiveStation("SAWG", "Rio Gallegos, Argentina", "AR", "winter"),
+    ArchiveStation("SAZS", "San Carlos de Bariloche, Argentina", "AR", "terrain"),
+    ArchiveStation("SAWE", "Rio Grande, Tierra del Fuego, Argentina", "AR", "winter"),
+    ArchiveStation("SCCI", "Punta Arenas, Chile", "CL", "winter"),
+    ArchiveStation("SAZN", "Neuquen, Argentina", "AR", "fog"),
+    ArchiveStation("SAWC", "El Calafate, Argentina", "AR", "winter"),
+    ArchiveStation("SAVE", "Esquel, Argentina", "AR", "terrain"),
 )
 
 ARCHIVE_BY_ICAO: dict[str, ArchiveStation] = {a.icao: a for a in ARCHIVE_STATIONS}

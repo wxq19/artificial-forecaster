@@ -68,10 +68,15 @@ try:
 
     # T8a: TT panel fails -> SPC mesoanalysis, degradation note names the requested fhr.
     _patch(wxmaps, "latest_gfs_run", lambda: RUN)
-    def _map_url(name, *, fhr=0, run=None):
+    # Stubs take **kw on purpose. A stub with a rigid signature turns any new keyword on the
+    # real function into a TypeError, which _get_map catches and reports as a degraded
+    # fallback -- so a signature change silently converts "healthy" into "fell back", and the
+    # fallback tests keep PASSING for the wrong reason. That is exactly what the `domain`
+    # keyword did on 2026-07-28.
+    def _map_url(name, **kw):
         return f"http://{wxmaps.CATALOG[name].source}/{name}"
     _patch(wxmaps, "map_url", _map_url)
-    def _fetch_map_tt_fails(name, *, fhr=0, run=None):
+    def _fetch_map_tt_fails(name, **kw):
         if wxmaps.CATALOG[name].source == "tt":
             raise RuntimeError("HTTP 403")
         return PNG
@@ -84,7 +89,7 @@ try:
 
     # T8b: healthy TT -> no SPC fetch (the map served is the TT panel).
     fetched: list[str] = []
-    def _fetch_map_ok(name, *, fhr=0, run=None):
+    def _fetch_map_ok(name, **kw):
         fetched.append(name)
         return PNG
     _patch(wxmaps, "fetch_map", _fetch_map_ok)
