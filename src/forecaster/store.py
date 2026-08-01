@@ -671,23 +671,31 @@ def model_data_field(
 ) -> list[dict]:
     """One variable's value at ONE valid time across ALL pre-fetched locations -- the
     spatial slice a gradient/advection tool reads. Returns [{loc_id, lat, lon, value, run}]
-    ordered by loc_id, keeping the LATEST run per location if several are present."""
+    ordered by loc_id, keeping the LATEST run per COORDINATE if several are present.
+
+    The identity here is (loc_id, lat, lon), NOT loc_id. A ring point's name is only a
+    bearing and a radius -- `g300_10` -- so all 71 stations write that same string at 71
+    different coordinates. Deduping on the name alone collapsed 2,904 real points onto 384
+    names and returned one arbitrary station's coordinate for each, which put Korean and
+    Patagonian grid points in a German station's gradient table. Only the ICAO-named entries
+    (the site and its neighbours) were ever unambiguous."""
     sql = ("SELECT loc_id, lat, lon, value, run FROM model_data "
            "WHERE model = ? AND variable = ? AND valid_time = ?")
     params: list = [model, variable, _to_naive_utc(valid_time)]
     if run is not None:
         sql += " AND run = ?"
         params.append(_to_naive_utc(run))
-    sql += " ORDER BY loc_id, run DESC"
+    sql += " ORDER BY loc_id, lat, lon, run DESC"
     cur = con.execute(sql, params)
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     seen: set = set()
     out: list[dict] = []
-    for r in rows:  # rows already run-DESC; first per loc_id is the latest run
-        if r["loc_id"] in seen:
+    for r in rows:  # rows already run-DESC; first per coordinate is the latest run
+        key = (r["loc_id"], r["lat"], r["lon"])
+        if key in seen:
             continue
-        seen.add(r["loc_id"])
+        seen.add(key)
         out.append(r)
     return out
 
@@ -704,6 +712,28 @@ def model_data_as_of(
         [model, _round_ll(lat), _round_ll(lon)],
     )
     row = cur.fetchone()
+    return row[0] if row else None
+
+
+def model_data_latest_run(
+    con: duckdb.DuckDBPyConnection, model: str, lat: float, lon: float,
+    *, variables: list[str] | None = None,
+) -> datetime | None:
+    """The newest model RUN stored at this point, or None if nothing is archived.
+
+    Distinct from `model_data_as_of`: `as_of` is the instant WE pinned the pull to, while the
+    run is the cycle the model itself was initialised on, and the two differ by however long
+    the provider takes to post (5 h for the 2026-07-31 06Z GFS pulled at 11Z). A forecast hour
+    counts from the RUN by convention, so anything resolving an f-hour must use this one --
+    resolving against `as_of` and then reporting f-hours against the run made a request for
+    f012 come back labelled f018. `variables` restricts to runs carrying a specific alias, so
+    the pressure-level bundle can be asked about separately from the surface fields."""
+    sql = "SELECT max(run) FROM model_data WHERE model = ? AND lat = ? AND lon = ?"
+    params: list = [model, _round_ll(lat), _round_ll(lon)]
+    if variables:
+        sql += f" AND variable IN ({','.join('?' * len(variables))})"
+        params += list(variables)
+    row = con.execute(sql, params).fetchone()
     return row[0] if row else None
 
 
@@ -730,11 +760,22 @@ def copy_model_data(
     src_db_path: str,
     *,
     coords: list[tuple[float, float, str]] | None = None,
+    run_at_or_before: datetime | None = None,
 ) -> int:
     """Copy model_data rows from the benchmark DB into `con` (a per-run collection DB) so
-    the model-data tools work there for 0 credits -- mirrors copy_obs/copy_climo. Leakage-
-    safe by construction: the archive was pre-fetched with asOf = issue_time, so every
-    row's run <= issue_time already (no read-cutoff needed here, unlike copy_obs).
+    the model-data tools work there for 0 credits -- mirrors copy_obs/copy_climo.
+
+    PASS `run_at_or_before` = the issue time. This used to be omitted, on the reasoning that
+    the archive was pre-fetched with asOf = issue_time so every row's run was already <=
+    issue_time. That held while the benchmark DB carried ONE pull for ONE cycle. It stopped
+    holding when the archiver began accumulating: by 2026-07-31 the table spanned eleven GFS
+    runs from 07-28T18Z to 07-31T06Z, so copying without a cutoff hands a replay of an
+    earlier cycle model guidance issued AFTER the forecast was due. The tools make that
+    active rather than latent -- `_from_latest_run` and `modeldata.build_profile` both
+    prefer max(run) -- so the future run is the one the agent would read.
+
+    Leaving the cutoff at None still copies everything, which is right for a scratch DB
+    built from a single pinned pull, but a collection run must always pass it.
 
     `coords` is the station's coordinate set (site + neighbors + grid, the SAME list the
     prefetch used) as (lat, lon, name); rows are filtered to those ROUNDED points so only
@@ -744,16 +785,21 @@ def copy_model_data(
     con.execute(f"ATTACH '{src_db_path}' AS mdsrc (READ_ONLY)")
     try:
         before = con.execute("SELECT count(*) FROM model_data").fetchone()[0]
+        where: list[str] = []
+        params: list = []
         if coords:
             pairs = {(_round_ll(la), _round_ll(lo)) for la, lo, _ in coords}
-            values = ",".join(f"({la},{lo})" for la, lo in pairs)
-            con.execute(
-                "INSERT INTO model_data SELECT * FROM mdsrc.model_data "
-                f"WHERE (lat, lon) IN (VALUES {values}) ON CONFLICT DO NOTHING"
-            )
-        else:
-            con.execute("INSERT INTO model_data SELECT * FROM mdsrc.model_data "
-                        "ON CONFLICT DO NOTHING")
+            where.append(f"(lat, lon) IN (VALUES {','.join(f'({la},{lo})' for la, lo in pairs)})")
+        if run_at_or_before is not None:
+            # `run`, not `as_of`: as_of records when WE pulled, the run is when the MODEL was
+            # initialised, and it is the run that decides whether the guidance could have
+            # existed at issue time. A row can be pulled late and still be a legitimate old run.
+            where.append("run <= ?")
+            params.append(_to_naive_utc(run_at_or_before))
+        sql = "INSERT INTO model_data SELECT * FROM mdsrc.model_data"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        con.execute(sql + " ON CONFLICT DO NOTHING", params)
         return con.execute("SELECT count(*) FROM model_data").fetchone()[0] - before
     except duckdb.CatalogException:
         # Source has no model_data table yet -> nothing to copy (not an error).

@@ -355,6 +355,81 @@ def fetch_profile(wmo: str, when: datetime, *, use_cache: bool = False,
         n_raw=len(rows), indices={}, url=url)
 
 
+# Where a real ascent ends. Set from the full archive, not a sample: classifying all 293
+# archived soundings on 2026-07-31 put their top pressures in three groups -- 4-85 hPa
+# (real burst, 280 records), a tight 101-109 hPa cluster (the staged release / the FM35
+# convention, 9), and 173/284/524 hPa (caught genuinely mid-flight, 3).
+#
+# AN EARLIER VALUE OF 30 hPa WAS WRONG and is recorded here so it is not reintroduced. It
+# came from an 18-site sample that happened to burst at 4.0-11.0 hPa, and it misclassified
+# 19 real ascents -- everything between 30 and 85 hPa -- as truncated. The error fell almost
+# entirely on the FM35 feed: 49% of FM35 records failed it against 5.4% of BUFR, because
+# FM35 is the traditional TEMP bulletin whose parts A and B terminate at 100 hPa by
+# convention, so a 100 hPa FM35 record is frequently the WHOLE bulletin and not a fragment.
+# 95 hPa sits above every observed real burst and below the staging cluster.
+COMPLETE_ASCENT_MAX_HPA = 95.0
+
+# The Wyoming feed PUBLISHES IN STAGES, and this is the fact that matters: the truncated
+# captures cluster at 100-109 hPa rather than scattering -- a staging point, not a balloon
+# still climbing. That is why elapsed time does NOT predict completeness (one capture 82 min
+# after launch was complete; one at 129 min was still the staged version), and why a
+# clock-based gate cannot work at any value. Test the DATA, not the time.
+_STAGED_RELEASE_HPA = 100.0
+_STAGED_RELEASE_BAND_HPA = (95.0, 115.0)
+
+
+def ascent_is_complete(prof: "ObsProfile") -> bool:
+    """True when this ascent reached burst rather than a staged intermediate release.
+
+    Call this before FREEZING an ascent into the archive: `ON CONFLICT DO NOTHING` makes the
+    first copy permanent, so accepting a staged release keeps half an ascent forever, and the
+    half that is lost is the upper troposphere and stratosphere -- the tropopause and jet
+    level a TAF's turbulence and icing reasoning depends on."""
+    tops = [p for p in prof.pres if p is not None and p == p]     # p == p drops NaN
+    return bool(tops) and min(tops) <= COMPLETE_ASCENT_MAX_HPA
+
+
+def ascent_stage_note(prof: "ObsProfile") -> str | None:
+    """Short reason an ascent looks incomplete, or None when it is complete."""
+    if ascent_is_complete(prof):
+        return None
+    tops = [p for p in prof.pres if p is not None and p == p]
+    if not tops:
+        return "no usable pressure levels"
+    top = min(tops)
+    lo, hi = _STAGED_RELEASE_BAND_HPA
+    staged = lo <= top <= hi
+    return (f"stops at {top:.0f} hPa"
+            + (f" (the provider's {_STAGED_RELEASE_HPA:.0f} hPa staged release, not burst)"
+               if staged else " (caught mid-flight, far below any burst altitude)"))
+
+
+# How long to keep retrying before accepting an ascent that never reached burst. The
+# completeness test alone must NOT be the whole rule: a balloon really can pop early, and a
+# hard pressure gate would refuse that ascent at every sweep forever -- discarding data the
+# human forecaster genuinely had, which is a worse failure than storing a short flight.
+# So the rule is COMPLETE **OR** OLD ENOUGH, and the age clause guarantees termination.
+STAGED_RETRY_WINDOW_H = 4.0
+
+
+def ascent_is_final(prof: "ObsProfile", *, now: datetime | None = None) -> bool:
+    """True when this is worth freezing: it reached burst, OR it is old enough that this is
+    all the provider is ever going to publish.
+
+    Two failure modes, and they pull opposite ways. Freezing too EARLY keeps a staged
+    release forever (the provider publishes an intermediate at 100 hPa, and one sampled
+    capture was still staged 129 minutes after launch). Refusing on pressure ALONE never
+    terminates for a genuine early burst. The disjunction bounds both: a complete record is
+    taken at once, and anything else is retried only until the window closes."""
+    if ascent_is_complete(prof):
+        return True
+    ref = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    launched = prof.launched
+    if launched.tzinfo is not None:
+        launched = launched.astimezone(timezone.utc).replace(tzinfo=None)
+    return (ref - launched).total_seconds() / 3600.0 >= STAGED_RETRY_WINDOW_H
+
+
 def _get(url: str) -> bytes:
     """GET raw bytes, spacing requests politely (module-level throttle)."""
     global _last_request

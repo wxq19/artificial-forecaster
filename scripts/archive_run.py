@@ -367,15 +367,17 @@ def reset_loop_expand_cache() -> None:
     """Drop every per-sweep memo. One sweep is one process today, so this is for tests and for
     any caller that runs two cycles in one process.
 
-    ALL THREE are cleared together because they do NOT fail the same way. The loop and
-    resolve-source memos key on the cycle, so a second cycle simply misses and re-fetches --
-    the only cost is unbounded growth. `_taf_batch` keys on ICAO ALONE, so a second cycle in
+    ALL FOUR are cleared together because they do NOT fail the same way. The loop, resolve-
+    source and launches memos key on the cycle, so a second cycle simply misses and re-fetches
+    -- the only cost is unbounded growth. `_taf_batch` keys on ICAO ALONE, so a second cycle in
     the same process would be served the FIRST cycle's bulletins. Nothing does that today;
     this is what stops it becoming true quietly."""
     with _loop_expand_lock:
         _loop_expand_cache.clear()
     with _resolve_source_lock:
         _resolve_source_cache.clear()
+    with _launches_lock:
+        _launches_cache.clear()
     with _taf_batch_lock:
         _taf_batch.clear()
 
@@ -489,6 +491,34 @@ def _resolve_source_memo(wmo: str, cycle: datetime):
     return got
 
 
+_launches_cache: dict[tuple, list] = {}
+_launches_lock = threading.Lock()
+
+
+def _launches_memo(wmo: str, src: str, cycle: datetime) -> list[datetime]:
+    """Launch times at or before `cycle`, oldest first, asked once per (site, feed, cycle).
+
+    Same reason as `_resolve_source_memo`: this reads the provider's per-year inventory, and
+    71 stations share ~50 sites, so an unmemoized call repeats a request already made."""
+    key = (wmo, src, cycle)
+    with _launches_lock:
+        if key in _launches_cache:
+            return _launches_cache[key]
+    try:
+        got = [t for t in soundings.available_times(wmo, cycle, src=src) if t <= cycle]
+    except Exception:  # noqa: BLE001 -- fall back to the single resolved launch
+        got = []
+    with _launches_lock:
+        _launches_cache[key] = got
+    return got
+
+
+# How many launches back to keep entitled. 2 = the newest plus one fallback, which is a
+# full synoptic step (usually 12 h) and is what a forecaster has in hand while the current
+# balloon is still being processed.
+_SOUNDING_FALLBACK_DEPTH = 2
+
+
 def _expand_sounding(icao: str, cycle: datetime) -> list[Item]:
     for wmo, name, dist, brg, _la, _lo in upper_air_sites.sites_for(icao):
         try:
@@ -498,19 +528,53 @@ def _expand_sounding(icao: str, cycle: datetime) -> list[Item]:
         if got is None:
             continue
         src, launched = got
+        # ENTITLE THE PREVIOUS LAUNCH TOO, not just the newest.
+        #
+        # `_fetch_sounding` refuses an ascent the provider has only staged, so that it is
+        # retried rather than frozen half-written. On its own that left the station with NO
+        # sounding for the cycle -- strictly worse than the truncated one it replaced, and
+        # not what a forecaster has: while the current balloon is still being processed they
+        # are reading the PREVIOUS ascent, which is complete.
+        #
+        # So emit both. Each Item is keyed on the launch it actually carries, so nothing is
+        # ever labelled with a time it did not come from -- the failure mode this project
+        # keeps meeting. The older launch was the newest one a sweep or two ago and is
+        # therefore already in the archive, so `select` dedups it and it costs no fetch;
+        # it only ever downloads on a cold start. The serve side reads the newest of these
+        # that actually resolved to bytes.
+        times = [t for t in _launches_memo(wmo, src, cycle) if t <= launched]
+        if launched not in times:
+            times.append(launched)
+        wanted = times[-_SOUNDING_FALLBACK_DEPTH:]
         # The FEED is part of the identity: BUFR and FM35 are different level sets for the
         # same ascent, so one cannot silently stand in for the other at replay.
         # requested_utc is the LAUNCH time, not the cycle: rule 1, key on what was returned.
         # NEVER snapped to 00/12Z -- an off-cycle ascent is released BECAUSE something is
         # happening, so a synoptic snap discards exactly the informative ones.
-        return [Item(kind="sounding", identity=f"{wmo}/{src.lower()}", requested_utc=launched,
-                     provider="wyoming", note=f"{name}, {dist:.0f} km {brg} of {icao}",
-                     fetch=lambda w=wmo, t=launched, s=src: _fetch_sounding(w, t, s))]
+        return [Item(kind="sounding", identity=f"{wmo}/{src.lower()}", requested_utc=t,
+                     provider="wyoming",
+                     note=(f"{name}, {dist:.0f} km {brg} of {icao}"
+                           + ("" if t == launched else "; previous ascent, kept as the "
+                              "fallback while the newest is still being published")),
+                     fetch=lambda w=wmo, tt=t, s=src: _fetch_sounding(w, tt, s))
+                for t in reversed(wanted)]
     return []
 
 
 def _fetch_sounding(wmo: str, launched: datetime, src: str = "BUFR"):
     prof = soundings.fetch_profile(wmo, launched, src=src)
+    # DO NOT FREEZE A STAGED RELEASE -- but do not refuse forever either. Wyoming publishes an
+    # ascent in stages, most often truncated at 100 hPa, and `ON CONFLICT DO NOTHING` would
+    # keep that half permanently (measured 2026-07-31: 3 of 5 sampled captures held the 100 hPa
+    # version, one fetched 129 minutes after launch, so no fixed capture delay avoids it).
+    # A pressure test ALONE would be just as wrong the other way: a balloon can pop early, and
+    # refusing that ascent at every sweep would discard a sounding the human forecaster had.
+    # So retry only until STAGED_RETRY_WINDOW_H, then take what exists and SAY it is short --
+    # the note rides on the artifact, so a replay can see the flight ended high.
+    why = soundings.ascent_stage_note(prof)
+    if why is not None and not soundings.ascent_is_final(prof):
+        raise ValueError(f"incomplete ascent for {wmo} at {launched:%Y-%m-%dT%H:%MZ}: {why}"
+                         f" -- retrying next sweep")
     # No `title=` kwarg: charts.skewt reads `profile.title`, which ObsProfile supplies, so an
     # observed ascent is not captioned "forecast". Same call `_sounding_bufr` makes.
     #
@@ -524,7 +588,9 @@ def _fetch_sounding(wmo: str, launched: datetime, src: str = "BUFR"):
     # ONE item per station out of ~60, so nothing meaningful ever waits on it.
     with _RENDER_LOCK:
         png = charts.skewt(prof)
-    return png, prof.url, launched, None
+    return png, prof.url, launched, (f"short ascent, accepted after "
+                                     f"{soundings.STAGED_RETRY_WINDOW_H:.0f}h: {why}"
+                                     if why else None)
 
 
 def _static_items(icao: str, lat: float, lon: float) -> list[Item]:

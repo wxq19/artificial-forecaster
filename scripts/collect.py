@@ -303,13 +303,17 @@ def main() -> int:
                 # returns clean "not built" feedback rather than a SQL error.
                 store.init_scoring_schema(rcon)
                 n_climo = store.copy_climo(rcon, bench_db, icao)
-                # Model-data archive: leakage-safe by construction (prefetched with
-                # as_of=valid_from), so it copies with NO cutoff -- just the station's
-                # coordinate neighborhood. copy_model_data creates its own schema, so the
+                # Model-data archive: copied with an EXPLICIT run cutoff, not by assumption.
+                # This used to pass no cutoff because a prefetch pinned to as_of=valid_from
+                # could only contain runs <= issue time. The archiver now accumulates every
+                # pull (eleven GFS runs on 2026-07-31), so that is no longer true and an
+                # uncut copy would hand this cell model guidance issued after its own
+                # forecast was due. copy_model_data creates its own schema, so the
                 # get_model_* tools return clean "not pre-fetched" feedback on an empty archive.
                 n_md = store.copy_model_data(
                     rcon, bench_db,
-                    coords=modeldata.station_coords(icao, as_of=valid_from, db_path=bench_db))
+                    coords=modeldata.station_coords(icao, as_of=valid_from, db_path=bench_db),
+                    run_at_or_before=valid_from)
                 if prev_taf:
                     store.insert_taf(rcon, prev_taf)
             finally:

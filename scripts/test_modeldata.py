@@ -291,6 +291,44 @@ def test_collect_path():
     r = tools.run_tool("get_hazard_scan", {"station": "KTEST"}, db_path=run_db)
     check("per-run DB: get_hazard_scan renders after copy", "ICING" in r.text)
 
+    # --- LEAKAGE: a run issued AFTER the issue time must never reach the per-run DB -------
+    # The archiver accumulates every pull, so the benchmark DB holds many runs at once. The
+    # old copy took them all, on the retired assumption that a prefetch pinned to the issue
+    # time could only contain runs <= issue time. It cannot hold any more, and the tools now
+    # PREFER the newest run, so an uncut copy would serve tomorrow's guidance to today's TAF.
+    future_run = RUN + timedelta(hours=12)
+    fcon = store.connect(bench)
+    store.insert_model_data(fcon, [
+        md_row("gfs", RUN + timedelta(hours=h), LAT, LON, "KTEST", "t2m", 310.0,
+               run=future_run) for h in range(0, 9, 3)])
+    fcon.close()
+
+    cut_db = str(Path(TMP) / "percell_cutoff.duckdb")
+    ccon = store.connect(cut_db)
+    store.copy_model_data(ccon, bench, coords=[(LAT, LON, "KTEST")], run_at_or_before=RUN)
+    runs = {r[0] for r in ccon.execute("SELECT DISTINCT run FROM model_data").fetchall()}
+    ccon.close()
+    check("cutoff: no run later than the issue time is copied",
+          all(x <= RUN for x in runs), f"copied runs {sorted(runs)}")
+    check("cutoff: the legitimate run still survives the filter", RUN in runs, f"{sorted(runs)}")
+
+    # And prove the guard is not vacuous: without the cutoff the future run DOES come across,
+    # so a passing test above is the filter working rather than the row never existing.
+    open_db = str(Path(TMP) / "percell_nocutoff.duckdb")
+    ocon = store.connect(open_db)
+    store.copy_model_data(ocon, bench, coords=[(LAT, LON, "KTEST")])
+    oruns = {r[0] for r in ocon.execute("SELECT DISTINCT run FROM model_data").fetchall()}
+    ocon.close()
+    check("cutoff: without it the future run really is copied (guard is not vacuous)",
+          future_run in oruns, f"copied runs {sorted(oruns)}")
+
+    # The tool layer is what the agent sees: with the cutoff it must read the ISSUE-time run,
+    # not the future one. 310 K would be the future row's value.
+    r = tools.run_tool("get_point_forecast", {"station": "KTEST"}, db_path=cut_db)
+    check("cutoff: get_point_forecast names the issue-time run, not a later one",
+          f"{RUN:%Y-%m-%dT%H}Z" in r.text and f"{future_run:%Y-%m-%dT%H}Z" not in r.text,
+          r.text.splitlines()[0] if r.text else "")
+
     # a benchmark DB with NO model_data (tier OFF): copy is a clean 0, tools give feedback
     empty = str(Path(TMP) / "bench_empty.duckdb")
     econ = store.connect(empty)

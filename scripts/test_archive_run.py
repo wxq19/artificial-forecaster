@@ -393,6 +393,9 @@ def test_render_is_serialized() -> None:
 
     class _Prof:
         url = "http://sounding"
+        # A real ascent carries levels, and _fetch_sounding now refuses one that stopped at a
+        # staged release, so the stub must reach burst or it never gets as far as the render.
+        pres = [1000.0, 500.0, 10.0]
 
     real_skewt, real_profile = ar.charts.skewt, ar.soundings.fetch_profile
     ar.charts.skewt = fake_skewt
@@ -404,6 +407,54 @@ def test_render_is_serialized() -> None:
                  for i in range(6)]
         ar.fetch_all(items, workers=6)
         check("render: never two threads inside pyplot at once", depth["max"], 1)
+
+        # A FRESH STAGED RELEASE MUST NOT BE FROZEN. Wyoming publishes an ascent in stages,
+        # usually truncated at 100 hPa, and ON CONFLICT DO NOTHING makes the first copy
+        # permanent -- so the capture refuses it and the next sweep retries the same launch.
+        now = datetime.utcnow()
+
+        class _Staged:
+            url = "http://sounding"
+            pres = [1000.0, 500.0, 100.1]        # the provider's 100 hPa staging point
+            launched = now                       # just launched -> still worth retrying
+
+        ar.soundings.fetch_profile = lambda *a, **k: _Staged()
+        before = depth["max"]
+        try:
+            ar._fetch_sounding("72572", CYCLE)
+            check_true("capture: a fresh staged release is refused", False, "no error raised")
+        except ValueError as e:
+            check_true("capture: a fresh staged release is refused", "100 hPa" in str(e), str(e))
+        check("capture: a refused ascent is never rendered", depth["max"], before)
+
+        # BUT THE RETRY MUST TERMINATE. A balloon can genuinely pop early, and refusing on
+        # pressure alone would discard that ascent at every sweep forever -- losing a sounding
+        # the human forecaster actually had. Past the window we take it and label it short.
+        class _OldShort:
+            url = "http://sounding"
+            pres = [1000.0, 500.0, 300.0]        # caught mid-flight; never reaches burst
+            launched = now - timedelta(hours=ar.soundings.STAGED_RETRY_WINDOW_H + 1)
+
+        ar.soundings.fetch_profile = lambda *a, **k: _OldShort()
+        png, _url, _served, note = ar._fetch_sounding("72572", CYCLE)
+        check_true("capture: a short ascent is accepted once the window closes", bool(png))
+        check_true("capture: and the artifact records that the ascent was short",
+                   note is not None and "300 hPa" in note, repr(note))
+
+        # A REAL EARLY BURST IS NOT "SHORT", and must pass on the DATA rather than by ageing
+        # out. The threshold was 30 hPa until 2026-07-31, when classifying all 293 archived
+        # soundings showed real bursts running to 85 hPa; that value called 19 genuine
+        # ascents truncated, 17 of them FM35, whose TEMP parts A/B end at 100 hPa by
+        # convention. A fresh 63 hPa ascent must come back with NO note at all.
+        class _EarlyBurst:
+            url = "http://sounding"
+            pres = [1000.0, 500.0, 63.0]
+            launched = now                       # fresh: the age clause must not be what saves it
+
+        ar.soundings.fetch_profile = lambda *a, **k: _EarlyBurst()
+        png, _url, _served, note = ar._fetch_sounding("72572", CYCLE)
+        check_true("capture: a 63 hPa burst counts as complete, not truncated",
+                   bool(png) and note is None, repr(note))
     finally:
         ar.charts.skewt, ar.soundings.fetch_profile = real_skewt, real_profile
 
@@ -574,11 +625,39 @@ def test_sounding_feeds() -> None:
               S.last_known_time("NOWHERE"), None)
         # The archiver must carry the feed in the identity: the two are different level sets
         # for one ascent, so neither may silently stand in for the other at replay.
+        ar.reset_loop_expand_cache()
         items = ar._expand_sounding("KWRI", when)
         check("sounding: the planner keys on the feed it actually resolved",
               items[0].identity if items else None, "72501/bufr")
+
+        # THE PREVIOUS LAUNCH IS ENTITLED TOO. _fetch_sounding refuses an ascent the provider
+        # has only staged, so it is retried instead of frozen half-written -- but on its own
+        # that left the station with NO sounding for the cycle, which is worse than the
+        # truncated one it replaced. The fallback is what a forecaster actually has while the
+        # current balloon is still being processed: the previous, complete ascent.
+        fm35_only = {datetime(2026, 7, 28, 12), datetime(2026, 7, 29, 0)}
+        ar.reset_loop_expand_cache()
+        items = ar._expand_sounding("KWRI", when)
+        check("sounding: the previous launch is entitled as a fallback", len(items), 2)
+        check("sounding: the newest launch is offered first",
+              [i.requested_utc for i in items],
+              [datetime(2026, 7, 29, 0), datetime(2026, 7, 28, 12)])
+        # Each Item must be keyed on the launch it CARRIES. Sharing one key would let the
+        # older ascent be frozen under the newer launch's time -- the label-over-wrong-
+        # content failure this project keeps meeting.
+        check("sounding: the fallback is keyed on its own launch, not the newest",
+              len({(i.identity, i.requested_utc) for i in items}), 2)
+        check_true("sounding: and the fallback says why it is there",
+                   "previous ascent" in (items[1].note or ""), repr(items[1].note))
+
+        # A site with only ONE launch on record must still plan cleanly, not emit a phantom.
+        fm35_only = {datetime(2026, 7, 29, 0)}
+        ar.reset_loop_expand_cache()
+        items = ar._expand_sounding("KWRI", when)
+        check("sounding: a single available launch yields exactly one item", len(items), 1)
     finally:
         S.inventory = real
+        ar.reset_loop_expand_cache()
 
 
 def test_loop_cadence() -> None:

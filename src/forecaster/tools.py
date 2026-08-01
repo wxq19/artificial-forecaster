@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pydantic import ValidationError
 
 from forecaster import (
-    awc, charts, imagery, modeldata, neighbors, soundings, store, tafgen,
+    awc, charts, geo, imagery, modeldata, neighbors, soundings, store, tafgen,
     tafparse, tafstate, terrain, upper_air_sites, worksheet, wxmaps,
 )
 from forecaster.config import settings
@@ -1532,19 +1532,26 @@ def _get_fcst_sounding(con, station: str, args: dict) -> ToolResult:
         return ToolResult(f"error: no archived {model.upper()} profile for {station}; the "
                           f"pressure-level bundle may not have been pulled for this cycle.")
     fhr = _int_arg(args.get("fhr"), 12, lo=0, hi=384)
-    # fhr counts from the ISSUE time, not from the first archived hour: the level grid snaps
-    # to a 00Z-anchored 3-hourly grid, so those differ by up to one step.
-    issue = store.model_data_as_of(con, model, lat, lon) or times[0]
-    want = issue.replace(minute=0, second=0, microsecond=0) + timedelta(hours=fhr)
-    valid = min(times, key=lambda t: abs((t - want).total_seconds()))   # snap to the grid
+    # fhr COUNTS FROM THE MODEL RUN, which is the forecasting convention and the origin the
+    # receipt reports (prof.fhr is derived from prof.run). Resolving the request against
+    # `as_of` instead put two different origins in one sentence: as_of trails the run by
+    # however long the provider takes to post -- 5 h for the 2026-07-31 06Z GFS -- so a
+    # request for f012 was answered with f018 and described as "1h later", which is the grid
+    # snap alone. `times` spans every archived run, so restrict to the newest one first or
+    # the snap can land on a superseded hour.
+    run = store.model_data_latest_run(con, model, lat, lon) or times[0]
+    grid = [t for t in times if t >= run] or times
+    want = run.replace(minute=0, second=0, microsecond=0) + timedelta(hours=fhr)
+    valid = min(grid, key=lambda t: abs((t - want).total_seconds()))    # snap to the grid
     try:
         prof = modeldata.build_profile(con, station, model, valid, lat=lat, lon=lon)
     except ValueError as e:
         return ToolResult(f"error: {e}")
     off_h = round((valid - want).total_seconds() / 3600)
     snapped = ("" if not off_h else
-               f" (you asked for f{fhr:03d}; the archive is 3-hourly, so this is the nearest "
-               f"stored hour, {abs(off_h)}h {'later' if off_h > 0 else 'earlier'})")
+               f" (you asked for f{fhr:03d} of this run; the level grid is 3-hourly, so this "
+               f"is the nearest stored hour, f{prof.fhr:03d}, "
+               f"{abs(off_h)}h {'later' if off_h > 0 else 'earlier'})")
     ifs_note = ("\nNOTE: IFS carries no 950/900 mb level, so the boundary layer -- where "
                 "ceilings and inversions sit -- is resolved coarsely here. Cross-check low "
                 "cloud against GFS or HRRR." if model == "ifsoper" else "")
@@ -1934,6 +1941,22 @@ _WIDE_START = datetime(1970, 1, 1)
 _WIDE_END = datetime(2100, 1, 1)
 
 
+def _from_latest_run(series: list[tuple]) -> list[tuple]:
+    """Drop entries that a newer run has superseded.
+
+    Every model-data read spans _WIDE_START.._WIDE_END because a valid time can only be
+    matched across runs by asking for all of them. But the archive ACCUMULATES -- four pulls
+    a day, 11 GFS runs by 2026-07-31 -- so the oldest entry is the day collection started,
+    not the current forecast. Anything anchoring on series[0] therefore drifts one day
+    staler per day. Keeping only valid times at or after the newest run's start also drops
+    the '--' rows the superseded runs carry: before 2026-07-29 the surface grid was 2-hourly
+    on ODD hours while level times are 3-hourly on 00Z, so 06Z and 12Z held level data with
+    no surface row. Call this per model -- each has its own newest run, and HRRR/NBM stop at
+    the CONUS edge."""
+    run = max((r for _, r, _ in series if r), default=None)
+    return [s for s in series if s[0] >= run] if run is not None else series
+
+
 def _resolve_md_location(con, station: str, location: str | None) -> tuple | None:
     """Map a requested location name to (lat, lon, loc_id) from the archive. Defaults to the
     station itself. Returns None if the name isn't pre-fetched (caller lists what is)."""
@@ -1961,10 +1984,13 @@ def _fmt_model_state(con, station: str, loc: tuple, models: list[str], hours: in
         series = _pivot_series(rows)
         if not series:
             continue
-        if hours is not None:
+        series = _from_latest_run(series)          # never window from the archive's first row
+        if hours is not None and series:
             cutoff = series[0][0] + timedelta(hours=hours)
             series = [s for s in series if s[0] <= cutoff]
-        run = next((r for _, r, _ in series if r), None)
+        if not series:
+            continue
+        run = max((r for _, r, _ in series if r), default=None)
         lines = [
             f"{model.upper()} surface forecast for {loc_id} -- run "
             f"{run:%Y-%m-%dT%HZ}" if run else f"{model.upper()} surface forecast for {loc_id}",
@@ -2032,7 +2058,7 @@ def _fmt_hazard_scan(con, station: str, loc: tuple, want) -> str:
     piv = {}
     for model in ("gfs", "hrrr"):
         rows = store.model_data_series(con, model, lat, lon, start=_WIDE_START, end=_WIDE_END)
-        piv[model] = _pivot_series(rows)
+        piv[model] = _from_latest_run(_pivot_series(rows))
     base = piv["gfs"] or piv["hrrr"]
     # The series carries the surface 6h back-tail too, whose early entries hold no pressure-
     # level vars. Restrict to HAZARD-BEARING entries (cape/t650 present) BEFORE choosing, for
@@ -2594,31 +2620,75 @@ _FIELD_UNITS = {"t2m": ("C", _k2c), "td2m": ("C", _k2c), "gust": ("kt", _ms2kt),
                 "mslp": ("hPa", lambda p: None if p is None else p / 100)}
 
 
-def _fmt_nearby_model_data(con, model: str, variable: str, want) -> str:
-    # find a stored valid time nearest `want` (or the first) by checking one location
-    locs = store.model_data_locations(con)
-    if not locs:
+def _fmt_nearby_model_data(con, station: str, model: str, variable: str, want) -> str:
+    """This station's own pre-fetched points for one surface variable, at one valid time.
+
+    SELECT BY COORDINATE, NEVER BY NAME. A ring point is named for its bearing and radius --
+    `g300_10` -- so all 71 stations write that identical string at 71 different coordinates.
+    Listing by name served an arbitrary station's point per name, which put Korean, Texan and
+    Patagonian samples in a German station's gradient table. `modeldata.coords_for` is pure
+    geometry and is the same builder the pull used, so re-deriving the set here reproduces
+    exactly the points this station paid for -- and its names are correct RELATIVE TO THIS
+    STATION, which the stored loc_id is not. No re-pull is needed: the coordinates in the
+    database were always right."""
+    if not store.model_data_locations(con):
         return _md_locations_hint(con)
-    ref = None
-    for lc in locs:
-        vts = store.model_data_valid_times(con, model, lc["lat"], lc["lon"])
-        if vts:
-            ref = min(vts, key=lambda v: abs((v - want).total_seconds())) if want else vts[0]
-            break
-    if ref is None:
-        return f"(no {model.upper()} data pre-fetched). {_md_locations_hint(con)}"
+    try:
+        own = modeldata.coords_for(station)
+    except Exception:  # noqa: BLE001 -- an id outside the static roster must still work
+        own = None
+    if own is not None:
+        lat0, lon0, _icao = own[0]
+        by_coord = {(round(la, 4), round(lo, 4)): nm for la, lo, nm in own}
+        scope = "of this station's own points"
+    else:
+        # The station is in the archive but not in the static roster (a synthetic or a newly
+        # added id), so the geometry cannot be re-derived. Fall back to the DB's own site
+        # coordinate and a radius, which is weaker -- a ring name from another station can
+        # appear -- so every row still carries its true distance and bearing from here.
+        home = _resolve_md_location(con, station, None)
+        if home is None:
+            return (f"error: {station.upper()} is not a pre-fetched model-data location. "
+                    f"{_md_locations_hint(con)}")
+        lat0, lon0, _icao = home
+        by_coord = None
+        scope = "points within 200 km (station geometry unavailable)"
+    # Anchor on the newest run: the archive accumulates every pull, so the oldest stored hour
+    # is the day collection began, not the current forecast.
+    vts = store.model_data_valid_times(con, model, lat0, lon0)
+    if not vts:
+        return (f"(no {model.upper()} data pre-fetched for {station.upper()}). "
+                f"{_md_locations_hint(con)}")
+    run = store.model_data_latest_run(con, model, lat0, lon0)
+    grid = [v for v in vts if run is None or v >= run] or vts
+    ref = min(grid, key=lambda v: abs((v - want).total_seconds())) if want else grid[0]
     field = store.model_data_field(con, model, variable, valid_time=ref)
     if not field:
         return (f"(no {model.upper()} '{variable}' at {ref:%Y-%m-%dT%HZ}; check the alias -- "
                 "surface aliases: t2m td2m gust mslp vis ceil tcdc; wind is u10/v10 or wind/wdir)")
-    unit, conv = _FIELD_UNITS.get(variable, ("native", lambda x: x))
-    out = [f"{model.upper()} '{variable}' ({unit}) across pre-fetched points, valid "
-           f"{ref:%Y-%m-%dT%HZ} -- for gradient/advection reasoning (sorted by location id):",
-           f"  {'loc':<10}{'lat':>9}{'lon':>10}{'value':>10}"]
+    mine = []
     for r in field:
+        km = geo.haversine_km(lat0, lon0, r["lat"], r["lon"])
+        if by_coord is not None:
+            name = by_coord.get((round(r["lat"], 4), round(r["lon"], 4)))
+        else:
+            name = (r["loc_id"] or "") if km <= 200.0 else None
+        if name is not None:
+            mine.append((km, name, r))
+    if not mine:
+        return (f"(no {model.upper()} '{variable}' at {ref:%Y-%m-%dT%HZ} for any of "
+                f"{station.upper()}'s pre-fetched points)")
+    mine.sort(key=lambda t: t[0])
+    unit, conv = _FIELD_UNITS.get(variable, ("native", lambda x: x))
+    out = [f"{model.upper()} '{variable}' ({unit}) around {station.upper()}, valid "
+           f"{ref:%Y-%m-%dT%HZ} -- for gradient/advection reasoning "
+           f"({len(mine)} {scope}, nearest first):",
+           f"  {'loc':<10}{'lat':>9}{'lon':>10}{'km':>7}{'dir':>5}{'value':>10}"]
+    for km, name, r in mine:
         cv = conv(r["value"])
         vs = "--" if cv is None else (f"{cv:.1f}" if unit != "native" else f"{cv:.3g}")
-        out.append(f"  {(r['loc_id'] or ''):<10}{r['lat']:>9.4f}{r['lon']:>10.4f}{vs:>10}")
+        brg = geo.compass16(geo.bearing_deg(lat0, lon0, r["lat"], r["lon"])) if km > 0.5 else "--"
+        out.append(f"  {name:<10}{r['lat']:>9.4f}{r['lon']:>10.4f}{km:>7.0f}{brg:>5}{vs:>10}")
     return "\n".join(out)
 
 
@@ -2636,7 +2706,7 @@ def _get_nearby_model_data(con, station: str, args: dict) -> ToolResult:
             want = datetime.strptime(str(args["valid_time"]).replace("Z", "")[:16], "%Y-%m-%dT%H:%M")
         except ValueError:
             return ToolResult('error: valid_time must be ISO like "2026-07-17T21:00Z"')
-    return ToolResult(_fmt_nearby_model_data(con, model, variable, want))
+    return ToolResult(_fmt_nearby_model_data(con, station, model, variable, want))
 
 
 def _stamp_fetched(result: ToolResult) -> ToolResult:
